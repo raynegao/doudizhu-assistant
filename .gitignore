@@ -1,0 +1,53 @@
+# Byte-compiled / optimized files
+__pycache__/
+*.py[cod]
+*$py.class
+
+# Virtual environments
+.venv/
+venv/
+env/
+ENV/
+.conda/
+
+# Distribution / packaging
+build/
+dist/
+.eggs/
+*.egg-info/
+pip-wheel-metadata/
+
+# Logs
+*.log
+
+# Unit test / coverage reports
+.pytest_cache/
+.cache/
+htmlcov/
+.coverage
+.coverage.*
+
+# Type checker / lint caches
+.mypy_cache/
+.ruff_cache/
+.pyre/
+.pytype/
+
+# Editors / IDEs
+.vscode/
+.idea/
+*.swp
+*.swo
+
+# Jupyter
+.ipynb_checkpoints/
+
+# Project outputs and large artifacts
+runs/
+data/
+*.pt
+*.onnx
+
+# OS metadata
+.DS_Store
+Thumbs.db
