@@ -31,6 +31,12 @@ class TestSimulatorHelpers(unittest.TestCase):
         picked = _choose_play(prev, legal)
         self.assertEqual(picked, [Card("6")])
 
+    def test_choose_play_avoids_bomb_if_other_option(self) -> None:
+        prev = [Card("8")]
+        legal = [[Card("9")], [Card("10")] * 4]  # single 和炸弹
+        picked = _choose_play(prev, legal)
+        self.assertEqual(picked, [Card("9")])
+
 
 class TestEstimateWinRate(unittest.TestCase):
     def test_estimate_win_rate_with_mock(self) -> None:

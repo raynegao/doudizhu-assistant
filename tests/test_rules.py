@@ -33,8 +33,11 @@ class TestRulesClassification(unittest.TestCase):
         triple_chain = [Card(r) for r in ["3", "3", "3", "4", "4", "4"]]
         self.assertEqual(classify_hand(triple_chain), HandType.AIRPLANE)
 
-        airplane_wings = [Card(r) for r in ["3", "3", "3", "4", "4", "4", "6", "7"]]
-        self.assertEqual(classify_hand(airplane_wings), HandType.AIRPLANE_WITH_WINGS)
+        airplane_wings_s = [Card(r) for r in ["3", "3", "3", "4", "4", "4", "6", "7"]]
+        self.assertEqual(classify_hand(airplane_wings_s), HandType.AIRPLANE_WITH_WINGS)
+
+        airplane_wings_p = [Card(r) for r in ["5", "5", "5", "6", "6", "6", "7", "7", "8", "8"]]
+        self.assertEqual(classify_hand(airplane_wings_p), HandType.AIRPLANE_WITH_WINGS)
 
     def test_invalid_straight_with_two(self) -> None:
         invalid = [Card(r) for r in ["10", "J", "Q", "K", "A", "2"]]
@@ -55,6 +58,11 @@ class TestRulesComparison(unittest.TestCase):
 
         rocket = [Card("joker_small"), Card("joker_big")]
         self.assertTrue(can_beat(prev_bomb, rocket))
+
+    def test_length_mismatch(self) -> None:
+        prev = [Card(r) for r in ["3", "3", "4", "4", "5", "5"]]
+        curr = [Card(r) for r in ["6", "6", "7", "7"]]
+        self.assertFalse(can_beat(prev, curr))
 
     def test_generate_filtered_by_prev(self) -> None:
         hand = [

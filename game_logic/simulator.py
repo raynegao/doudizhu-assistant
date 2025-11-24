@@ -9,7 +9,7 @@ from collections import Counter
 from dataclasses import dataclass
 from typing import List, Sequence
 
-from .cards import Card, RANK_ORDER, build_standard_deck
+from .cards import Card, RANK_ORDER, RANK_TO_ID, build_standard_deck
 from .doudizhu_rules import HandType, can_beat, classify_hand, generate_all_legal_hands
 from .state_parser import GameState
 
@@ -129,16 +129,41 @@ def _choose_play(prev_play: List[Card], legal: List[List[Card]]) -> List[Card]:
         return []
 
     if not prev_play:
-        # 无上家牌，出最小单
-        singles = [c for c in legal if classify_hand(c) == HandType.SINGLE]
-        if singles:
-            singles.sort(key=lambda cs: RANK_ORDER.index(cs[0].rank))
-            return singles[0]
+        # 无上家牌，尽量出最小非炸弹
+        legal.sort(key=_play_sort_key)
         return legal[0]
 
     legal_beating = [c for c in legal if can_beat(prev_play, c)]
     if not legal_beating:
         return []
 
-    legal_beating.sort(key=lambda cs: (len(cs), RANK_ORDER.index(cs[0].rank)))
+    legal_beating.sort(key=_play_sort_key)
     return legal_beating[0]
+
+
+def _play_sort_key(cards: List[Card]) -> tuple:
+    """排序策略：非炸弹优先，牌数少优先，关键牌小优先。"""
+
+    hand_type = classify_hand(cards)
+    bomb_flag = 1 if hand_type in {HandType.BOMB, HandType.ROCKET} else 0
+    strength = _hand_strength(cards, hand_type)
+    return (bomb_flag, len(cards), strength)
+
+
+def _hand_strength(cards: List[Card], hand_type: HandType) -> int:
+    """用于排序的强度值，越小越优先。"""
+
+    ranks = [c.rank for c in cards]
+    counts = Counter(ranks)
+    if hand_type in {HandType.SINGLE, HandType.PAIR, HandType.TRIPLE, HandType.BOMB}:
+        key_rank = min(counts.items(), key=lambda kv: (-kv[1], RANK_TO_ID[kv[0]]))[0]
+        return RANK_TO_ID[key_rank]
+    if hand_type == HandType.ROCKET:
+        return RANK_TO_ID["joker_small"]
+    if hand_type in {HandType.TRIPLE_WITH_SINGLE, HandType.TRIPLE_WITH_PAIR}:
+        triple_rank = min((r for r, c in counts.items() if c == 3), key=lambda r: RANK_TO_ID[r])
+        return RANK_TO_ID[triple_rank]
+    if hand_type in {HandType.STRAIGHT, HandType.DOUBLE_SEQUENCE, HandType.AIRPLANE, HandType.AIRPLANE_WITH_WINGS}:
+        seq_ranks = sorted((r for r, c in counts.items() if c >= (2 if hand_type == HandType.DOUBLE_SEQUENCE else 1)), key=lambda r: RANK_TO_ID[r])
+        return RANK_TO_ID[seq_ranks[0]]
+    return RANK_TO_ID[ranks[0]]

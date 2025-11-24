@@ -78,11 +78,20 @@ def classify_hand(cards: List[Card]) -> HandType:
     if triple_ranks:
         triple_ranks_sorted = sorted(triple_ranks, key=lambda r: RANK_TO_ID[r])
         triple_count = len(triple_ranks_sorted)
+        singles_count = sum(1 for c in counts.values() if c == 1)
+        pairs_count = sum(1 for c in counts.values() if c == 2)
         if (
             triple_count >= 2
             and _is_straight(triple_ranks_sorted)
             and n == triple_count * 4
-            and sum(1 for c in counts.values() if c == 1) == triple_count
+            and singles_count == triple_count
+        ):
+            return HandType.AIRPLANE_WITH_WINGS
+        if (
+            triple_count >= 2
+            and _is_straight(triple_ranks_sorted)
+            and n == triple_count * 5
+            and pairs_count == triple_count
         ):
             return HandType.AIRPLANE_WITH_WINGS
 
