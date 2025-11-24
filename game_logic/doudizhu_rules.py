@@ -193,7 +193,7 @@ def _is_straight(ranks: List[str]) -> bool:
     if not ranks:
         return False
     ids = sorted(RANK_TO_ID[r] for r in ranks)
-    if any(r >= RANK_TO_ID["2"] for r in ranks):
+    if any(rid >= RANK_TO_ID["2"] for rid in ids):
         return False
     return ids == list(range(ids[0], ids[0] + len(ids)))
 
