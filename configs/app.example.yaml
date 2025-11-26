@@ -1,0 +1,20 @@
+model_paths:
+  detector: models/detector.onnx
+  classifier: models/classifier.onnx
+
+inference:
+  device: cpu
+  input_size: 640
+  detector_conf_threshold: 0.25
+  detector_nms_iou: 0.45
+  max_detections: 50
+
+monte_carlo:
+  simulations: 200
+  max_depth: 50
+  time_budget_ms: 100
+
+logging:
+  level: INFO
+  json: false
+  file: logs/app.log

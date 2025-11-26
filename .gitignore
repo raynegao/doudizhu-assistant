@@ -45,6 +45,9 @@ htmlcov/
 # Project outputs and large artifacts
 runs/
 data/
+!data/.gitkeep
+logs/
+!logs/.gitkeep
 *.pt
 *.onnx
 
