@@ -23,6 +23,11 @@ def test_parse_cards_supports_compact_input() -> None:
     assert parse_cards("334455") == ("3", "3", "4", "4", "5", "5")
 
 
+def test_parse_cards_distinguishes_joker_aliases() -> None:
+    assert parse_cards("smalljoker blackjoker") == ("SJ", "BJ")
+    assert parse_cards("X D") == ("SJ", "BJ")
+
+
 def test_card_set_rejects_too_many_rank_cards() -> None:
     with pytest.raises(CardParseError):
         CardSet.parse("3 3 3 3 3")

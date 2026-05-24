@@ -8,26 +8,35 @@
 
 ## 2. 当前结构评审
 
-当前仓库处于早期脚手架阶段：
+当前仓库已经完成 Phase 1 规则引擎 MVP 的最小闭环：
 
 ```text
 configs/
   app.example.yaml
+tests/
+  test_cards.py
+  test_decision_cli.py
+  test_rules.py
 src/
   capture/
   config/
   logic/
+    decision.py
+    rules.py
   state/
-  tests/  # 当前脚手架遗留；长期测试建议迁移到根目录 tests/
+    cards.py
+    game_state.py
   tracking/
   ui/
+    cli.py
   vision/
 README.md
 PLAN.md
+pytest.ini
 requirements-dev.txt
 ```
 
-整体模块方向合理，已经把采集、视觉、跟踪、状态、决策和 UI 分成不同包，符合 AI 工程项目的基本分层意识。主要问题是实时推理编排层、数据集/训练/评测层、Agent 工作流层和部署层还没有独立边界，后续如果直接在 `vision`、`logic` 或 `ui` 里堆主循环，耦合会快速上升。
+整体模块方向合理，已经把采集、视觉、跟踪、状态、决策和 UI 分成不同包，符合 AI 工程项目的基本分层意识。当前已实现手动输入到 `GameStateSnapshot`、合法动作生成、基础推荐、CLI 输出和 JSONL 日志。主要缺口是 Phase 2 及之后的 CV 检测、实时推理编排层、数据集/训练/评测层、Agent 工作流层和部署层。后续如果直接在 `vision`、`logic` 或 `ui` 里堆主循环，耦合会快速上升。
 
 ## 3. 推荐分层
 
@@ -55,6 +64,17 @@ capture -> vision -> tracking -> state -> logic -> ui
 - `ui` 不承载实时主循环。
 - `agent` 不绕过 `logic` 直接给最终出牌结论。
 - `pipeline/runtime` 可以编排模块，但不应把视觉细节、规则细节或 GUI 状态写进同一个大函数。
+
+### 3.1 开发与训练环境边界
+
+本项目采用 Mac/Windows 分工，而不是把所有开发都迁移到远程 GPU 机器：
+
+- Mac：默认代码实现环境，负责日常编码、规则引擎、状态建模、CLI、文档、单元测试和轻量集成验证。
+- Windows/WSL + RTX 4060：默认训练与 GPU 实验环境，负责 YOLO/CV 训练、CUDA/PyTorch 验证、ONNX/GPU 推理实验、性能基准和大数据处理。
+- 同步方式：两端通过 Git 分支和远端仓库同步，不用手动复制作为长期工作流。
+- 远程目录：Windows 侧优先使用 WSL Linux 文件系统，例如 `/home/rayne/projects/doudizhu-assistant`，不要把训练项目长期放在 `/mnt/c`。
+- VS Code：需要远程训练或调试时，通过 `code --remote ssh-remote+win-ai /home/rayne/projects/doudizhu-assistant` 打开 WSL 目录。
+- 阶段边界：Phase 1 不依赖 Windows；Phase 2 之后凡是涉及 YOLO、CUDA、训练或性能基准，默认在 Windows/WSL 执行。
 
 ## 4. Codex 多 Agent 开发模式
 
@@ -89,6 +109,8 @@ Phase 1 不实现 `src/agent/`。Agent 工作流要等 `GameStateSnapshot`、`De
 ### Phase 1：规则引擎 MVP
 
 目标：在不依赖 CV 模型的情况下跑通“输入手牌 -> 结构化状态 -> 合法动作 -> 基础推荐 -> 展示”的最小闭环。
+
+状态：已实现，当前进入收尾维护阶段。后续只做缺陷修复、测试补强、日志字段稳定和文档同步，不再扩大 Phase 1 范围。
 
 更收敛的 Phase 1 数据流：
 
@@ -158,6 +180,8 @@ Phase 1 最小日志字段：
 - 检测/分类推理。
 - 视觉结果到 `CardObservation`。
 - 固定截图测试。
+
+环境策略：CV 代码、数据格式、推理接口和测试先在 Mac 侧实现；训练、CUDA 验证、模型导出和性能基准在 Windows/WSL + RTX 4060 上执行。
 
 ### Phase 3：实时系统
 
@@ -355,11 +379,11 @@ ExplanationEvent
 
 短期优先级：
 
-1. 先把 Phase 1 的接口、验收标准和测试边界写清楚。
-2. 建立核心数据结构，不急于训练模型。
-3. 先实现规则引擎单测，因为规则正确性是决策可信度基础。
-4. 先用模拟输入跑通 `GameState -> 合法动作 -> 基础推荐 -> CLI 输出`。
-5. 引入 `pytest` 作为 Phase 1 测试工具；`ruff`、`mypy` 或 `pyright` 放到后续工程化阶段。
+1. 保持 Phase 1 的 `GameState -> 合法动作 -> 基础推荐 -> CLI 输出 -> JSONL 日志` 闭环稳定。
+2. 补齐 Phase 1 缺陷修复和边界测试，不扩大到真实 CV、GUI、Docker 或 RL。
+3. 进入 Phase 2 前，先定义 `Frame`、`Detection`、`CardObservation` 等视觉输入对象边界。
+4. 建立少量固定截图或手工 fixture，为后续 CV 检测接入准备验收样本。
+5. `ruff`、`mypy` 或 `pyright` 放到后续工程化阶段。
 
 中期优先级：
 
@@ -433,16 +457,16 @@ Phase 2/3 再考虑：
 - 前后端实时交互
 - 工程可维护性和部署意识
 
-目前短板是还没有真实模型、数据闭环、测试体系、Docker 和可运行 Demo。后续开发应优先把“可运行的最小闭环”做出来，而不是先追求复杂模型。
+目前短板是还没有真实模型、数据闭环、实时 pipeline、Docker 和作品集级 Demo。Phase 1 已有 CLI 级可运行闭环，后续开发应优先把 CV 输入接到这个稳定闭环上，而不是先追求复杂模型。
 
 ## 12. 当前架构结论
 
-当前目录划分是一个合格的起点，模块方向正确，但还不是完整 AI 工程项目。最需要避免的是把实时主循环、CV 推理、状态更新、决策和 UI 混在同一个模块里。下一步应先补齐 pipeline、核心数据结构、规则单测和回放机制，再进入模型训练和 GUI 展示。
+当前目录划分是一个合格的起点，模块方向正确，Phase 1 已经具备手动输入规则引擎闭环，但还不是完整 AI 工程项目。最需要避免的是把实时主循环、CV 推理、状态更新、决策和 UI 混在同一个模块里。下一步应先补齐 CV 输入对象、固定截图验收样本和检测后处理边界，再进入实时 pipeline 和 GUI 展示。
 
 推荐下一阶段目标：
 
 ```text
-模拟输入 -> 状态建模 -> 规则决策 -> JSON 日志 -> CLI/简单 API 展示
+截图/ROI -> 视觉观测 -> CardObservation -> GameStateSnapshot -> 规则决策 -> JSONL 日志
 ```
 
-这个闭环不依赖真实 CV 模型，但能先稳定系统边界。随后再把 CV 检测结果替换为真实输入，工程风险会低很多。
+这个阶段只把视觉输入接入结构化状态，继续复用 Phase 1 的规则、推荐和日志闭环，工程风险会低很多。

@@ -42,7 +42,7 @@ _ALIASES: dict[str, str] = {
     "D": "BJ",
     "BJ": "BJ",
     "RJ": "BJ",
-    "BLACKJOKER": "SJ",
+    "BLACKJOKER": "BJ",
     "REDJOKER": "BJ",
     "BIGJOKER": "BJ",
     "BIG": "BJ",
