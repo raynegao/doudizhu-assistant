@@ -46,6 +46,38 @@ python -m src.ui.cli \
 
 目标：把手动输入替换或补充为屏幕/截图识别输入。先完成手牌区域识别和牌面结构转换，不做完整实时系统。
 
+当前 Phase 2 路线：固定 ROI + 规则切牌 + PyTorch CNN 分类。验收目标是 Mac 本地 replay 闭环：ROI/crop -> CNN 识别手牌 -> Phase 1 规则引擎 -> 推荐动作。
+
+### Phase 2A：模板资源整理
+
+- 从 `tianqiraf/DouZero_For_HappyDouDiZhu`、`Vincentzyx/DouZero_For_HLDDZ_FullAuto`、`cyt0125/DouZero_For_Offline_Doudizhu` 的 `pics/` 中提取牌面模板。
+- 统一映射类别：`3 4 5 6 7 8 9 10 J Q K A 2 SJ BJ`。
+- 兼容 DouZero fork 的记法：`T -> 10`、`X -> SJ`、`D -> BJ`。
+- 使用 `scripts/prepare_card_templates.py` 输出到 `data/cards_cls_seed/<rank>/`。
+
+### Phase 2B：生成 CNN 分类数据集
+
+- 使用 `scripts/generate_card_cls_dataset.py` 对 seed 模板做增强。
+- 增强包括 resize、brightness/contrast、blur、JPEG compression、slight crop、background noise。
+- 输出到 `data/cards_cls/train/<rank>/` 和 `data/cards_cls/val/<rank>/`。
+
+### Phase 2C：训练小 CNN
+
+- 使用 `src/vision/card_classifier.py` 定义轻量 CNN、类别映射、预处理、checkpoint 加载和批量预测。
+- 使用 `scripts/train_card_cnn.py` 在 Mac 本地训练，优先 `mps`，否则 `cpu`。
+- 输出 `models/card_cnn.pt` 和 `models/card_cnn.onnx`，二者默认不提交 Git。
+- 使用 `scripts/predict_card_crops.py` 对已切 crop 做批量推理。
+
+### Phase 2D：真实截图校验
+
+- 优先使用 Mac 本地 replay 模式：读取固定截图、手牌 ROI 或预录样本，稳定演示识别和推荐链路。
+- 当前窗口模式基准：ROI box `(380, 1110, 2555, 1515)`，当前样本 `count=15`，`start-y=20`，`step-x=135`，`crop-size=126x210`。
+- 使用 `scripts.crop_hand_roi_cards` 裁出 rank+suit crop。
+- 使用 `scripts.add_labeled_crops_to_dataset` 将少量真实 crop 加入训练集，缓解模板合成数据和 Mac 客户端牌面风格差异。
+- 已补充真实 `2` 和 `BJ` 样本；`SJ` 暂用 `BJ` 灰度版本生成，后续截到真实小王后替换。
+- 使用 `scripts.replay_phase2` 将 CNN 识别结果接入 `GameStateSnapshot`、合法动作生成和推荐策略。
+- 当前合成数据只保证工程闭环；真实 crop 后续可作为 validation 或 fine-tune 数据。
+
 建议范围：
 
 - 定义 `Frame`、`Detection`、`CardObservation` 等数据对象。

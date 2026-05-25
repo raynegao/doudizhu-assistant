@@ -65,16 +65,16 @@ capture -> vision -> tracking -> state -> logic -> ui
 - `agent` 不绕过 `logic` 直接给最终出牌结论。
 - `pipeline/runtime` 可以编排模块，但不应把视觉细节、规则细节或 GUI 状态写进同一个大函数。
 
-### 3.1 开发与训练环境边界
+### 3.1 开发、训练与演示环境边界
 
-本项目采用 Mac/Windows 分工，而不是把所有开发都迁移到远程 GPU 机器：
+本项目当前采用 Mac 单机闭环，而不是把训练或演示绑定到远程 GPU 机器：
 
-- Mac：默认代码实现环境，负责日常编码、规则引擎、状态建模、CLI、文档、单元测试和轻量集成验证。
-- Windows/WSL + RTX 4060：默认训练与 GPU 实验环境，负责 YOLO/CV 训练、CUDA/PyTorch 验证、ONNX/GPU 推理实验、性能基准和大数据处理。
-- 同步方式：两端通过 Git 分支和远端仓库同步，不用手动复制作为长期工作流。
-- 远程目录：Windows 侧优先使用 WSL Linux 文件系统，例如 `/home/rayne/projects/doudizhu-assistant`，不要把训练项目长期放在 `/mnt/c`。
-- VS Code：需要远程训练或调试时，通过 `code --remote ssh-remote+win-ai /home/rayne/projects/doudizhu-assistant` 打开 WSL 目录。
-- 阶段边界：Phase 1 不依赖 Windows；Phase 2 之后凡是涉及 YOLO、CUDA、训练或性能基准，默认在 Windows/WSL 执行。
+- Mac：唯一默认环境，负责日常编码、规则引擎、状态建模、CLI、文档、单元测试、CV 数据准备、小 CNN 训练、推理验证和 Demo 演示。
+- Apple Silicon 本地训练：Phase 2 采用“固定 ROI + 规则切牌 + 小 CNN 分类”路线，训练规模较小，适合在 MacBook Air M4/16GB 上完成。
+- 演示方式：优先做 replay demo，读取固定截图、手牌 ROI 或预录样本，稳定展示识别结果、结构化手牌、合法动作和推荐理由。
+- Windows/WSL：不再作为默认开发、训练或演示链路。只有后续明确需要 YOLO 大规模训练、CUDA 对比实验或性能基准时，才作为可选增强资源单独规划。
+- 同步方式：默认不进行跨机器同步；如未来重新启用远程训练，必须先确认分支、未提交改动、数据目录和模型产物边界。
+- Docker：不作为当前训练前置条件；后续如用于工程化展示，再单独纳入 DevOps 范围。
 
 ## 4. Codex 多 Agent 开发模式
 
@@ -171,17 +171,19 @@ Phase 1 最小日志字段：
 
 ### Phase 2：CV 检测接入
 
-目标：把手动输入替换或补充为屏幕识别输入。先做手牌区域识别和牌面结构转换，再考虑整局状态。
+目标：把手动输入替换或补充为屏幕/截图识别输入。当前实现重点是 Mac 本地 replay 闭环，先做手牌区域识别和牌面结构转换，再考虑整局状态。
 
 核心内容：
 
 - 截屏和 ROI。
-- YOLO 数据格式和标注规范。
-- 检测/分类推理。
+- 固定步长切牌。
+- PyTorch 小 CNN 分类训练与推理。
+- 导出 `models/card_cnn.pt` 和 `models/card_cnn.onnx`。
 - 视觉结果到 `CardObservation`。
-- 固定截图测试。
+- replay 接入 `GameStateSnapshot`、合法动作生成和推荐输出。
+- 固定截图/crop 测试。
 
-环境策略：CV 代码、数据格式、推理接口和测试先在 Mac 侧实现；训练、CUDA 验证、模型导出和性能基准在 Windows/WSL + RTX 4060 上执行。
+环境策略：CV 代码、数据格式、推理接口、测试、小 CNN 训练、模型导出和 replay 演示都优先在 Mac 本地完成。Windows/WSL 只保留为后续可选的性能增强资源，不是 Phase 2 的默认依赖。
 
 ### Phase 3：实时系统
 
@@ -388,14 +390,14 @@ ExplanationEvent
 中期优先级：
 
 1. 建立合成数据和少量真实截图标注流程。
-2. 训练 YOLOv8n 或 YOLOv11n 检测器，导出 ONNX。
+2. 先训练小 CNN 牌面分类器并导出 ONNX；YOLOv8n 或 YOLOv11n 检测器只作为后续扩展路线。
 3. 建立视觉指标：mAP、precision、recall、分类 Top-1/Top-3、端到端牌面准确率。
 4. 建立实时指标：平均延迟、P95 延迟、FPS、掉帧率。
 5. 建立日志回放工具，让 Demo 可复现。
 
 长期优先级：
 
-1. Docker 化训练、评测和 API 服务。
+1. Docker 化评测和 API 服务；训练容器化等 Phase 2/3 稳定后再评估。
 2. 支持 WebSocket 实时前端或桌面 overlay。
 3. 引入实验追踪，例如 MLflow、Weights & Biases 或本地 JSONL 指标。
 4. 将 Agent 作为解释器和实验助手接入，而不是让 Agent 替代规则引擎。

@@ -49,6 +49,8 @@ AGENTS.md
 runs/
 data/
 !data/.gitkeep
+models/
+!models/.gitkeep
 logs/
 !logs/.gitkeep
 *.pt

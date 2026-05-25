@@ -44,6 +44,89 @@ python -m pytest -q
 
 下一阶段是 Phase 2：CV 检测接入。进入 Phase 2 前，应保持 Phase 1 的 CLI、测试和日志字段稳定。
 
+## Phase 2：CNN 牌面识别闭环
+
+Phase 2 采用“固定 ROI + 规则切牌 + PyTorch CNN 分类”路线。Mac 本地完成数据准备、训练、ONNX 导出、crop 推理和 replay 演示。
+
+```bash
+python -m scripts.prepare_card_templates --dry-run
+python -m scripts.prepare_card_templates
+python -m scripts.generate_card_cls_dataset \
+  --seed-dir data/cards_cls_seed \
+  --output-dir data/cards_cls \
+  --per-seed 80 \
+  --image-size 64x96
+```
+
+训练小 CNN 并导出 ONNX。第一次可先用模板合成数据训练；加入真实 crop 后需要重新运行同一命令完成当前客户端风格微调：
+
+```bash
+python -m scripts.train_card_cnn --epochs 30 --batch-size 32
+```
+
+输出目录：
+
+- `data/cards_cls_seed/<rank>/`：从 DouZero fork 的 `pics/` 提取的模板 seed。
+- `data/cards_cls/train/<rank>/`：增强后的训练集。
+- `data/cards_cls/val/<rank>/`：增强后的验证集。
+- `models/card_cnn.pt`：PyTorch checkpoint。
+- `models/card_cnn.onnx`：ONNX 推理模型。
+
+这些数据和模型目录默认不提交 Git。Phase 2 默认在 Mac 本地完成，不依赖 Windows/WSL。
+
+## Phase 2D：Mac 斗地主 ROI 切牌
+
+当前 Mac 客户端可用固定 ROI + 固定步长切牌。先从完整截图裁出手牌 ROI，再把重叠手牌切成可分类的 rank+suit 小图：
+
+```bash
+python -m scripts.crop_hand_roi_cards \
+  --roi data/raw_screenshots/window_mode_hand_roi_tight_001.png \
+  --output-dir data/roi_samples/window_mode_hand_roi_tight_001 \
+  --count 15 \
+  --start-x 0 \
+  --start-y 20 \
+  --step-x 135 \
+  --crop-size 126x210
+```
+
+把真实 crop 加入训练集用于当前客户端风格微调：
+
+```bash
+python -m scripts.add_labeled_crops_to_dataset \
+  --crop-dir data/roi_samples/window_mode_hand_roi_tight_001 \
+  --labels "A K Q J 10 10 9 8 7 7 6 5 4 3 3"
+```
+
+`data/raw_screenshots/` 和 `data/roi_samples/` 默认不提交 Git。当前窗口模式实测手牌 ROI 为 `(380, 1110, 2555, 1515)`，当前样本手牌数为 15，`step-x=135`，`start-y=20`；如果窗口缩放、移动到其他显示器或分辨率变化，需要重新标定。
+
+补充 `2/BJ/SJ` 覆盖时，可使用包含大王和 `2` 的 17 张手牌截图。当前 joker 样本参数为 ROI `(360, 1110, 2600, 1515)`、`count=17`、`step-x=120`；`SJ` 暂用 `BJ` crop 的灰度版本生成，后续截到真实小王后再替换。
+
+预测已切好的 crop：
+
+```bash
+python -m scripts.predict_card_crops \
+  --model models/card_cnn.pt \
+  --crop-dir data/roi_samples/window_mode_hand_roi_tight_001
+```
+
+端到端 replay：CNN 识别手牌后接入 Phase 1 规则引擎，输出候选动作和推荐理由。
+
+```bash
+python -m scripts.replay_phase2 \
+  --model models/card_cnn.pt \
+  --roi data/raw_screenshots/window_mode_hand_roi_tight_001.png
+```
+
+如果当前手牌数量或重叠间距不同，replay 可显式传入切牌参数，例如：
+
+```bash
+python -m scripts.replay_phase2 \
+  --model models/card_cnn.pt \
+  --roi data/raw_screenshots/window_mode_jokers_hand_roi_001.png \
+  --count 17 \
+  --step-x 120
+```
+
 ## 配置与日志
 - 配置文件支持 YAML/JSON，示例见 `configs/app.example.yaml`。
 - `src/config/settings.py` 提供 Pydantic 校验与热重载轮询。
