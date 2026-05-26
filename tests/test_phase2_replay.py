@@ -36,8 +36,41 @@ def test_replay_phase2_connects_mock_predictions_to_rule_engine(tmp_path: Path, 
         start_y=20,
         step_x=135,
         crop_size=(126, 210),
+        confidence_threshold=0.70,
     ) == 0
     output = capsys.readouterr().out
     assert "识别手牌:" in output
     assert "候选动作数:" in output
     assert "推荐动作:" in output
+
+
+def test_replay_phase2_warns_on_low_confidence(tmp_path: Path, monkeypatch, capsys) -> None:
+    crop_dir = tmp_path / "crops"
+    crop_dir.mkdir()
+    for index in range(2):
+        Image.new("RGB", (20, 30), color=(255, 255, 255)).save(crop_dir / f"card_{index:02d}.png")
+
+    def fake_predict_crop_dir(model_path: Path, crop_dir: Path, device_name: str = "auto") -> list[dict[str, object]]:
+        return [
+            {"index": 0, "file": str(crop_dir / "card_00.png"), "rank": "3", "confidence": 0.99},
+            {"index": 1, "file": str(crop_dir / "card_01.png"), "rank": "4", "confidence": 0.42},
+        ]
+
+    monkeypatch.setattr(replay_phase2, "predict_crop_dir", fake_predict_crop_dir)
+
+    assert replay_phase2.replay_phase2(
+        model_path=tmp_path / "mock.pt",
+        roi_path=None,
+        screenshot_path=None,
+        crop_dir=crop_dir,
+        last_play="",
+        device_name="cpu",
+        roi_box=replay_phase2.WINDOW_MODE_ROI_BOX,
+        count=2,
+        start_x=0,
+        start_y=20,
+        step_x=135,
+        crop_size=(126, 210),
+        confidence_threshold=0.70,
+    ) == 0
+    assert "WARNING: low-confidence predictions" in capsys.readouterr().out

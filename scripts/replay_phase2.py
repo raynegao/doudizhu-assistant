@@ -41,6 +41,7 @@ def replay_phase2(
     start_y: int,
     step_x: int,
     crop_size: tuple[int, int],
+    confidence_threshold: float,
 ) -> int:
     with tempfile.TemporaryDirectory(prefix="doudizhu_phase2_") as temp:
         temp_dir = Path(temp)
@@ -75,8 +76,14 @@ def replay_phase2(
 
         print(f"识别手牌: {hand_text}")
         print("单牌置信度:")
+        low_confidence: list[dict[str, object]] = []
         for prediction in predictions:
             print(f"  {prediction['index']:02d} {prediction['rank']:>2} {prediction['confidence']:.3f}")
+            if float(prediction["confidence"]) < confidence_threshold:
+                low_confidence.append(prediction)
+        if low_confidence:
+            indexes = ", ".join(f"{item['index']:02d}:{item['rank']}={float(item['confidence']):.3f}" for item in low_confidence)
+            print(f"WARNING: low-confidence predictions below {confidence_threshold:.2f}: {indexes}")
         print(f"上一手牌: {state.last_play}")
         print(f"候选动作数: {len([action for action in actions if not action.is_pass])}")
         print(f"推荐动作: {decision.action}")
@@ -99,6 +106,7 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--start-y", type=int, default=WINDOW_MODE_START_Y)
     parser.add_argument("--step-x", type=int, default=WINDOW_MODE_STEP_X)
     parser.add_argument("--crop-size", type=parse_crop_size, default=WINDOW_MODE_CROP_SIZE)
+    parser.add_argument("--confidence-threshold", type=float, default=0.70)
     return parser
 
 
@@ -127,6 +135,7 @@ def main() -> int:
         start_y=args.start_y,
         step_x=args.step_x,
         crop_size=args.crop_size,
+        confidence_threshold=args.confidence_threshold,
     )
 
 

@@ -60,8 +60,10 @@ def train_model(
 
     train_dataset = CardImageDataset(dataset_dir / "train", image_size=image_size)
     val_dataset = CardImageDataset(dataset_dir / "val", image_size=image_size)
+    test_dataset = CardImageDataset(dataset_dir / "test", image_size=image_size) if (dataset_dir / "test").exists() else None
     train_loader = DataLoader(train_dataset, batch_size=batch_size, shuffle=True)
     val_loader = DataLoader(val_dataset, batch_size=batch_size, shuffle=False)
+    test_loader = DataLoader(test_dataset, batch_size=batch_size, shuffle=False) if test_dataset else None
 
     model = CardClassifierCNN(num_classes=len(CARD_CLASSES)).to(device)
     optimizer = torch.optim.Adam(model.parameters(), lr=learning_rate)
@@ -93,14 +95,31 @@ def train_model(
         if val_acc >= best_val_acc:
             best_val_acc = val_acc
             metrics = {
-                "epoch": float(epoch),
+                "best_epoch": float(epoch),
                 "train_loss": train_loss,
                 "val_loss": val_loss,
                 "val_acc": val_acc,
+                "train_count": float(len(train_dataset)),
+                "val_count": float(len(val_dataset)),
+                "test_count": float(len(test_dataset)) if test_dataset else 0.0,
             }
             save_checkpoint(output, model, image_size=image_size, extra={"metrics": metrics})
 
     model, _, _ = _load_best_model(output, device)
+    train_loss, train_acc = evaluate(model, DataLoader(train_dataset, batch_size=batch_size, shuffle=False), criterion, device)
+    val_loss, val_acc = evaluate(model, val_loader, criterion, device)
+    metrics.update({
+        "train_loss": train_loss,
+        "train_acc": train_acc,
+        "val_loss": val_loss,
+        "val_acc": val_acc,
+    })
+    if test_loader:
+        test_loss, test_acc = evaluate(model, test_loader, criterion, device)
+        metrics.update({
+            "test_loss": test_loss,
+            "test_acc": test_acc,
+        })
     export_onnx(model, onnx_output, image_size=image_size)
     (output.with_suffix(".metrics.json")).write_text(json.dumps(metrics, indent=2), encoding="utf-8")
     return metrics

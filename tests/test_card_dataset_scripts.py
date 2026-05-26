@@ -8,6 +8,7 @@ from scripts.add_labeled_crops_to_dataset import add_labeled_crops
 from scripts.crop_hand_roi_cards import crop_hand_roi_cards
 from scripts.generate_card_cls_dataset import generate_dataset
 from scripts.prepare_card_templates import classify_template_name, collect_local_templates
+from scripts.rebuild_card_cls_dataset import CropSource, rebuild_dataset
 
 
 def _write_png(path: Path) -> None:
@@ -97,3 +98,39 @@ def test_add_labeled_crops_to_dataset(tmp_path: Path) -> None:
     assert count == 4
     assert len(list((output_dir / "train" / "A").glob("*.png"))) + len(list((output_dir / "val" / "A").glob("*.png"))) == 2
     assert len(list((output_dir / "train" / "BJ").glob("*.png"))) + len(list((output_dir / "val" / "BJ").glob("*.png"))) == 2
+
+
+def test_rebuild_dataset_writes_test_split_and_manifest(tmp_path: Path) -> None:
+    seed_dir = tmp_path / "seed"
+    _write_png(seed_dir / "3" / "template_3.png")
+
+    crop_dir = tmp_path / "roi_samples" / "good_roi"
+    _write_png(crop_dir / "card_00.png")
+    _write_png(crop_dir / "card_01.png")
+
+    bad_crop_dir = tmp_path / "roi_samples" / "hand_roi_001_step135"
+    _write_png(bad_crop_dir / "card_00.png")
+
+    output_dir = tmp_path / "cards_cls"
+    summary = rebuild_dataset(
+        seed_dir=seed_dir,
+        output_dir=output_dir,
+        crop_sources=(CropSource(crop_dir=crop_dir, labels=("A", "BJ")),),
+        template_per_seed=5,
+        real_per_crop=10,
+        image_size=(32, 48),
+        seed=1,
+        clean=True,
+    )
+
+    assert summary["sample_count"] == 25
+    assert (output_dir / "train" / "3").exists()
+    assert (output_dir / "val" / "3").exists()
+    assert list((output_dir / "test" / "A").glob("*.png"))
+    assert list((output_dir / "test" / "BJ").glob("*.png"))
+
+    manifest = (output_dir / "manifest.jsonl").read_text(encoding="utf-8")
+    assert "good_roi" in manifest
+    assert "hand_roi_001_step135" not in manifest
+    assert "source_dir" in manifest
+    assert "augmentation_seed" in manifest
