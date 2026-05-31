@@ -165,15 +165,44 @@ Replay 默认会在单牌置信度低于 `0.70` 时输出 warning，但不中断
 A K Q J 10 10 9 8 7 7 6 5 4 3 3
 ```
 
-## Phase 3：实时系统准备
+## Phase 3：实时系统第一版
 
-Phase 3 第一目标是把固定截图源或窗口源接成可刷新流水线：
+Phase 3 第一版已把 Mac 固定 ROI 截屏源接成可刷新流水线：
 
 ```text
 固定截图源/窗口源 -> ROI -> CNN 识别 -> 状态刷新 -> 推荐输出 -> JSONL 日志
 ```
 
-实时主循环应放在后续新增的 `src/pipeline/` 或 `src/runtime/`，不要塞进 `vision`、`logic` 或 `ui` 内部。第一版只做稳定刷新、日志和简单展示，再考虑复杂 GUI、胜率估计和蒙特卡洛策略。
+实时主循环位于 `src/pipeline/`，不塞进 `vision`、`logic` 或 `ui` 内部。第一版只做固定 ROI 截屏、内存切牌、CNN 推理、规则推荐、终端实时面板和 JSONL 日志；复杂 GUI、胜率估计和蒙特卡洛策略仍留到后续阶段。
+
+运行一帧 smoke：
+
+```bash
+python -m scripts.run_phase3_runtime \
+  --max-frames 1 \
+  --device cpu \
+  --no-clear
+```
+
+连续运行：
+
+```bash
+python -m scripts.run_phase3_runtime \
+  --interval 1.0 \
+  --device cpu
+```
+
+常用参数：
+
+- `--roi-box`：屏幕 ROI，格式为 `left,top,right,bottom`，默认 `(380,1110,2555,1515)`。
+- `--count`、`--start-x`、`--start-y`、`--step-x`、`--crop-size`：沿用 Phase 2 固定切牌参数。
+- `--last-play`：上一手牌；留空表示主动出牌。
+- `--confidence-threshold`：低置信度 warning 阈值，默认 `0.70`。
+- `--log-file`：默认写入 `logs/phase3_runtime.jsonl`。
+
+macOS 首次运行可能需要给终端或 Codex app 授权“屏幕录制”。如果未授权，CLI 会输出截图权限错误；授权后重新运行即可。如果看到 `does not intersect any displays`，说明当前 `--roi-box` 不在活动显示器坐标范围内，需要重新标定 ROI；Retina 屏幕下 `screencapture` 使用的坐标可能和截图像素尺寸不同。
+
+Phase 3 JSONL 每帧包含 `event`、`frame_id`、`timestamp`、`source`、`roi_box`、`recognized_cards`、`observations`、`last_play`、`candidate_count`、`recommended_action`、`reason`、`warnings` 和 `latency_ms`。
 
 ## 配置与日志
 - 配置文件支持 YAML/JSON，示例见 `configs/app.example.yaml`。

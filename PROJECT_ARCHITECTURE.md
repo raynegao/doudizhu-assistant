@@ -8,7 +8,7 @@
 
 ## 2. 当前结构评审
 
-当前仓库已经完成 Phase 1 规则引擎 MVP，并完成 Phase 2 本地 CNN 牌面识别 replay 闭环：
+当前仓库已经完成 Phase 1 规则引擎 MVP、Phase 2 本地 CNN 牌面识别 replay 闭环，并具备 Phase 3 第一版固定 ROI 实时系统：
 
 ```text
 configs/
@@ -23,6 +23,7 @@ tests/
 scripts/
   crop_hand_roi_cards.py
   predict_card_crops.py
+  run_phase3_runtime.py
   replay_phase2.py
   train_card_cnn.py
 src/
@@ -31,6 +32,8 @@ src/
   logic/
     decision.py
     rules.py
+  pipeline/
+    runtime.py
   state/
     cards.py
     game_state.py
@@ -44,7 +47,7 @@ pytest.ini
 requirements-dev.txt
 ```
 
-整体模块方向合理，已经把采集、视觉、跟踪、状态、决策和 UI 分成不同包，符合 AI 工程项目的基本分层意识。当前已实现手动输入到 `GameStateSnapshot`、合法动作生成、基础推荐、CLI 输出和 JSONL 日志；Phase 2 已实现固定 ROI、切牌、小 CNN 分类、模型导出、评估和 replay 接入规则引擎。主要缺口转为实时推理编排层、状态刷新、简单展示、Agent 工作流层和部署层。后续如果直接在 `vision`、`logic` 或 `ui` 里堆主循环，耦合会快速上升。
+整体模块方向合理，已经把采集、视觉、跟踪、状态、决策和 UI 分成不同包，符合 AI 工程项目的基本分层意识。当前已实现手动输入到 `GameStateSnapshot`、合法动作生成、基础推荐、CLI 输出和 JSONL 日志；Phase 2 已实现固定 ROI、切牌、小 CNN 分类、模型导出、评估和 replay 接入规则引擎；Phase 3 第一版已新增 `pipeline/runtime`，把 Mac 固定 ROI 截屏、内存切牌、CNN 推理、规则推荐、终端面板和 JSONL 日志串成可刷新系统。主要缺口转为更稳定的窗口定位、GUI 展示、对局状态跟踪、Agent 工作流层和部署层。
 
 ## 3. 推荐分层
 
@@ -199,16 +202,17 @@ Phase 1 最小日志字段：
 
 目标：把截图、识别、状态、决策、展示串成可刷新系统。
 
+状态：第一版已实现。当前支持 Mac 固定 ROI 截屏、内存切牌、CNN 推理、`GameStateSnapshot` 构造、合法动作/推荐、终端实时面板和 JSONL 日志。暂不做自动窗口定位、复杂 GUI、蒙特卡洛胜率估计或自动操作。
+
 核心内容：
 
 - Pipeline/Runtime。
 - 固定截图源或窗口源。
 - ROI 到 CNN 识别的周期性刷新。
 - 状态刷新。
-- 简单 GUI 展示。
+- 终端实时面板。
 - JSONL 日志。
-- 回放机制。
-- 延迟统计。
+- 单帧延迟统计。
 
 Phase 3 第一版数据流：
 
@@ -314,6 +318,8 @@ Phase 3 第一版数据流：
 这是后续实时系统最应该补的模块。
 
 职责：串联截图、推理、跟踪、状态更新、决策和 UI 推送；管理异步队列、线程池、背压、FPS 和错误恢复。
+
+当前 Phase 3 第一版已经新增 `src/pipeline/runtime.py`，职责收敛为固定 ROI 截屏、内存切牌、CNN 分类、规则推荐、终端事件和 JSONL 日志。后续再逐步扩展到窗口定位、异步队列、稳定跟踪和 GUI 推送。
 
 建议数据流：
 
@@ -477,11 +483,11 @@ Phase 2/3 再考虑：
 - 前后端实时交互
 - 工程可维护性和部署意识
 
-目前短板是还没有实时 pipeline、持续状态刷新、GUI 展示、Docker 和作品集级 Demo。Phase 1 已有 CLI 级可运行闭环，Phase 2 已有本地 CNN replay 闭环，后续开发应优先把固定截图或窗口源接成可刷新流水线，而不是先追求复杂模型。
+目前短板是还没有自动窗口定位、稳定对局状态跟踪、GUI 展示、Docker 和作品集级 Demo。Phase 1 已有 CLI 级可运行闭环，Phase 2 已有本地 CNN replay 闭环，Phase 3 已有固定 ROI 实时刷新闭环，后续开发应优先增强状态跟踪和展示，而不是先追求复杂模型。
 
 ## 12. 当前架构结论
 
-当前目录划分是一个合格的起点，模块方向正确，Phase 1 已经具备手动输入规则引擎闭环，Phase 2 已具备本地固定 ROI/CNN/replay 闭环，但还不是完整 AI 工程项目。最需要避免的是把实时主循环、CV 推理、状态更新、决策和 UI 混在同一个模块里。下一步应进入 Phase 3，先新增实时 pipeline/runtime 边界，再接简单展示。
+当前目录划分是一个合格的起点，模块方向正确，Phase 1 已经具备手动输入规则引擎闭环，Phase 2 已具备本地固定 ROI/CNN/replay 闭环，Phase 3 已具备固定 ROI 实时刷新和终端展示闭环，但还不是完整 AI 工程项目。最需要避免的是把实时主循环、CV 推理、状态更新、决策和 UI 混在同一个模块里。下一步应补强窗口定位、跨帧状态跟踪和更稳定的展示层。
 
 推荐下一阶段目标：
 
