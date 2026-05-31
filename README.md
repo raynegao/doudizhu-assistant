@@ -42,11 +42,20 @@ python -m pytest -q
 - 输出一个确定性的基础推荐动作和中文理由。
 - 写入 JSONL 日志，字段包括 `event`、`input_cards`、`last_play`、`candidate_count`、`recommended_action`、`reason`、`warnings`。
 
-下一阶段是 Phase 2：CV 检测接入。进入 Phase 2 前，应保持 Phase 1 的 CLI、测试和日志字段稳定。
+Phase 1 现在作为稳定基础保留；后续 CV 和实时系统继续复用 CLI、测试和日志字段。
 
 ## Phase 2：CNN 牌面识别闭环
 
-Phase 2 采用“固定 ROI + 规则切牌 + PyTorch CNN 分类”路线。Mac 本地完成数据准备、训练、ONNX 导出、crop 推理和 replay 演示。
+Phase 2 采用“固定 ROI + 规则切牌 + PyTorch CNN 分类”路线。Mac 本地已完成数据准备、训练、ONNX 导出、crop 推理和 replay 演示，当前进入收尾状态，下一步准备进入 Phase 3 实时系统。
+
+当前本地评估结果来自 `models/card_cnn.metrics.json` 和 `models/card_cnn.eval.json`：
+
+- train：`1589/1589 = 100%`
+- val：`422/422 = 100%`
+- test：`99/99 = 100%`
+- `error_count = 0`
+
+这个准确率只代表当前小样本、本地 ROI/CNN 闭环验收，不代表真实游戏窗口泛化准确率。Phase 3 需要继续用更多真实截图验证。
 
 ```bash
 python -m scripts.prepare_card_templates --dry-run
@@ -149,6 +158,22 @@ python -m scripts.replay_phase2 \
 ```
 
 Replay 默认会在单牌置信度低于 `0.70` 时输出 warning，但不中断规则引擎推荐。
+
+当前 Phase 2 replay smoke 的期望识别结果：
+
+```text
+A K Q J 10 10 9 8 7 7 6 5 4 3 3
+```
+
+## Phase 3：实时系统准备
+
+Phase 3 第一目标是把固定截图源或窗口源接成可刷新流水线：
+
+```text
+固定截图源/窗口源 -> ROI -> CNN 识别 -> 状态刷新 -> 推荐输出 -> JSONL 日志
+```
+
+实时主循环应放在后续新增的 `src/pipeline/` 或 `src/runtime/`，不要塞进 `vision`、`logic` 或 `ui` 内部。第一版只做稳定刷新、日志和简单展示，再考虑复杂 GUI、胜率估计和蒙特卡洛策略。
 
 ## 配置与日志
 - 配置文件支持 YAML/JSON，示例见 `configs/app.example.yaml`。

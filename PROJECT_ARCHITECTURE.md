@@ -8,15 +8,23 @@
 
 ## 2. 当前结构评审
 
-当前仓库已经完成 Phase 1 规则引擎 MVP 的最小闭环：
+当前仓库已经完成 Phase 1 规则引擎 MVP，并完成 Phase 2 本地 CNN 牌面识别 replay 闭环：
 
 ```text
 configs/
   app.example.yaml
 tests/
+  test_card_classifier.py
+  test_card_dataset_scripts.py
   test_cards.py
   test_decision_cli.py
+  test_phase2_replay.py
   test_rules.py
+scripts/
+  crop_hand_roi_cards.py
+  predict_card_crops.py
+  replay_phase2.py
+  train_card_cnn.py
 src/
   capture/
   config/
@@ -30,13 +38,13 @@ src/
   ui/
     cli.py
   vision/
+    card_classifier.py
 README.md
-PLAN.md
 pytest.ini
 requirements-dev.txt
 ```
 
-整体模块方向合理，已经把采集、视觉、跟踪、状态、决策和 UI 分成不同包，符合 AI 工程项目的基本分层意识。当前已实现手动输入到 `GameStateSnapshot`、合法动作生成、基础推荐、CLI 输出和 JSONL 日志。主要缺口是 Phase 2 及之后的 CV 检测、实时推理编排层、数据集/训练/评测层、Agent 工作流层和部署层。后续如果直接在 `vision`、`logic` 或 `ui` 里堆主循环，耦合会快速上升。
+整体模块方向合理，已经把采集、视觉、跟踪、状态、决策和 UI 分成不同包，符合 AI 工程项目的基本分层意识。当前已实现手动输入到 `GameStateSnapshot`、合法动作生成、基础推荐、CLI 输出和 JSONL 日志；Phase 2 已实现固定 ROI、切牌、小 CNN 分类、模型导出、评估和 replay 接入规则引擎。主要缺口转为实时推理编排层、状态刷新、简单展示、Agent 工作流层和部署层。后续如果直接在 `vision`、`logic` 或 `ui` 里堆主循环，耦合会快速上升。
 
 ## 3. 推荐分层
 
@@ -171,7 +179,9 @@ Phase 1 最小日志字段：
 
 ### Phase 2：CV 检测接入
 
-目标：把手动输入替换或补充为屏幕/截图识别输入。当前实现重点是 Mac 本地 replay 闭环，先做手牌区域识别和牌面结构转换，再考虑整局状态。
+目标：把手动输入替换或补充为屏幕/截图识别输入。当前 Mac 本地 replay 闭环已完成，已经能从手牌 ROI 或 crop 识别牌面，并接入 Phase 1 的规则引擎输出候选动作和推荐理由。
+
+状态：已实现，当前进入收尾和交接阶段。当前小样本评估为 train `1589/1589 = 100%`、val `422/422 = 100%`、test `99/99 = 100%`、`error_count = 0`。该准确率只代表本地 ROI/CNN 闭环验收，不代表真实游戏窗口泛化准确率。
 
 核心内容：
 
@@ -192,11 +202,19 @@ Phase 1 最小日志字段：
 核心内容：
 
 - Pipeline/Runtime。
+- 固定截图源或窗口源。
+- ROI 到 CNN 识别的周期性刷新。
 - 状态刷新。
 - 简单 GUI 展示。
 - JSONL 日志。
 - 回放机制。
 - 延迟统计。
+
+Phase 3 第一版数据流：
+
+```text
+固定截图源/窗口源 -> ROI -> CNN 识别 -> 状态刷新 -> 推荐输出 -> JSONL 日志
+```
 
 ### Phase 4：智能决策增强
 
@@ -382,9 +400,9 @@ ExplanationEvent
 短期优先级：
 
 1. 保持 Phase 1 的 `GameState -> 合法动作 -> 基础推荐 -> CLI 输出 -> JSONL 日志` 闭环稳定。
-2. 补齐 Phase 1 缺陷修复和边界测试，不扩大到真实 CV、GUI、Docker 或 RL。
-3. 进入 Phase 2 前，先定义 `Frame`、`Detection`、`CardObservation` 等视觉输入对象边界。
-4. 建立少量固定截图或手工 fixture，为后续 CV 检测接入准备验收样本。
+2. 保持 Phase 2 的固定 ROI、CNN 识别、replay 和评估脚本可复现。
+3. 进入 Phase 3 前，先定义实时 `Frame`、`CardObservation`、状态刷新事件和 JSONL 日志字段。
+4. 继续补充真实截图 fixture，验证当前 100% 小样本准确率的泛化边界。
 5. `ruff`、`mypy` 或 `pyright` 放到后续工程化阶段。
 
 中期优先级：
@@ -459,16 +477,16 @@ Phase 2/3 再考虑：
 - 前后端实时交互
 - 工程可维护性和部署意识
 
-目前短板是还没有真实模型、数据闭环、实时 pipeline、Docker 和作品集级 Demo。Phase 1 已有 CLI 级可运行闭环，后续开发应优先把 CV 输入接到这个稳定闭环上，而不是先追求复杂模型。
+目前短板是还没有实时 pipeline、持续状态刷新、GUI 展示、Docker 和作品集级 Demo。Phase 1 已有 CLI 级可运行闭环，Phase 2 已有本地 CNN replay 闭环，后续开发应优先把固定截图或窗口源接成可刷新流水线，而不是先追求复杂模型。
 
 ## 12. 当前架构结论
 
-当前目录划分是一个合格的起点，模块方向正确，Phase 1 已经具备手动输入规则引擎闭环，但还不是完整 AI 工程项目。最需要避免的是把实时主循环、CV 推理、状态更新、决策和 UI 混在同一个模块里。下一步应先补齐 CV 输入对象、固定截图验收样本和检测后处理边界，再进入实时 pipeline 和 GUI 展示。
+当前目录划分是一个合格的起点，模块方向正确，Phase 1 已经具备手动输入规则引擎闭环，Phase 2 已具备本地固定 ROI/CNN/replay 闭环，但还不是完整 AI 工程项目。最需要避免的是把实时主循环、CV 推理、状态更新、决策和 UI 混在同一个模块里。下一步应进入 Phase 3，先新增实时 pipeline/runtime 边界，再接简单展示。
 
 推荐下一阶段目标：
 
 ```text
-截图/ROI -> 视觉观测 -> CardObservation -> GameStateSnapshot -> 规则决策 -> JSONL 日志
+固定截图源/窗口源 -> ROI -> CNN 识别 -> 状态刷新 -> 推荐输出 -> JSONL 日志
 ```
 
-这个阶段只把视觉输入接入结构化状态，继续复用 Phase 1 的规则、推荐和日志闭环，工程风险会低很多。
+这个阶段只把视觉输入接成可刷新状态，继续复用 Phase 1 的规则、推荐和 Phase 2 的 CNN/replay 闭环，工程风险会低很多。
