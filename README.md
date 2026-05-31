@@ -192,6 +192,26 @@ python -m scripts.run_phase3_runtime \
   --device cpu
 ```
 
+当前 Mac 斗地主窗口实测运行方式：
+
+```bash
+cd "/Users/rayne/Documents/university/junior_year_spring/doudizhu-assistant"
+source .venv/bin/activate
+
+python -m scripts.run_phase3_runtime \
+  --max-frames 1 \
+  --device cpu \
+  --no-clear \
+  --roi-box 180,555,1300,758 \
+  --count 17 \
+  --step-x 60 \
+  --crop-size 63x105 \
+  --start-y 10 \
+  --last-play 3
+```
+
+如果当前是主动出牌，去掉 `--last-play 3`。如果上一手是对子、三张或其他牌型，按牌面写入，例如 `--last-play "5 5"`、`--last-play "Q Q Q"`。如果窗口位置、窗口大小、显示器或缩放发生变化，`--roi-box 180,555,1300,758` 需要重新标定。
+
 常用参数：
 
 - `--roi-box`：屏幕 ROI，格式为 `left,top,right,bottom`，默认 `(380,1110,2555,1515)`。
