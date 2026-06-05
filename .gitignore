@@ -41,6 +41,7 @@ htmlcov/
 
 # Local agent/collaboration notes
 AGENTS.md
+configs/phase3_runtime.local.json
 
 # Jupyter
 .ipynb_checkpoints/

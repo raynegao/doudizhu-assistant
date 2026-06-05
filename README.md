@@ -212,17 +212,69 @@ python -m scripts.run_phase3_runtime \
 
 如果当前是主动出牌，去掉 `--last-play 3`。如果上一手是对子、三张或其他牌型，按牌面写入，例如 `--last-play "5 5"`、`--last-play "Q Q Q"`。如果窗口位置、窗口大小、显示器或缩放发生变化，`--roi-box 180,555,1300,758` 需要重新标定。
 
+## Phase 3.5：窗口标定与稳定识别
+
+Phase 3.5 支持从当前 Mac 斗地主窗口生成本地 ROI 配置，并用最近 N 帧投票稳定识别结果。
+
+先打开斗地主窗口并进入牌局，然后运行：
+
+```bash
+python -m scripts.calibrate_phase3_roi \
+  --app-name 斗地主 \
+  --save-config configs/phase3_runtime.local.json
+```
+
+该命令会读取 `斗地主` 窗口位置，生成 `configs/phase3_runtime.local.json`。这个本地配置已被 `.gitignore` 忽略，不会提交到 Git。
+
+使用本地配置运行：
+
+```bash
+python -m scripts.run_phase3_runtime \
+  --config configs/phase3_runtime.local.json \
+  --max-frames 3 \
+  --device cpu \
+  --no-clear
+```
+
+也可以在运行时重新读取窗口位置：
+
+```bash
+python -m scripts.run_phase3_runtime \
+  --config configs/phase3_runtime.local.json \
+  --auto-window \
+  --app-name 斗地主 \
+  --max-frames 3 \
+  --device cpu \
+  --no-clear
+```
+
+默认稳定窗口为 `--stability-window 3`。设为 `1` 可关闭跨帧投票：
+
+```bash
+python -m scripts.run_phase3_runtime \
+  --config configs/phase3_runtime.local.json \
+  --stability-window 1 \
+  --max-frames 1 \
+  --device cpu \
+  --no-clear
+```
+
+如果斗地主窗口移动、缩放或换显示器，重新运行 `scripts.calibrate_phase3_roi` 即可。
+
 常用参数：
 
 - `--roi-box`：屏幕 ROI，格式为 `left,top,right,bottom`，默认 `(380,1110,2555,1515)`。
 - `--count`、`--start-x`、`--start-y`、`--step-x`、`--crop-size`：沿用 Phase 2 固定切牌参数。
 - `--last-play`：上一手牌；留空表示主动出牌。
+- `--config`：读取本地 ROI 配置，通常使用 `configs/phase3_runtime.local.json`。
+- `--auto-window`：运行前重新读取斗地主窗口并换算 ROI。
+- `--stability-window`：最近 N 帧投票稳定识别结果，默认 `3`。
 - `--confidence-threshold`：低置信度 warning 阈值，默认 `0.70`。
 - `--log-file`：默认写入 `logs/phase3_runtime.jsonl`。
 
 macOS 首次运行可能需要给终端或 Codex app 授权“屏幕录制”。如果未授权，CLI 会输出截图权限错误；授权后重新运行即可。如果看到 `does not intersect any displays`，说明当前 `--roi-box` 不在活动显示器坐标范围内，需要重新标定 ROI；Retina 屏幕下 `screencapture` 使用的坐标可能和截图像素尺寸不同。
 
-Phase 3 JSONL 每帧包含 `event`、`frame_id`、`timestamp`、`source`、`roi_box`、`recognized_cards`、`observations`、`last_play`、`candidate_count`、`recommended_action`、`reason`、`warnings` 和 `latency_ms`。
+Phase 3 JSONL 每帧包含 `event`、`frame_id`、`timestamp`、`source`、`roi_box`、`raw_recognized_cards`、`recognized_cards`、`observations`、`last_play`、`candidate_count`、`recommended_action`、`reason`、`warnings`、`latency_ms`、`stabilized` 和 `stability_window`。
 
 ## 配置与日志
 - 配置文件支持 YAML/JSON，示例见 `configs/app.example.yaml`。

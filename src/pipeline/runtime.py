@@ -5,7 +5,7 @@ import time
 from collections.abc import Callable, Iterator, Sequence
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Protocol
+from typing import Any, Protocol
 
 from PIL import Image
 import torch
@@ -66,6 +66,7 @@ class RuntimeDecisionEvent:
     timestamp: float
     source: str
     roi_box: tuple[int, int, int, int]
+    raw_recognized_cards: tuple[str, ...]
     recognized_cards: tuple[str, ...]
     observations: tuple[CardObservation, ...]
     last_play: tuple[str, ...]
@@ -74,6 +75,8 @@ class RuntimeDecisionEvent:
     reason: str
     warnings: tuple[str, ...]
     latency_ms: float
+    stabilized: bool = False
+    stability_window: int = 1
     error: str | None = None
 
     def to_log_payload(self) -> dict[str, object]:
@@ -83,6 +86,7 @@ class RuntimeDecisionEvent:
             "timestamp": self.timestamp,
             "source": self.source,
             "roi_box": list(self.roi_box),
+            "raw_recognized_cards": list(self.raw_recognized_cards),
             "recognized_cards": list(self.recognized_cards),
             "observations": [observation.to_payload() for observation in self.observations],
             "last_play": list(self.last_play),
@@ -91,6 +95,8 @@ class RuntimeDecisionEvent:
             "reason": self.reason,
             "warnings": list(self.warnings),
             "latency_ms": self.latency_ms,
+            "stabilized": self.stabilized,
+            "stability_window": self.stability_window,
         }
         if self.error:
             payload["error"] = self.error
@@ -111,6 +117,7 @@ class RuntimeSettings:
     last_play: str = ""
     log_file: Path | None = Path("logs/phase3_runtime.jsonl")
     source: str = "mac_screen"
+    stability_window: int = 3
 
 
 class FrameSource(Protocol):
@@ -162,10 +169,12 @@ class Phase3Runtime:
         settings: RuntimeSettings,
         frame_source: FrameSource | None = None,
         predictor: PredictionFn | None = None,
+        stabilizer: Any | None = None,
         sleeper: Callable[[float], None] = time.sleep,
     ) -> None:
         self.settings = settings
         self.frame_source = frame_source or MacScreenFrameSource(settings.roi_box, source=settings.source)
+        self._stabilizer = stabilizer
         self._sleeper = sleeper
         self._next_frame_id = 1
         if predictor is None:
@@ -179,11 +188,23 @@ class Phase3Runtime:
         current_frame_id = self._allocate_frame_id(frame_id)
         started_at = time.perf_counter()
         frame = self.frame_source.capture(current_frame_id)
-        observations = self._observe_frame(frame)
+        raw_observations = self._observe_frame(frame)
+        if self._stabilizer is not None:
+            stable_result = self._stabilizer.update(raw_observations)
+            observations = stable_result.stable
+            stabilized = stable_result.stabilized
+            stability_window = stable_result.window_size
+        else:
+            observations = raw_observations
+            stabilized = False
+            stability_window = 1
         event = self._build_decision_event(
             frame=frame,
+            raw_observations=raw_observations,
             observations=observations,
             latency_ms=(time.perf_counter() - started_at) * 1000,
+            stabilized=stabilized,
+            stability_window=stability_window,
         )
         if self.settings.log_file is not None:
             write_runtime_event(self.settings.log_file, event)
@@ -231,9 +252,13 @@ class Phase3Runtime:
     def _build_decision_event(
         self,
         frame: ScreenFrame,
+        raw_observations: tuple[CardObservation, ...],
         observations: tuple[CardObservation, ...],
         latency_ms: float,
+        stabilized: bool,
+        stability_window: int,
     ) -> RuntimeDecisionEvent:
+        raw_recognized_cards = tuple(observation.rank for observation in raw_observations)
         recognized_cards = tuple(observation.rank for observation in observations)
         warnings = [
             f"low-confidence card {observation.index:02d}: {observation.rank}={observation.confidence:.3f}"
@@ -262,6 +287,7 @@ class Phase3Runtime:
             timestamp=frame.timestamp,
             source=frame.source,
             roi_box=frame.roi_box,
+            raw_recognized_cards=raw_recognized_cards,
             recognized_cards=recognized_cards,
             observations=observations,
             last_play=tuple(last_play),
@@ -270,6 +296,8 @@ class Phase3Runtime:
             reason=reason,
             warnings=tuple(warnings),
             latency_ms=latency_ms,
+            stabilized=stabilized,
+            stability_window=stability_window,
             error=error,
         )
 
@@ -317,7 +345,9 @@ def format_runtime_event(event: RuntimeDecisionEvent) -> str:
         "Dou Dizhu Phase 3 Runtime",
         f"frame={event.frame_id} source={event.source} latency={event.latency_ms:.1f}ms",
         f"roi_box={event.roi_box}",
+        f"raw识别: {' '.join(event.raw_recognized_cards) if event.raw_recognized_cards else '(none)'}",
         f"识别手牌: {' '.join(event.recognized_cards) if event.recognized_cards else '(none)'}",
+        f"稳定窗口: {event.stability_window} stabilized={event.stabilized}",
         "单牌置信度:",
     ]
     for observation in event.observations:

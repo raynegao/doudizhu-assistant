@@ -1,0 +1,15 @@
+{
+  "app_name": "斗地主",
+  "window_name": "斗地主",
+  "window_box": [147, 82, 1323, 849],
+  "roi_box": [180, 555, 1300, 758],
+  "count": 17,
+  "start_x": 0,
+  "start_y": 10,
+  "step_x": 60,
+  "crop_size": [63, 105],
+  "confidence_threshold": 0.7,
+  "stability_window": 3,
+  "log_file": "logs/phase3_runtime.jsonl",
+  "created_at": 0
+}
