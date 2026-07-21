@@ -26,6 +26,11 @@ RANKS: tuple[str, ...] = (
 
 RANK_VALUE: dict[str, int] = {rank: index for index, rank in enumerate(RANKS)}
 CHAIN_RANKS: tuple[str, ...] = RANKS[:12]
+FULL_DECK: tuple[str, ...] = tuple(
+    card
+    for rank in RANKS
+    for card in ([rank] if rank in {"SJ", "BJ"} else [rank] * 4)
+)
 
 _ALIASES: dict[str, str] = {
     "T": "10",
@@ -50,7 +55,7 @@ _ALIASES: dict[str, str] = {
 }
 
 _TOKEN_RE = re.compile(
-    r"小王|大王|BLACKJOKER|REDJOKER|SMALLJOKER|BIGJOKER|BJ|RJ|SJ|10|[3-9JQKATXD]",
+    r"小王|大王|BLACKJOKER|REDJOKER|SMALLJOKER|BIGJOKER|BJ|RJ|SJ|10|[2-9JQKATXD]",
     re.IGNORECASE,
 )
 
@@ -133,6 +138,7 @@ __all__ = [
     "CHAIN_RANKS",
     "CardParseError",
     "CardSet",
+    "FULL_DECK",
     "RANKS",
     "RANK_VALUE",
     "normalize_rank",

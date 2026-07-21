@@ -21,6 +21,8 @@ class PlayType(str, Enum):
     PLANE = "plane"
     PLANE_SINGLE = "plane_single"
     PLANE_PAIR = "plane_pair"
+    FOUR_TWO_SINGLE = "four_two_single"
+    FOUR_TWO_PAIR = "four_two_pair"
     BOMB = "bomb"
     ROCKET = "rocket"
     INVALID = "invalid"
@@ -99,6 +101,12 @@ def classify_play(cards: Iterable[str]) -> Play:
 
     if size == 5 and count_values == [3, 2]:
         return Play(normalized, PlayType.TRIPLE_PAIR, ranks_by_count[3][0], size, 1)
+
+    if size == 6 and count_values == [4, 1, 1]:
+        return Play(normalized, PlayType.FOUR_TWO_SINGLE, ranks_by_count[4][0], size, 1)
+
+    if size == 8 and count_values == [4, 2, 2]:
+        return Play(normalized, PlayType.FOUR_TWO_PAIR, ranks_by_count[4][0], size, 1)
 
     if _is_straight_counts(counts):
         return Play(normalized, PlayType.STRAIGHT, _chain_main_rank(counts), size, size)
@@ -223,6 +231,18 @@ def _all_candidate_plays(hand: CardSet) -> list[Play]:
             if pair != triple:
                 candidates.add(tuple(sorted((triple, triple, triple, pair, pair), key=RANK_VALUE.__getitem__)))
 
+    bomb_ranks = [rank for rank, count in counts.items() if count == 4]
+    for bomb in bomb_ranks:
+        single_ranks = [rank for rank in counts if rank != bomb]
+        for kickers in combinations(single_ranks, 2):
+            candidates.add(sort_cards((bomb, bomb, bomb, bomb, *kickers)))
+        pair_ranks = [rank for rank, count in counts.items() if rank != bomb and count >= 2]
+        for kickers in combinations(pair_ranks, 2):
+            cards = [bomb, bomb, bomb, bomb]
+            for rank in kickers:
+                cards.extend([rank, rank])
+            candidates.add(sort_cards(cards))
+
     _add_straights(candidates, counts)
     _add_pair_straights(candidates, counts)
     _add_planes(candidates, counts)
@@ -282,7 +302,7 @@ def _consecutive_slices(ranks: list[str], min_len: int) -> list[list[str]]:
     return chains
 
 
-def _play_sort_key(play: Play) -> tuple[int, int, int, int]:
+def _play_sort_key(play: Play) -> tuple[int, int, int, int, tuple[int, ...]]:
     type_order = {
         PlayType.PASS: 0,
         PlayType.SINGLE: 1,
@@ -295,12 +315,15 @@ def _play_sort_key(play: Play) -> tuple[int, int, int, int]:
         PlayType.PLANE: 8,
         PlayType.PLANE_SINGLE: 9,
         PlayType.PLANE_PAIR: 10,
-        PlayType.BOMB: 11,
-        PlayType.ROCKET: 12,
+        PlayType.FOUR_TWO_SINGLE: 11,
+        PlayType.FOUR_TWO_PAIR: 12,
+        PlayType.BOMB: 13,
+        PlayType.ROCKET: 14,
         PlayType.INVALID: 99,
     }
     main_value = RANK_VALUE[play.main_rank] if play.main_rank else -1
-    return (len(play.cards), type_order[play.type], main_value, play.combo_size)
+    card_values = tuple(RANK_VALUE[card] for card in play.cards)
+    return (len(play.cards), type_order[play.type], main_value, play.combo_size, card_values)
 
 
 __all__ = ["Play", "PlayType", "can_beat", "classify_play", "legal_actions"]

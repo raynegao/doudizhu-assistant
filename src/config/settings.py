@@ -31,9 +31,13 @@ class InferenceConfig(BaseModel):
 
 
 class MonteCarloConfig(BaseModel):
-    simulations: int = 200
-    max_depth: int = 50
-    time_budget_ms: int = 100
+    simulations: int = Field(default=200, gt=0)
+    max_depth: int = Field(default=50, gt=0)
+    time_budget_ms: int = Field(default=500, ge=0)
+    seed: int = 20260721
+    top_k: int = Field(default=3, gt=0)
+    max_candidates: int = Field(default=12, gt=0)
+    min_rollouts_per_action: int = Field(default=8, gt=0)
 
 
 class LoggingConfig(BaseModel):

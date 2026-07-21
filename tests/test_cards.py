@@ -28,6 +28,10 @@ def test_parse_cards_distinguishes_joker_aliases() -> None:
     assert parse_cards("X D") == ("SJ", "BJ")
 
 
+def test_parse_single_two_without_separator() -> None:
+    assert parse_cards("2") == ("2",)
+
+
 def test_card_set_rejects_too_many_rank_cards() -> None:
     with pytest.raises(CardParseError):
         CardSet.parse("3 3 3 3 3")

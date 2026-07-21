@@ -12,7 +12,11 @@ inference:
 monte_carlo:
   simulations: 200
   max_depth: 50
-  time_budget_ms: 100
+  time_budget_ms: 500
+  seed: 20260721
+  top_k: 3
+  max_candidates: 12
+  min_rollouts_per_action: 8
 
 logging:
   level: INFO

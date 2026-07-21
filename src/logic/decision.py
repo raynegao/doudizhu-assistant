@@ -89,6 +89,8 @@ def _decision_sort_key(play: Play) -> tuple[int, int, int, int]:
         PlayType.PLANE: 8,
         PlayType.PLANE_SINGLE: 9,
         PlayType.PLANE_PAIR: 10,
+        PlayType.FOUR_TWO_SINGLE: 11,
+        PlayType.FOUR_TWO_PAIR: 12,
         PlayType.BOMB: 50,
         PlayType.ROCKET: 60,
         PlayType.PASS: 99,
