@@ -8,11 +8,16 @@
 
 ## 2. 当前结构评审
 
-当前仓库已经完成 Phase 1 规则引擎 MVP、Phase 2 本地 CNN 牌面识别 replay、Phase 3/3.5 实时识别与稳定化，以及 Phase 4 显式牌局状态/蒙特卡洛决策闭环：
+当前仓库已经完成 Phase 1 规则引擎 MVP、Phase 2 本地 CNN 牌面识别 replay、Phase 3/3.5 实时识别与稳定化、Phase 4 显式牌局状态/蒙特卡洛决策闭环，以及 Phase 5A 可复现工程展示：
 
 ```text
 configs/
   app.example.yaml
+docs/
+  ARCHITECTURE.md
+  EVALUATION.md
+  PORTFOLIO.md
+  SHOWCASE.md
 tests/
   test_card_classifier.py
   test_card_dataset_scripts.py
@@ -24,12 +29,15 @@ tests/
   test_opponent_model.py
   test_phase4_decision.py
   test_phase4_cli.py
+  test_event_replay.py
+  test_phase5_showcase.py
   test_rules.py
 scripts/
   calibrate_phase3_roi.py
   crop_hand_roi_cards.py
   predict_card_crops.py
   run_phase4_decision.py
+  run_phase5_showcase.py
   run_phase3_runtime.py
   replay_phase2.py
   train_card_cnn.py
@@ -46,12 +54,15 @@ src/
     calibration.py
     runtime.py
     stabilizer.py
+  reporting/
+    showcase.py
   state/
     cards.py
     events.py
     game_tracker.py
     game_state.py
     observable_state.py
+    replay.py
   tracking/
   ui/
     cli.py
@@ -274,14 +285,17 @@ Phase 4 数据流：
 
 目标：让项目适合申请材料和实习简历展示。
 
-核心内容：
+状态：Phase 5A 已完成，Phase 5B 待开始。
 
-- README。
-- 架构图。
-- Demo 视频或截图说明。
-- Docker。
-- 测试和指标报告。
-- 项目总结和简历描述。
+Phase 5A 已完成：
+
+- 三个固定 JSONL 场景和固定 seed 决策指纹。
+- JSON、Markdown、HTML 一键 Showcase。
+- 历史 CNN 指标摘要与 Phase 4 延迟基准证据。
+- Python 3.10/3.12 CI、依赖分层和 CPU Docker Demo。
+- 精简架构图、录屏说明和中英文作品集材料。
+
+Phase 5B 再增加最小只读 Web API/UI、公开 Demo GIF 和真实窗口独立 holdout。
 
 ## 6. 逐层模块职责
 
@@ -339,13 +353,19 @@ Phase 4 数据流：
 
 建议：后续可以分为 `cli.py`、`api.py`、`desktop.py`。如果做 Web GUI，建议 FastAPI + WebSocket 提供实时状态流，前端只负责渲染和交互。
 
+### `src/reporting/`
+
+职责：把已完成的离线决策结果汇总为可追溯证据，不改变状态或算法输出。
+
+当前实现：Phase 5A 使用纯 Python 生成 JSON、Markdown 和自包含 HTML，记录环境、固定 seed、决策指纹、Top-K、延迟和风险字段；输出默认位于被忽略的 `runs/`。
+
 ### `src/config/`
 
 职责：配置模型、配置加载、热更新和日志参数。
 
 合理性：已有 Pydantic 配置是好的开始。
 
-问题：当前 `LoggingConfig.json` 字段名会遮蔽 Pydantic `BaseModel.json` 方法，建议后续改为 `json_format` 或 `structured`。另外 `ConfigManager` 当前要求 `Path`，README/示例要保持一致。
+当前实现已用 `LoggingConfig.json_output` 消除 Pydantic 属性遮蔽，并通过 alias 兼容配置文件中的 `json` 字段。`ConfigManager` 仍要求 `Path`，README/示例需保持一致。
 
 建议：随着项目扩展，配置应拆分为 `CaptureConfig`、`VisionConfig`、`TrackingConfig`、`StateConfig`、`DecisionConfig`、`RuntimeConfig`、`UIConfig`、`AgentConfig`、`LoggingConfig`。
 
@@ -381,7 +401,9 @@ Phase 1 不创建该模块；等规则、状态和日志稳定后再引入。
 
 ### `scripts/`
 
-职责：数据合成、训练、导出 ONNX、回放、评测、性能测试。
+职责：数据合成、训练、导出 ONNX、回放、评测、性能测试和 Showcase 构建。
+
+当前 Phase 5A 入口是 `scripts/run_phase5_showcase.py`，使用三个已提交事件场景生成可复现决策证据。
 
 建议脚本：
 
@@ -404,14 +426,13 @@ Phase 1 不创建该模块；等规则、状态和日志稳定后再引入。
 
 ### `docs/`
 
-用于申请和实习展示。建议包含：
+用于申请和实习展示。当前已包含：
 
 - 系统架构图
-- 数据集与标注流程
-- 模型训练与评测报告
-- 实时推理延迟报告
-- Demo 截图/视频说明
-- 失败案例分析
+- 本地小样本 CNN 指标摘要与 manifest 哈希
+- Phase 4 三场景延迟/指纹证据
+- Demo 运行与录屏说明
+- 中英文作品集文案、已知风险和诚实边界
 
 ## 8. 数据流设计建议
 
@@ -493,14 +514,9 @@ ExplanationEvent
 
 ### Docker
 
-Phase 1 不做 Docker。先规划 `.dockerignore` 排除 `.venv`、`data`、`models`、`logs`。
+Phase 5A 已提供 core-only CPU `Dockerfile`，通过 `.dockerignore` 排除 `.venv`、`data`、`models`、`logs` 和本地配置。容器只承诺 Phase 1/4/5 离线 Showcase，不承诺 macOS 截屏或模型推理。
 
-Phase 2/3 再考虑：
-
-- `Dockerfile`：CPU API/评测环境
-- `docker-compose.yml`：API + 前端 + 日志目录挂载
-
-模型权重不要直接进 Git，可用下载脚本或 release artifact。
+模型权重不直接进 Git；如 Phase 5B 需要公开视觉 Demo，应使用带 SHA256 的 release artifact 或只读挂载。
 
 ## 11. 申请和实习竞争力判断
 
@@ -521,16 +537,16 @@ Phase 2/3 再考虑：
 - 前后端实时交互
 - 工程可维护性和部署意识
 
-目前短板是实时视觉还不能自动生成对手出牌/过牌/剩余张数事件，也没有 GUI 展示、Docker 和作品集级 Demo。Phase 1 已有 CLI 规则闭环，Phase 2 已有本地 CNN replay，Phase 3/3.5 已有实时刷新、窗口标定和跨帧投票，Phase 4 已有显式事件状态与蒙特卡洛决策闭环。后续应进入 Phase 5，优先做可复现 Demo、指标报告和展示层。
+Phase 5A 已补齐可复现 Showcase、三类事件场景、指标证据、CI、CPU Docker 和作品集文档。当前主要短板转为：实时视觉仍不能自动生成对手出牌/过牌/剩余张数事件，Phase 2 缺少可公开的模型 Release 与真实窗口独立 holdout，展示层尚无最小 Web API/UI。
 
 ## 12. 当前架构结论
 
-当前目录划分已经形成 Phase 1–4 的可测试闭环：规则、CNN/replay、实时识别、窗口/跨帧稳定，以及显式事件驱动的状态跟踪和蒙特卡洛决策。最需要避免的是在对手事件视觉输入尚未具备时，把离线状态模型描述成真实窗口自动整局跟踪。下一步应进入 Phase 5，补齐可复现 Demo、性能/准确率报告、GUI/API 和部署材料。
+当前目录划分已经形成 Phase 1–5A 的可测试闭环：规则、CNN/replay、实时识别、窗口/跨帧稳定、显式事件状态、蒙特卡洛决策，以及可复现报告/CI/Docker。最需要避免的是在对手事件视觉输入尚未具备时，把离线状态模型描述成真实窗口自动整局跟踪。
 
-推荐下一阶段目标：
+推荐下一阶段目标（Phase 5B）：
 
 ```text
-固定 replay/显式事件 -> Phase 4 指标基准 -> GUI/API 展示 -> Demo/架构图 -> Docker/作品集材料
+固定 replay/显式事件 -> 只读 Web API/UI -> 公开 Demo GIF -> 真实窗口独立 holdout -> 可选模型 Release
 ```
 
-这个阶段复用已经验证的 Phase 1–4 离线闭环，重点把输入、状态、对手估计、推荐和风险展示成可复现作品集证据；自动操作和强化学习仍不进入当前路线。
+Phase 5B 继续复用已验证的离线证据链，只增加展示和独立评测，不改变自动操作和强化学习仍不进入当前路线的约束。

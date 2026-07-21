@@ -1,7 +1,26 @@
 # doudizhu-assistant
 AI-based Dou Dizhu assistant with Mac screen capture, CNN card recognition, a rule engine, real-time recommendations, and multi-frame stabilization.
 
-当前已完成 Phase 1–4：规则引擎、CNN 牌面识别 replay、Mac 固定 ROI 实时流水线、窗口标定、跨帧稳定投票，以及基于显式牌局事件的对手牌估计、蒙特卡洛策略与 Top-K 推荐。下一阶段是工程化展示。
+[![CI](https://github.com/raynegao/doudizhu-assistant/actions/workflows/ci.yml/badge.svg)](https://github.com/raynegao/doudizhu-assistant/actions/workflows/ci.yml)
+
+当前已完成 Phase 1–5A：规则引擎、CNN 牌面识别 replay、Mac 固定 ROI 实时流水线、窗口标定、跨帧稳定投票、显式事件状态、蒙特卡洛 Top-K 推荐，以及可复现 Showcase/CI/Docker。下一阶段是最小 Web/API 展示和公开 Demo 素材。
+
+## 一分钟作品集 Demo
+
+不需要模型权重、原始数据或游戏窗口即可生成可复现报告：
+
+```bash
+source .venv/bin/activate
+make demo
+open runs/showcase/index.html
+```
+
+输出包括机器可读 `report.json`、CI 摘要 `summary.md` 和完全离线的响应式 `index.html`。默认覆盖地主主动、地主响应和农民响应三个固定事件场景，并验证 sampled worlds 完成数、Top-K 排序与固定 seed 决策指纹。
+
+- [精简架构图](docs/ARCHITECTURE.md)
+- [Demo 与录屏说明](docs/SHOWCASE.md)
+- [评测口径与基准](docs/EVALUATION.md)
+- [中英文作品集/简历描述](docs/PORTFOLIO.md)
 
 ## 环境
 - Python 3.12.13（>=3.10 均可，当前本地开发使用 3.12）
@@ -315,6 +334,19 @@ Phase 4 当前能力：
 - 补充四带二单/四带二对；飞机单翅膀仍采用“不同点数单牌”的严格规则口径。
 
 重要边界：当前 Phase 3 只能自动识别自己的手牌，尚未自动识别对手出牌、过牌和剩余张数。因此 Phase 4 的智能决策通过显式事件/JSONL replay 验证，默认不会拖慢 Phase 3 实时路径。均匀分配是可解释的概率基线，不是对手真实手牌预测；日志会保留 `uniform_opponent_model` 和 `rule_subset_only` 风险提示。
+
+## Phase 5A：工程化展示
+
+Phase 5A 已完成可复现证据链：
+
+- `scripts/run_phase5_showcase.py` 一条命令运行 Phase 1 基线和三个 Phase 4 场景。
+- 固定 seed 重复执行并生成决策指纹，区分算法一致性与机器相关延迟。
+- 输出 JSON、Markdown 和完全自包含的 HTML 作品集报告。
+- 核心/视觉依赖分层，CPU Docker 不携带权重、截图或私有数据。
+- GitHub Actions 在 Python 3.10/3.12 验证核心路径，并在 Python 3.12 跑完整测试。
+- 当前 Phase 5 验证基线为 `79 passed`，详细证据见 `docs/evidence/`。
+
+Phase 5B 再考虑最小 Web API/UI 和可公开 Demo GIF；不在展示阶段引入自动点击、强化学习或未经验证的真实窗口准确率宣传。
 
 ## 配置与日志
 - 配置文件支持 YAML/JSON，示例见 `configs/app.example.yaml`。

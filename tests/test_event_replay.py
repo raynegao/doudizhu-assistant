@@ -31,4 +31,3 @@ def test_event_replay_reports_json_line_number(tmp_path: Path) -> None:
 
     with pytest.raises(ValueError, match="line 2"):
         load_event_replay(path, validator=validate_observed_action)
-

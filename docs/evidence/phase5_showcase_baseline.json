@@ -1,0 +1,20 @@
+{
+  "schema_version": "phase5-baseline-evidence-v1",
+  "source_commit": "e67035c",
+  "generated_at_utc": "2026-07-21T04:43:14.230394+00:00",
+  "environment": {"python": "3.12.13", "system": "Darwin 25.5.0", "machine": "arm64"},
+  "command": "python -m scripts.run_phase5_showcase --output-dir runs/showcase-benchmark --repeats 3 --simulations 20 --max-depth 20",
+  "settings": {"simulations": 20, "max_depth": 20, "seed": 20260721, "repeats": 3, "top_k": 3, "max_candidates": 8, "time_budget_ms": 0},
+  "overall_status": "passed",
+  "phase1": {"recommended_action": ["6", "6"], "deterministic": true},
+  "phase4_scenarios": [
+    {"name": "farmer_response", "landlord": "right", "completed_simulations": 20, "decision_fingerprint": "c07a71c931229e0e", "recommended_action": ["J"], "median_latency_ms": 375.152, "p95_latency_ms": 375.178, "worlds_per_second": 54.296},
+    {"name": "landlord_lead", "landlord": "self", "completed_simulations": 20, "decision_fingerprint": "6f8a4d361d643bde", "recommended_action": ["3", "4", "5", "6", "7", "8", "9", "10", "J", "Q", "K", "A"], "median_latency_ms": 191.608, "p95_latency_ms": 191.789, "worlds_per_second": 104.775},
+    {"name": "landlord_response", "landlord": "self", "completed_simulations": 20, "decision_fingerprint": "f1b00e9197f67003", "recommended_action": ["9"], "median_latency_ms": 312.358, "p95_latency_ms": 313.232, "worlds_per_second": 64.253}
+  ],
+  "limitations": [
+    "Latency is machine-specific and is not a cross-platform threshold.",
+    "The opponent model uniformly samples unknown remaining cards.",
+    "The result validates deterministic replay behavior, not real-window generalization."
+  ]
+}
