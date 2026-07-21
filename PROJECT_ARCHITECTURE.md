@@ -8,7 +8,7 @@
 
 ## 2. 当前结构评审
 
-当前仓库已经完成 Phase 1 规则引擎 MVP、Phase 2 本地 CNN 牌面识别 replay 闭环，并具备 Phase 3 第一版固定 ROI 实时系统：
+当前仓库已经完成 Phase 1 规则引擎 MVP、Phase 2 本地 CNN 牌面识别 replay 闭环、Phase 3 第一版固定 ROI 实时系统和 Phase 3.5 窗口标定/跨帧稳定识别：
 
 ```text
 configs/
@@ -19,8 +19,10 @@ tests/
   test_cards.py
   test_decision_cli.py
   test_phase2_replay.py
+  test_phase3_runtime.py
   test_rules.py
 scripts/
+  calibrate_phase3_roi.py
   crop_hand_roi_cards.py
   predict_card_crops.py
   run_phase3_runtime.py
@@ -33,7 +35,9 @@ src/
     decision.py
     rules.py
   pipeline/
+    calibration.py
     runtime.py
+    stabilizer.py
   state/
     cards.py
     game_state.py
@@ -47,7 +51,7 @@ pytest.ini
 requirements-dev.txt
 ```
 
-整体模块方向合理，已经把采集、视觉、跟踪、状态、决策和 UI 分成不同包，符合 AI 工程项目的基本分层意识。当前已实现手动输入到 `GameStateSnapshot`、合法动作生成、基础推荐、CLI 输出和 JSONL 日志；Phase 2 已实现固定 ROI、切牌、小 CNN 分类、模型导出、评估和 replay 接入规则引擎；Phase 3 第一版已新增 `pipeline/runtime`，把 Mac 固定 ROI 截屏、内存切牌、CNN 推理、规则推荐、终端面板和 JSONL 日志串成可刷新系统。主要缺口转为更稳定的窗口定位、GUI 展示、对局状态跟踪、Agent 工作流层和部署层。
+整体模块方向合理，已经把采集、视觉、跟踪、状态、决策和 UI 分成不同包，符合 AI 工程项目的基本分层意识。当前已实现手动输入到 `GameStateSnapshot`、合法动作生成、基础推荐、CLI 输出和 JSONL 日志；Phase 2 已实现固定 ROI、切牌、小 CNN 分类、模型导出、评估和 replay 接入规则引擎；Phase 3 第一版已新增 `pipeline/runtime`，把 Mac 固定 ROI 截屏、内存切牌、CNN 推理、规则推荐、终端面板和 JSONL 日志串成可刷新系统；Phase 3.5 已补齐窗口标定、本地 ROI 配置和跨帧稳定投票。主要缺口转为对局事件跟踪、智能决策、GUI 展示、Agent 工作流层和部署层。
 
 ## 3. 推荐分层
 
@@ -121,7 +125,7 @@ Phase 1 不实现 `src/agent/`。Agent 工作流要等 `GameStateSnapshot`、`De
 
 目标：在不依赖 CV 模型的情况下跑通“输入手牌 -> 结构化状态 -> 合法动作 -> 基础推荐 -> 展示”的最小闭环。
 
-状态：已实现，当前进入收尾维护阶段。后续只做缺陷修复、测试补强、日志字段稳定和文档同步，不再扩大 Phase 1 范围。
+状态：已完成，作为后续阶段的稳定规则基础维护。后续只做缺陷修复、测试补强和日志字段稳定，不再扩大 Phase 1 范围。
 
 更收敛的 Phase 1 数据流：
 
@@ -202,7 +206,7 @@ Phase 1 最小日志字段：
 
 目标：把截图、识别、状态、决策、展示串成可刷新系统。
 
-状态：第一版已实现。当前支持 Mac 固定 ROI 截屏、内存切牌、CNN 推理、`GameStateSnapshot` 构造、合法动作/推荐、终端实时面板和 JSONL 日志。暂不做自动窗口定位、复杂 GUI、蒙特卡洛胜率估计或自动操作。
+状态：第一版已实现。当前支持 Mac 固定 ROI 截屏、内存切牌、CNN 推理、`GameStateSnapshot` 构造、合法动作/推荐、终端实时面板和 JSONL 日志。第一版未包含的窗口定位和跨帧稳定识别已在 Phase 3.5 补齐；复杂 GUI、蒙特卡洛胜率估计和自动操作仍未实现。
 
 核心内容：
 
@@ -331,7 +335,7 @@ Phase 3.5 数据流：
 
 职责：串联截图、推理、跟踪、状态更新、决策和 UI 推送；管理异步队列、线程池、背压、FPS 和错误恢复。
 
-当前 Phase 3 第一版已经新增 `src/pipeline/runtime.py`，职责收敛为固定 ROI 截屏、内存切牌、CNN 分类、规则推荐、终端事件和 JSONL 日志。后续再逐步扩展到窗口定位、异步队列、稳定跟踪和 GUI 推送。
+当前 Phase 3/3.5 已新增 `src/pipeline/runtime.py`、`calibration.py` 和 `stabilizer.py`，职责收敛为固定 ROI 截屏、窗口标定、内存切牌、CNN 分类、跨帧投票、规则推荐、终端事件和 JSONL 日志。后续再逐步扩展到对局事件跟踪、异步队列和 GUI 推送。
 
 建议数据流：
 
@@ -504,7 +508,7 @@ Phase 2/3 再考虑：
 推荐下一阶段目标：
 
 ```text
-固定截图源/窗口源 -> ROI -> CNN 识别 -> 状态刷新 -> 推荐输出 -> JSONL 日志
+稳定视觉观测 -> 对局事件/未知牌状态 -> 对手牌采样 -> 蒙特卡洛评估 -> Top-K 推荐与理由
 ```
 
-这个阶段只把视觉输入接成可刷新状态，继续复用 Phase 1 的规则、推荐和 Phase 2 的 CNN/replay 闭环，工程风险会低很多。
+这个阶段继续复用 Phase 1 的规则引擎和 Phase 2/3.5 的稳定视觉输入，重点补齐可测试的牌局状态与决策评估，不把 GUI、自动操作或强化学习混入同一阶段。

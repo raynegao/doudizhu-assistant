@@ -1,5 +1,7 @@
 # doudizhu-assistant
-AI-based Dou Dizhu assistant: screen card recognition + win rate estimation using YOLO and Monte Carlo simulation.
+AI-based Dou Dizhu assistant with Mac screen capture, CNN card recognition, a rule engine, real-time recommendations, and multi-frame stabilization.
+
+当前已完成 Phase 1–3.5：规则引擎、CNN 牌面识别 replay、Mac 固定 ROI 实时流水线、窗口标定和跨帧稳定投票。Phase 4 的对手剩余牌估计、蒙特卡洛策略与胜率评估尚未实现。
 
 ## 环境
 - Python 3.12.13（>=3.10 均可，当前本地开发使用 3.12）
@@ -46,7 +48,7 @@ Phase 1 现在作为稳定基础保留；后续 CV 和实时系统继续复用 C
 
 ## Phase 2：CNN 牌面识别闭环
 
-Phase 2 采用“固定 ROI + 规则切牌 + PyTorch CNN 分类”路线。Mac 本地已完成数据准备、训练、ONNX 导出、crop 推理和 replay 演示，当前进入收尾状态，下一步准备进入 Phase 3 实时系统。
+Phase 2 采用“固定 ROI + 规则切牌 + PyTorch CNN 分类”路线。Mac 本地已完成数据准备、训练、ONNX 导出、crop 推理和 replay 演示，并已被 Phase 3/3.5 实时系统复用。
 
 当前本地评估结果来自 `models/card_cnn.metrics.json` 和 `models/card_cnn.eval.json`：
 
