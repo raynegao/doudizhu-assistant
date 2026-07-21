@@ -12,7 +12,7 @@ from pathlib import Path
 from typing import Any, Callable, Optional
 
 import yaml
-from pydantic import BaseModel, Field, ValidationError
+from pydantic import BaseModel, ConfigDict, Field, ValidationError
 
 logger = logging.getLogger(__name__)
 
@@ -41,8 +41,10 @@ class MonteCarloConfig(BaseModel):
 
 
 class LoggingConfig(BaseModel):
+    model_config = ConfigDict(populate_by_name=True)
+
     level: str = "INFO"
-    json: bool = False
+    json_output: bool = Field(default=False, alias="json")
     file: Optional[Path] = None
 
 

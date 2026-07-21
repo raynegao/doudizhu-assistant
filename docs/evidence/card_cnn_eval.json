@@ -1,0 +1,34 @@
+{
+  "schema_version": "card-cnn-evidence-v1",
+  "scope": "Historical local fixed-ROI small-sample evaluation; not real-window generalization accuracy.",
+  "model_family": "small-card-cnn",
+  "dataset_manifest": {
+    "sample_count": 2110,
+    "sha256": "8c4b4ca03199a815711e8f7014c231cbb1b1f4ff61f81fefd9e2766249a01d62"
+  },
+  "splits": {
+    "train": {
+      "count": 1589,
+      "accuracy": 1.0
+    },
+    "val": {
+      "count": 422,
+      "accuracy": 1.0
+    },
+    "test": {
+      "count": 99,
+      "accuracy": 1.0
+    }
+  },
+  "error_count": 0,
+  "focus_error_count": 0,
+  "local_source_hashes": {
+    "card_cnn_eval_json": "a0ebd104b956b6281781b280f219da2d24f2ba145f21315095612d85891c3ef9",
+    "card_cnn_metrics_json": "474cdfa75bb16e0acde1133d6499dbe555345e6be8578684a987b85af7c94e89"
+  },
+  "limitations": [
+    "The original images and model weights are intentionally not committed.",
+    "The dataset contains local fixed-ROI samples and augmentations.",
+    "A separate real-window holdout is still required before claiming deployment accuracy."
+  ]
+}

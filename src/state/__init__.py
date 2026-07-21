@@ -8,6 +8,7 @@ from .game_tracker import (
 )
 from .game_state import GameStateSnapshot
 from .observable_state import ObservableGameState
+from .replay import ReplayLoadResult, load_event_replay
 
 __all__ = [
     "DEFAULT_TURN_ORDER",
@@ -21,7 +22,9 @@ __all__ = [
     "ObservedAction",
     "PlayerSeat",
     "RoundPhase",
+    "ReplayLoadResult",
     "StateUpdateResult",
     "StateUpdateStatus",
     "parse_cards",
+    "load_event_replay",
 ]

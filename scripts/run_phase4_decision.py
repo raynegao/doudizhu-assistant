@@ -10,9 +10,10 @@ from src.config.settings import ConfigManager
 from src.logic.action_validation import validate_observed_action
 from src.logic.monte_carlo import MonteCarloSettings, Phase4DecisionResult, recommend_phase4
 from src.state.cards import CardParseError
-from src.state.events import DEFAULT_TURN_ORDER, ObservedAction, PlayerSeat
-from src.state.game_tracker import GameStateTracker, GameStateTransitionError, StateUpdateStatus
+from src.state.events import PlayerSeat
+from src.state.game_tracker import GameStateTransitionError
 from src.state.observable_state import ObservableGameState
+from src.state.replay import load_event_replay
 
 
 def build_parser() -> argparse.ArgumentParser:
@@ -51,7 +52,12 @@ def main(argv: list[str] | None = None) -> int:
     args = build_parser().parse_args(argv)
     try:
         if args.events_file:
-            state, replay_warnings = _replay_events(Path(args.events_file))
+            replay = load_event_replay(
+                Path(args.events_file),
+                validator=validate_observed_action,
+            )
+            state = replay.state
+            replay_warnings = replay.warnings
         else:
             state = _build_direct_state(args)
             replay_warnings = ()
@@ -101,44 +107,6 @@ def _build_direct_state(args: argparse.Namespace) -> ObservableGameState:
         last_player=last_player,
         consecutive_passes=args.consecutive_passes,
     )
-
-
-def _replay_events(path: Path) -> tuple[ObservableGameState, tuple[str, ...]]:
-    payloads = [
-        json.loads(line)
-        for line in path.read_text(encoding="utf-8").splitlines()
-        if line.strip()
-    ]
-    if not payloads or payloads[0].get("event") != "game_started":
-        raise ValueError("events file must begin with a game_started object")
-    start = payloads[0]
-    remaining_payload = start.get("remaining_cards")
-    if not isinstance(remaining_payload, dict):
-        raise ValueError("game_started.remaining_cards must be an object")
-    state = ObservableGameState.from_inputs(
-        start.get("hand", ()),
-        round_id=str(start.get("round_id", path.stem)),
-        landlord=str(start.get("landlord", "self")),
-        current_actor=str(start.get("current_actor", "self")),
-        turn_order=start.get("turn_order", [seat.value for seat in DEFAULT_TURN_ORDER]),
-        remaining_cards={str(seat): int(count) for seat, count in remaining_payload.items()},
-        played_cards=start.get("played_cards", ()),
-        last_play=start.get("last_play", ()),
-        last_player=start.get("last_player"),
-        consecutive_passes=int(start.get("consecutive_passes", 0)),
-        state_confidence=float(start.get("state_confidence", 1.0)),
-    )
-    tracker = GameStateTracker(state, validator=validate_observed_action)
-    warnings: list[str] = []
-    for payload in payloads[1:]:
-        event = ObservedAction.from_payload(payload)
-        result = tracker.apply(event)
-        if result.status is StateUpdateStatus.REJECTED:
-            raise GameStateTransitionError(result.message)
-        if result.status in {StateUpdateStatus.DEFERRED, StateUpdateStatus.DUPLICATE}:
-            warnings.append(f"{result.status.value}: {event.event_id}: {result.message}")
-            warnings.extend(result.warnings)
-    return tracker.state, tuple(warnings)
 
 
 def format_phase4_result(

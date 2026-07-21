@@ -1,0 +1,14 @@
+.git
+.github
+.idea
+.venv
+__pycache__
+*.pyc
+.pytest_cache
+data
+models
+logs
+runs
+notebooks
+configs/phase3_runtime.local.json
+.DS_Store

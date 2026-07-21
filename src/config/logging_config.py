@@ -35,7 +35,7 @@ def _build_formatter(use_json: bool) -> logging.Formatter:
 
 def configure_logging(cfg: LoggingConfig) -> None:
     level = getattr(logging, cfg.level.upper(), logging.INFO)
-    formatter = _build_formatter(cfg.json)
+    formatter = _build_formatter(cfg.json_output)
 
     handlers: list[logging.Handler] = []
 

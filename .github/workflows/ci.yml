@@ -1,0 +1,71 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+
+jobs:
+  core:
+    name: Core / Python ${{ matrix.python-version }}
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        python-version: ["3.10", "3.12"]
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: ${{ matrix.python-version }}
+          cache: pip
+      - name: Install core test dependencies
+        run: python -m pip install -r requirements-core.txt "pytest>=8,<10"
+      - name: Compile
+        run: python -m compileall -q src scripts tests
+      - name: Test core and showcase
+        env:
+          PYTHONWARNINGS: error
+        run: >-
+          python -m pytest -q
+          tests/test_cards.py
+          tests/test_rules.py
+          tests/test_decision_cli.py
+          tests/test_game_tracker.py
+          tests/test_opponent_model.py
+          tests/test_phase4_decision.py
+          tests/test_phase4_cli.py
+          tests/test_event_replay.py
+          tests/test_phase5_showcase.py
+      - name: Build showcase artifact
+        run: >-
+          python -m scripts.run_phase5_showcase
+          --output-dir runs/showcase
+          --repeats 1
+          --simulations 4
+          --max-depth 8
+      - name: Add summary
+        run: cat runs/showcase/summary.md >> "$GITHUB_STEP_SUMMARY"
+      - uses: actions/upload-artifact@v4
+        if: matrix.python-version == '3.12'
+        with:
+          name: phase5-showcase
+          path: runs/showcase
+          retention-days: 30
+
+  vision:
+    name: Full suite / Python 3.12
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+          cache: pip
+      - name: Install full development dependencies
+        run: python -m pip install -r requirements-dev.txt
+      - name: Run full test suite
+        env:
+          PYTHONWARNINGS: error
+        run: python -m pytest -q
