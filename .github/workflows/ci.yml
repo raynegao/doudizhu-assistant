@@ -20,6 +20,7 @@ jobs:
         with:
           python-version: ${{ matrix.python-version }}
           cache: pip
+          cache-dependency-path: requirements-core.txt
       - name: Install core test dependencies
         run: python -m pip install -r requirements-core.txt "pytest>=8,<10"
       - name: Compile
@@ -63,6 +64,10 @@ jobs:
         with:
           python-version: "3.12"
           cache: pip
+          cache-dependency-path: |
+            requirements-core.txt
+            requirements-vision.txt
+            requirements-dev.txt
       - name: Install full development dependencies
         run: python -m pip install -r requirements-dev.txt
       - name: Run full test suite
