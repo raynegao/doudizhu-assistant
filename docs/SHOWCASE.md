@@ -35,3 +35,15 @@ For a repeated benchmark, run `make benchmark`. For the core-only CPU container,
 | `farmer_response.jsonl` | Self is farmer and responds | Farmer-team semantics and role-normalized rollout |
 
 All scenarios use fixed input, seed and simulation count. Repeated decisions must produce the same fingerprint; latency is recorded but not used as a universal threshold.
+
+## Phase 5B local Web/API and GIF
+
+```bash
+make web-demo
+# open http://127.0.0.1:8765
+
+make demo-gif
+# runs/phase5b/demo.gif
+```
+
+The Web/API accepts only the three versioned replay fixture IDs. It displays the observable state, Top-K evaluations, risk fields and limitations, but never reads an arbitrary user path, captures a window or plays cards automatically. The GIF is generated locally from those same fixed replay decisions; publishing it externally is a separate manual release action.

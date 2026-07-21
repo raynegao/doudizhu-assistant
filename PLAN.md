@@ -2,7 +2,7 @@
 
 ## 当前进度
 
-当前项目已完成 Phase 1、Phase 2、Phase 3 第一版、Phase 3.5、Phase 4 和 Phase 5A 可复现工程展示；下一阶段是 Phase 5B 最小 Web/API 展示与公开 Demo 素材。
+当前项目已完成 Phase 1、Phase 2、Phase 3 第一版、Phase 3.5、Phase 4 和 Phase 5A/5B 工程展示；真实窗口独立 holdout 的采集结果仍待数据到位后执行。
 
 | 阶段 | 状态 | 已验证闭环 |
 | --- | --- | --- |
@@ -12,11 +12,11 @@
 | Phase 3.5 | 已完成 | 窗口定位/ROI 配置 -> 跨帧稳定投票 -> 推荐 |
 | Phase 4 | 已完成 | 显式事件状态 -> 对手牌采样 -> 蒙特卡洛 -> Top-K 推荐/JSONL |
 | Phase 5A | 已完成 | 三场景 Showcase -> 固定指纹/基准 -> HTML/JSON -> CI/Docker |
-| Phase 5B | 待开始 | 最小 Web/API、公开 Demo GIF 和真实窗口独立 holdout |
+| Phase 5B | 已完成（评测待数据） | 最小只读 Web/API、Demo GIF 生成、真实窗口独立 holdout 评测流程 |
 
 当前 Phase 5A 验证基线为 `79 passed`；Phase 2 本地小样本 train/val/test 为 `1589/422/99`，三组准确率均为 `100%`，`error_count = 0`。这些数据只证明当前固定 ROI/CNN 小样本闭环，不代表真实游戏窗口泛化准确率。
 
-当前主要缺口：真实窗口尚未自动识别上一手牌、过牌和对手剩余张数；Phase 2 缺少真实窗口独立 holdout 和可公开模型资产；最小 Web/API 与 Demo GIF 尚未完成。Phase 5A 已完成离线证据链，不把不完整视觉输入伪装成自动整局跟踪。
+当前主要缺口：真实窗口尚未自动识别上一手牌、过牌和对手剩余张数；Phase 2 的真实窗口独立 holdout 已有可复现评测入口，但仍缺待采集的独立标注样本；公开发布模型资产需要另行规划。Phase 5B 已补齐本地 Web/API 与 GIF 生成，不把不完整视觉输入伪装成自动整局跟踪。
 
 ## Phase 1：规则引擎 MVP
 
@@ -167,11 +167,11 @@ Phase 5A 已完成：
 - Python 3.10/3.12 核心 CI、完整视觉测试任务和 CPU Docker Demo。
 - `requirements-core.txt` / `requirements-vision.txt` 依赖分层。
 
-Phase 5B 建议范围：
+Phase 5B 已实现范围：
 
 - 最小只读 Web API/UI，展示当前状态、Top-K 和风险字段。
-- 公开 Demo GIF 或短视频。
-- 新增真实窗口独立 holdout，重新评估 CNN 泛化。
-- 如需发布，再规划 GitHub Release 模型资产和 SHA256 下载流程。
+- 可重复生成的 Demo GIF（产物默认在被忽略的 `runs/`）。
+- 真实窗口独立 holdout 的 manifest 校验、推理、错误报告流程；实际指标等待新采集的独立标注数据。
+- 如需公开发布，再规划 GitHub Release 模型资产和 SHA256 下载流程。
 
 模型权重继续不直接进入 Git；自动点击、强化学习和云部署不进入当前范围。

@@ -3,7 +3,7 @@ AI-based Dou Dizhu assistant with Mac screen capture, CNN card recognition, a ru
 
 [![CI](https://github.com/raynegao/doudizhu-assistant/actions/workflows/ci.yml/badge.svg)](https://github.com/raynegao/doudizhu-assistant/actions/workflows/ci.yml)
 
-当前已完成 Phase 1–5A：规则引擎、CNN 牌面识别 replay、Mac 固定 ROI 实时流水线、窗口标定、跨帧稳定投票、显式事件状态、蒙特卡洛 Top-K 推荐，以及可复现 Showcase/CI/Docker。下一阶段是最小 Web/API 展示和公开 Demo 素材。
+当前已完成 Phase 1–5B：规则引擎、CNN 牌面识别 replay、Mac 固定 ROI 实时流水线、窗口标定、跨帧稳定投票、显式事件状态、蒙特卡洛 Top-K 推荐、可复现 Showcase/CI/Docker，以及最小只读 Web/API 展示、Demo GIF 生成与真实窗口 holdout 评测流程。
 
 ## 一分钟作品集 Demo
 
@@ -347,6 +347,24 @@ Phase 5A 已完成可复现证据链：
 - 当前 Phase 5 验证基线为 `79 passed`，详细证据见 `docs/evidence/`。
 
 Phase 5B 再考虑最小 Web API/UI 和可公开 Demo GIF；不在展示阶段引入自动点击、强化学习或未经验证的真实窗口准确率宣传。
+
+## Phase 5B：本地 Web 展示与真实窗口 Holdout
+
+启动只读本地展示：
+
+```bash
+make web-demo
+# 浏览器打开 http://127.0.0.1:8765
+```
+
+页面只接受仓库版本化的 Phase 4 replay 场景，展示当前状态、Top-K、风险字段和推荐理由；不会读取任意本地路径、截图或执行游戏操作。生成公开演示素材：
+
+```bash
+make demo-gif
+# 输出 runs/phase5b/demo.gif
+```
+
+真实窗口独立 holdout 的采集与评测说明见 [`docs/REAL_WINDOW_HOLDOUT.md`](docs/REAL_WINDOW_HOLDOUT.md)。这条流程提供评测框架，但不会虚构尚未采集的真实窗口泛化指标。
 
 ## 配置与日志
 - 配置文件支持 YAML/JSON，示例见 `configs/app.example.yaml`。

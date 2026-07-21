@@ -1,6 +1,6 @@
 PYTHON ?= python
 
-.PHONY: test demo benchmark docker-demo
+.PHONY: test demo benchmark docker-demo web-demo demo-gif
 
 test:
 	$(PYTHON) -m pytest -q
@@ -14,3 +14,9 @@ benchmark:
 docker-demo:
 	docker build -t doudizhu-assistant:phase5 .
 	docker run --rm doudizhu-assistant:phase5
+
+web-demo:
+	$(PYTHON) -m src.ui.web
+
+demo-gif:
+	$(PYTHON) -m scripts.generate_phase5b_demo_gif

@@ -285,7 +285,7 @@ Phase 4 数据流：
 
 目标：让项目适合申请材料和实习简历展示。
 
-状态：Phase 5A 已完成，Phase 5B 待开始。
+状态：Phase 5A 已完成；Phase 5B 的本地只读展示、GIF 生成和真实窗口 holdout 评测流程已完成，实际 holdout 指标等待独立数据采集。
 
 Phase 5A 已完成：
 
@@ -295,7 +295,7 @@ Phase 5A 已完成：
 - Python 3.10/3.12 CI、依赖分层和 CPU Docker Demo。
 - 精简架构图、录屏说明和中英文作品集材料。
 
-Phase 5B 再增加最小只读 Web API/UI、公开 Demo GIF 和真实窗口独立 holdout。
+Phase 5B 已增加最小只读 Web API/UI、可重复生成的本地 Demo GIF，以及真实窗口独立 holdout 的 manifest/错误报告流程。真实窗口独立 holdout 的数值结果必须等待未参与训练的标注数据，不得用历史固定 ROI 指标替代。
 
 ## 6. 逐层模块职责
 
@@ -549,4 +549,4 @@ Phase 5A 已补齐可复现 Showcase、三类事件场景、指标证据、CI、
 固定 replay/显式事件 -> 只读 Web API/UI -> 公开 Demo GIF -> 真实窗口独立 holdout -> 可选模型 Release
 ```
 
-Phase 5B 继续复用已验证的离线证据链，只增加展示和独立评测，不改变自动操作和强化学习仍不进入当前路线的约束。
+Phase 5B 继续复用已验证的离线证据链，增加展示和独立评测流程，不改变自动操作和强化学习仍不进入当前路线的约束。
