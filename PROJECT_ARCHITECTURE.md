@@ -8,7 +8,7 @@
 
 ## 2. 当前结构评审
 
-当前仓库已经完成 Phase 1 规则引擎 MVP、Phase 2 本地 CNN 牌面识别 replay 闭环、Phase 3 第一版固定 ROI 实时系统和 Phase 3.5 窗口标定/跨帧稳定识别：
+当前仓库已经完成 Phase 1 规则引擎 MVP、Phase 2 本地 CNN 牌面识别 replay、Phase 3/3.5 实时识别与稳定化，以及 Phase 4 显式牌局状态/蒙特卡洛决策闭环：
 
 ```text
 configs/
@@ -20,11 +20,16 @@ tests/
   test_decision_cli.py
   test_phase2_replay.py
   test_phase3_runtime.py
+  test_game_tracker.py
+  test_opponent_model.py
+  test_phase4_decision.py
+  test_phase4_cli.py
   test_rules.py
 scripts/
   calibrate_phase3_roi.py
   crop_hand_roi_cards.py
   predict_card_crops.py
+  run_phase4_decision.py
   run_phase3_runtime.py
   replay_phase2.py
   train_card_cnn.py
@@ -32,7 +37,10 @@ src/
   capture/
   config/
   logic/
+    action_validation.py
     decision.py
+    monte_carlo.py
+    opponent_model.py
     rules.py
   pipeline/
     calibration.py
@@ -40,7 +48,10 @@ src/
     stabilizer.py
   state/
     cards.py
+    events.py
+    game_tracker.py
     game_state.py
+    observable_state.py
   tracking/
   ui/
     cli.py
@@ -51,7 +62,7 @@ pytest.ini
 requirements-dev.txt
 ```
 
-整体模块方向合理，已经把采集、视觉、跟踪、状态、决策和 UI 分成不同包，符合 AI 工程项目的基本分层意识。当前已实现手动输入到 `GameStateSnapshot`、合法动作生成、基础推荐、CLI 输出和 JSONL 日志；Phase 2 已实现固定 ROI、切牌、小 CNN 分类、模型导出、评估和 replay 接入规则引擎；Phase 3 第一版已新增 `pipeline/runtime`，把 Mac 固定 ROI 截屏、内存切牌、CNN 推理、规则推荐、终端面板和 JSONL 日志串成可刷新系统；Phase 3.5 已补齐窗口标定、本地 ROI 配置和跨帧稳定投票。主要缺口转为对局事件跟踪、智能决策、GUI 展示、Agent 工作流层和部署层。
+整体模块方向合理，已经把采集、视觉、状态、决策和 UI 分成不同包。Phase 1 提供规则/CLI 基础；Phase 2 提供 CNN/replay；Phase 3/3.5 提供 Mac 实时截屏、窗口标定和跨帧投票；Phase 4 把显式 game/play/pass 事件归约成不可变状态，再完成未知牌采样、三人 rollout、Top-K 推荐和风险日志。主要缺口转为真实窗口对手事件识别、GUI 展示和部署/作品集层。
 
 ## 3. 推荐分层
 
@@ -240,6 +251,8 @@ Phase 3.5 数据流：
 
 目标：在规则引擎稳定后提升推荐质量。
 
+状态：已实现显式事件/离线 replay 版本。当前具备可观测牌局状态、54 张牌守恒、未知牌池、对手剩余牌均匀采样、三人团队 rollout、Top-K 策略评分、风险字段和 JSONL 日志。Phase 3 默认仍使用快速确定性策略，不被蒙特卡洛阻塞。
+
 核心内容：
 
 - 蒙特卡洛模拟。
@@ -247,6 +260,15 @@ Phase 3.5 数据流：
 - 策略评分。
 - 推荐理由解释。
 - 预留 RL 接口。
+
+Phase 4 数据流：
+
+```text
+显式 game/play/pass 事件 -> ObservableGameState -> 对手牌 sampled worlds
+  -> 三人 rollout -> ActionEvaluation -> Top-K 推荐/理由/风险 -> JSONL
+```
+
+边界：当前实时视觉没有对手出牌 ROI、过牌信号和剩余张数 OCR，因此不能自动生成完整事件流。Phase 4 的概率模型是固定 seed 的均匀剩余牌基线，不等同于精确对手牌预测；未确认的低置信度事件会把状态标记为 `uncertain` 并阻断推荐，信息不足的确定性回退不输出伪胜率。
 
 ### Phase 5：工程化展示
 
@@ -499,16 +521,16 @@ Phase 2/3 再考虑：
 - 前后端实时交互
 - 工程可维护性和部署意识
 
-目前短板是还没有稳定对局状态跟踪、GUI 展示、Docker 和作品集级 Demo。Phase 1 已有 CLI 级可运行闭环，Phase 2 已有本地 CNN replay 闭环，Phase 3 已有固定 ROI 实时刷新闭环，Phase 3.5 已有窗口标定和跨帧稳定投票。后续开发应优先增强对局状态跟踪和智能决策，而不是先追求复杂模型。
+目前短板是实时视觉还不能自动生成对手出牌/过牌/剩余张数事件，也没有 GUI 展示、Docker 和作品集级 Demo。Phase 1 已有 CLI 规则闭环，Phase 2 已有本地 CNN replay，Phase 3/3.5 已有实时刷新、窗口标定和跨帧投票，Phase 4 已有显式事件状态与蒙特卡洛决策闭环。后续应进入 Phase 5，优先做可复现 Demo、指标报告和展示层。
 
 ## 12. 当前架构结论
 
-当前目录划分是一个合格的起点，模块方向正确，Phase 1 已经具备手动输入规则引擎闭环，Phase 2 已具备本地固定 ROI/CNN/replay 闭环，Phase 3 已具备固定 ROI 实时刷新和终端展示闭环，Phase 3.5 已具备窗口标定和跨帧稳定识别，但还不是完整 AI 工程项目。最需要避免的是把实时主循环、CV 推理、状态更新、决策和 UI 混在同一个模块里。下一步应进入 Phase 4，补强对手牌估计、蒙特卡洛和策略评分。
+当前目录划分已经形成 Phase 1–4 的可测试闭环：规则、CNN/replay、实时识别、窗口/跨帧稳定，以及显式事件驱动的状态跟踪和蒙特卡洛决策。最需要避免的是在对手事件视觉输入尚未具备时，把离线状态模型描述成真实窗口自动整局跟踪。下一步应进入 Phase 5，补齐可复现 Demo、性能/准确率报告、GUI/API 和部署材料。
 
 推荐下一阶段目标：
 
 ```text
-稳定视觉观测 -> 对局事件/未知牌状态 -> 对手牌采样 -> 蒙特卡洛评估 -> Top-K 推荐与理由
+固定 replay/显式事件 -> Phase 4 指标基准 -> GUI/API 展示 -> Demo/架构图 -> Docker/作品集材料
 ```
 
-这个阶段继续复用 Phase 1 的规则引擎和 Phase 2/3.5 的稳定视觉输入，重点补齐可测试的牌局状态与决策评估，不把 GUI、自动操作或强化学习混入同一阶段。
+这个阶段复用已经验证的 Phase 1–4 离线闭环，重点把输入、状态、对手估计、推荐和风险展示成可复现作品集证据；自动操作和强化学习仍不进入当前路线。

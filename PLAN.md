@@ -2,7 +2,7 @@
 
 ## 当前进度
 
-当前项目已完成 Phase 1、Phase 2、Phase 3 第一版和 Phase 3.5，下一阶段是 Phase 4 智能决策增强。
+当前项目已完成 Phase 1、Phase 2、Phase 3 第一版、Phase 3.5 和 Phase 4，下一阶段是 Phase 5 工程化展示。
 
 | 阶段 | 状态 | 已验证闭环 |
 | --- | --- | --- |
@@ -10,12 +10,12 @@
 | Phase 2 | 已完成 | ROI/crop -> CNN -> 结构化手牌 -> replay 推荐 |
 | Phase 3 | 第一版已完成 | Mac 截屏 -> 实时识别 -> 状态刷新 -> 终端面板/JSONL |
 | Phase 3.5 | 已完成 | 窗口定位/ROI 配置 -> 跨帧稳定投票 -> 推荐 |
-| Phase 4 | 未开始 | 对手剩余牌估计、蒙特卡洛、策略评分、Top-K 推荐 |
+| Phase 4 | 已完成 | 显式事件状态 -> 对手牌采样 -> 蒙特卡洛 -> Top-K 推荐/JSONL |
 | Phase 5 | 未开始 | 作品集 Demo、指标报告、GUI/API、部署材料 |
 
-当前验证基线为 `37 passed`；Phase 2 本地小样本 train/val/test 为 `1589/422/99`，三组准确率均为 `100%`，`error_count = 0`。这些数据只证明当前固定 ROI/CNN 小样本闭环，不代表真实游戏窗口泛化准确率。
+当前验证基线为 `73 passed`；Phase 2 本地小样本 train/val/test 为 `1589/422/99`，三组准确率均为 `100%`，`error_count = 0`。这些数据只证明当前固定 ROI/CNN 小样本闭环，不代表真实游戏窗口泛化准确率。
 
-当前主要缺口：尚未自动跟踪上一手牌、轮次和对手出牌事件；尚未实现对手剩余牌估计、蒙特卡洛胜率、GUI/API、Docker 与作品集级 Demo。
+当前主要缺口：真实窗口尚未自动识别上一手牌、过牌和对手剩余张数；GUI/API、Docker、性能报告和作品集级 Demo 尚未完成。Phase 4 已通过显式事件/JSONL replay 完成算法闭环，不把不完整视觉输入伪装成自动整局跟踪。
 
 ## Phase 1：规则引擎 MVP
 
@@ -126,13 +126,30 @@ python -m src.ui.cli \
 
 目标：在规则引擎稳定后提升推荐质量。
 
-建议范围：
+状态：已完成显式状态/离线 replay 版本。
 
-- 蒙特卡洛模拟。
-- 对手剩余牌估计。
-- 策略评分。
-- Top-K 推荐和风险提示。
-- 保留 RL 接口，但不把强化学习作为 MVP。
+完成项：
+
+- `src/state/events.py`、`observable_state.py`、`game_tracker.py`：显式事件、54 张牌守恒、幂等 reducer 和过牌重置。
+- `src/logic/opponent_model.py`：固定 seed、无放回、均匀对手牌采样和概率摘要。
+- `src/logic/monte_carlo.py`：三人团队 rollout、common random worlds、时间/深度预算和候选裁剪。
+- 策略分、估计胜率、真实终局率、Top-K 推荐、理由和风险提示。
+- `RolloutPolicy` 接口预留后续启发式、MCTS 或 RL policy；Phase 4 不实现强化学习。
+- `scripts/run_phase4_decision.py`：手动状态和 JSONL 事件 replay CLI。
+- 低置信度/乱序/重复/非法事件保护；未确认事件阻断推荐，信息不足时确定性回退且胜率标记为不可用。
+
+验收命令：
+
+```bash
+python -m pytest -q
+python -m scripts.run_phase4_decision \
+  --events-file examples/phase4_round.jsonl \
+  --simulations 200 \
+  --seed 20260721 \
+  --top-k 3
+```
+
+边界：真实窗口自动对手事件识别尚未完成；均匀对手模型和当前规则子集会作为风险字段写入结果，不宣称为真实对手牌或完美胜率。
 
 ## Phase 5：工程化展示
 

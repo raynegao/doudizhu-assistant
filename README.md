@@ -1,7 +1,7 @@
 # doudizhu-assistant
 AI-based Dou Dizhu assistant with Mac screen capture, CNN card recognition, a rule engine, real-time recommendations, and multi-frame stabilization.
 
-当前已完成 Phase 1–3.5：规则引擎、CNN 牌面识别 replay、Mac 固定 ROI 实时流水线、窗口标定和跨帧稳定投票。Phase 4 的对手剩余牌估计、蒙特卡洛策略与胜率评估尚未实现。
+当前已完成 Phase 1–4：规则引擎、CNN 牌面识别 replay、Mac 固定 ROI 实时流水线、窗口标定、跨帧稳定投票，以及基于显式牌局事件的对手牌估计、蒙特卡洛策略与 Top-K 推荐。下一阶段是工程化展示。
 
 ## 环境
 - Python 3.12.13（>=3.10 均可，当前本地开发使用 3.12）
@@ -277,6 +277,44 @@ python -m scripts.run_phase3_runtime \
 macOS 首次运行可能需要给终端或 Codex app 授权“屏幕录制”。如果未授权，CLI 会输出截图权限错误；授权后重新运行即可。如果看到 `does not intersect any displays`，说明当前 `--roi-box` 不在活动显示器坐标范围内，需要重新标定 ROI；Retina 屏幕下 `screencapture` 使用的坐标可能和截图像素尺寸不同。
 
 Phase 3 JSONL 每帧包含 `event`、`frame_id`、`timestamp`、`source`、`roi_box`、`raw_recognized_cards`、`recognized_cards`、`observations`、`last_play`、`candidate_count`、`recommended_action`、`reason`、`warnings`、`latency_ms`、`stabilized` 和 `stability_window`。
+
+## Phase 4：可观测牌局状态与蒙特卡洛决策
+
+Phase 4 已完成离线/显式事件闭环：
+
+```text
+game_started + play/pass 事件
+  -> 54 张牌守恒与状态 reducer
+  -> 未知牌池/对手剩余牌均匀采样
+  -> 三人团队 rollout
+  -> 策略评分、Top-K 推荐、理由和风险
+  -> 终端输出与 JSONL 日志
+```
+
+运行仓库内置事件 replay：
+
+```bash
+python -m scripts.run_phase4_decision \
+  --events-file examples/phase4_round.jsonl \
+  --simulations 200 \
+  --seed 20260721 \
+  --top-k 3 \
+  --log-file logs/phase4_decision.jsonl
+```
+
+`examples/phase4_round.jsonl` 第一行是 `game_started`，后续每行是带稳定 `event_id` 和递增 `sequence_no` 的 `play_observed` 或 `pass_observed`。状态层会拒绝乱序、越权、物理重复或无法压制的动作；重复事件保持幂等，未确认的低置信度事件会把派生状态标记为 `uncertain` 并阻断推荐，确认事件到达后才能恢复。
+
+Phase 4 当前能力：
+
+- 维护地主、三人顺序、当前行动者、剩余张数、上一手、连续过牌、历史和未知牌池。
+- 两家连续过牌后清空当前牌型，由最后出牌者重新领出。
+- 使用固定 seed 的局部随机数，对未知牌无放回分配，所有候选动作共用同一批 sampled worlds。
+- 支持地主/农民团队胜负、最大深度、时间预算、候选裁剪和确定性回退。
+- 输出估计胜率、真实终局率、终局胜率、策略分、风险字段、对手持牌概率和 Top-K 推荐；状态信息不足时回退到确定性策略，并将胜率显示为 `n/a`，不会伪装成 `0%`。
+- `RolloutPolicy` 是后续替换更强启发式、MCTS 或 RL policy 的显式接口；Phase 4 本身不引入强化学习。
+- 补充四带二单/四带二对；飞机单翅膀仍采用“不同点数单牌”的严格规则口径。
+
+重要边界：当前 Phase 3 只能自动识别自己的手牌，尚未自动识别对手出牌、过牌和剩余张数。因此 Phase 4 的智能决策通过显式事件/JSONL replay 验证，默认不会拖慢 Phase 3 实时路径。均匀分配是可解释的概率基线，不是对手真实手牌预测；日志会保留 `uniform_opponent_model` 和 `rule_subset_only` 风险提示。
 
 ## 配置与日志
 - 配置文件支持 YAML/JSON，示例见 `configs/app.example.yaml`。
