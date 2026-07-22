@@ -344,9 +344,9 @@ Phase 5A 已完成可复现证据链：
 - 输出 JSON、Markdown 和完全自包含的 HTML 作品集报告。
 - 核心/视觉依赖分层，CPU Docker 不携带权重、截图或私有数据。
 - GitHub Actions 在 Python 3.10/3.12 验证核心路径，并在 Python 3.12 跑完整测试。
-- 当前 Phase 5 验证基线为 `79 passed`，详细证据见 `docs/evidence/`。
+- 当前自动化测试基线以最新 CI 为准，Phase 5 证据见 `docs/evidence/`。
 
-Phase 5B 再考虑最小 Web API/UI 和可公开 Demo GIF；不在展示阶段引入自动点击、强化学习或未经验证的真实窗口准确率宣传。
+Phase 5B 已实现最小 Web API/UI、可重复生成的 Demo GIF 和真实窗口 holdout 工具链；不引入自动点击、强化学习或未经验证的真实窗口准确率宣传。
 
 ## Phase 5B：本地 Web 展示与真实窗口 Holdout
 
@@ -364,7 +364,7 @@ make demo-gif
 # 输出 runs/phase5b/demo.gif
 ```
 
-真实窗口独立 holdout 的采集与评测说明见 [`docs/REAL_WINDOW_HOLDOUT.md`](docs/REAL_WINDOW_HOLDOUT.md)。这条流程提供评测框架，但不会虚构尚未采集的真实窗口泛化指标。
+真实窗口独立 holdout 的采集与评测说明见 [`docs/REAL_WINDOW_HOLDOUT.md`](docs/REAL_WINDOW_HOLDOUT.md)。工具支持 ROI 自动切牌、单行/交互标注、contact sheet、crop/ROI SHA256、训练集泄漏阻断、逐类别指标与混淆矩阵；尚未采集的数据不会被虚构为泛化指标。
 
 ## 配置与日志
 - 配置文件支持 YAML/JSON，示例见 `configs/app.example.yaml`。

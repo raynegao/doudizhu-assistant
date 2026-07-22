@@ -14,7 +14,7 @@
 | Phase 5A | 已完成 | 三场景 Showcase -> 固定指纹/基准 -> HTML/JSON -> CI/Docker |
 | Phase 5B | 已完成（评测待数据） | 最小只读 Web/API、Demo GIF 生成、真实窗口独立 holdout 评测流程 |
 
-当前 Phase 5A 验证基线为 `79 passed`；Phase 2 本地小样本 train/val/test 为 `1589/422/99`，三组准确率均为 `100%`，`error_count = 0`。这些数据只证明当前固定 ROI/CNN 小样本闭环，不代表真实游戏窗口泛化准确率。
+当前自动化测试基线以最新 CI 为准；Phase 2 本地小样本 train/val/test 为 `1589/422/99`，三组准确率均为 `100%`，`error_count = 0`。这些数据只证明当前固定 ROI/CNN 小样本闭环，不代表真实游戏窗口泛化准确率。
 
 当前主要缺口：真实窗口尚未自动识别上一手牌、过牌和对手剩余张数；Phase 2 的真实窗口独立 holdout 已有可复现评测入口，但仍缺待采集的独立标注样本；公开发布模型资产需要另行规划。Phase 5B 已补齐本地 Web/API 与 GIF 生成，不把不完整视觉输入伪装成自动整局跟踪。
 
@@ -156,7 +156,7 @@ python -m scripts.run_phase4_decision \
 
 目标：让项目适合申请材料和实习简历展示。
 
-状态：Phase 5A 已完成，Phase 5B 待开始。
+状态：Phase 5A/5B 已完成；真实窗口 holdout 工具链已完成，实际评测结果等待新数据采集。
 
 Phase 5A 已完成：
 
@@ -171,7 +171,7 @@ Phase 5B 已实现范围：
 
 - 最小只读 Web API/UI，展示当前状态、Top-K 和风险字段。
 - 可重复生成的 Demo GIF（产物默认在被忽略的 `runs/`）。
-- 真实窗口独立 holdout 的 manifest 校验、推理、错误报告流程；实际指标等待新采集的独立标注数据。
+- 真实窗口 ROI 自动切牌/标注、contact sheet、SHA256 防泄漏、逐类别指标、混淆矩阵和错误报告流程；实际指标等待新采集的独立标注数据。
 - 如需公开发布，再规划 GitHub Release 模型资产和 SHA256 下载流程。
 
 模型权重继续不直接进入 Git；自动点击、强化学习和云部署不进入当前范围。

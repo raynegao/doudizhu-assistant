@@ -1,6 +1,6 @@
 PYTHON ?= python
 
-.PHONY: test demo benchmark docker-demo web-demo demo-gif
+.PHONY: test demo benchmark docker-demo web-demo demo-gif holdout-evaluate
 
 test:
 	$(PYTHON) -m pytest -q
@@ -20,3 +20,10 @@ web-demo:
 
 demo-gif:
 	$(PYTHON) -m scripts.generate_phase5b_demo_gif
+
+holdout-evaluate:
+	$(PYTHON) -m scripts.evaluate_real_window_holdout \
+		--model models/card_cnn.pt \
+		--manifest data/real_window_holdout/manifest.jsonl \
+		--training-manifest data/cards_cls/manifest.jsonl \
+		--output-dir runs/real-window-holdout

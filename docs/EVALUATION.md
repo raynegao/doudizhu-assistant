@@ -38,4 +38,5 @@ This is small-sample local evidence. Original images and weights remain ignored,
 - `PYTHONWARNINGS=error` prevents warning regressions.
 - The showcase must complete every requested world and reproduce the same decision fingerprint.
 - Uniform unknown-card sampling is a baseline, candidate pruning bounds work, and the current ruleset is a documented subset.
-- Real opponent-event perception and a separate real-window holdout remain future work.
+- The real-window holdout collection/evaluation toolchain is implemented; the independent labeled dataset and its numerical result still require fresh capture sessions.
+- Real opponent-event perception remains future work.
