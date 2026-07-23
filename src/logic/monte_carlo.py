@@ -33,6 +33,7 @@ class MonteCarloSettings:
     top_k: int = 3
     max_candidates: int = 12
     min_rollouts_per_action: int = 8
+    enforce_min_rollouts: bool = False
 
     def __post_init__(self) -> None:
         if self.simulations <= 0:
@@ -250,7 +251,17 @@ class MonteCarloEvaluator:
                     )
                 )
             completed_worlds.append(world)
-            if self.clock() >= deadline:
+            if (
+                self.clock() >= deadline
+                and (
+                    not settings.enforce_min_rollouts
+                    or len(completed_worlds)
+                    >= min(
+                        settings.min_rollouts_per_action,
+                        settings.simulations,
+                    )
+                )
+            ):
                 deadline_reached = True
                 break
 
@@ -587,12 +598,40 @@ def _select_candidates(
     ]
     for action in sorted(
         normal,
-        key=lambda value: (-len(value.cards), *_stable_action_key(value)),
+        key=lambda value: (
+            -_candidate_prescore(state, value),
+            *_stable_action_key(value),
+        ),
     ):
         add(action)
     for action in sorted(candidates, key=_stable_action_key):
         add(action)
     return tuple(ordered)
+
+
+def _candidate_prescore(state: ObservableGameState, action: Play) -> float:
+    """Cheap all-candidate stage before Monte Carlo evaluates the shortlist."""
+
+    if len(action.cards) == len(state.self_hand):
+        return 10.0
+    shed_score = len(action.cards) / max(1, len(state.self_hand))
+    residual = Counter(state.self_hand.cards)
+    residual.subtract(action.cards)
+    residual_hand = CardSet(
+        sort_cards(
+            card
+            for rank, count in residual.items()
+            for card in [rank] * max(0, count)
+        )
+    )
+    if not residual_hand:
+        structure_score = 1.0
+    else:
+        residual_actions = legal_actions(residual_hand, Play.parse(()))
+        longest = max((len(play.cards) for play in residual_actions), default=0)
+        structure_score = longest / len(residual_hand)
+    control_score = 0.0 if action.type in {PlayType.BOMB, PlayType.ROCKET} else 1.0
+    return 0.60 * shed_score + 0.30 * structure_score + 0.10 * control_score
 
 
 def _same_team(
@@ -614,12 +653,12 @@ def _evaluation_sort_key(
     evaluation: ActionEvaluation,
 ) -> tuple[float, float, float, tuple[int, int, int, tuple[int, ...]]]:
     return (
-        -evaluation.strategy_score,
         -(
             evaluation.estimated_win_rate
             if evaluation.estimated_win_rate is not None
             else -1.0
         ),
+        -evaluation.terminal_rate,
         -evaluation.average_margin,
         _stable_action_key(evaluation.action),
     )

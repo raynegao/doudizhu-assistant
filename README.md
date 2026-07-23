@@ -3,7 +3,7 @@ AI-based Dou Dizhu assistant with Mac screen capture, CNN card recognition, a ru
 
 [![CI](https://github.com/raynegao/doudizhu-assistant/actions/workflows/ci.yml/badge.svg)](https://github.com/raynegao/doudizhu-assistant/actions/workflows/ci.yml)
 
-当前已完成 Phase 1–5B：规则引擎、CNN 牌面识别 replay、Mac 固定 ROI 实时流水线、窗口标定、跨帧稳定投票、显式事件状态、蒙特卡洛 Top-K 推荐、可复现 Showcase/CI/Docker，以及最小只读 Web/API 展示、Demo GIF 生成与真实窗口 holdout 评测流程。
+当前已完成 Phase 1–6 的代码闭环：规则引擎、CNN 牌面识别 replay、Mac 实时流水线、显式事件状态、蒙特卡洛 Top-K、可复现 Showcase/CI/Docker，以及 Phase 6 的 Retina 窗口采集、三家场面观测、视觉事件跟踪、异步胜率决策和只读置顶助手窗。Phase 6 的真实对局准确率仍需用 5–10 局独立录制数据验收。
 
 ## 一分钟作品集 Demo
 
@@ -333,7 +333,7 @@ Phase 4 当前能力：
 - `RolloutPolicy` 是后续替换更强启发式、MCTS 或 RL policy 的显式接口；Phase 4 本身不引入强化学习。
 - 补充四带二单/四带二对；飞机单翅膀仍采用“不同点数单牌”的严格规则口径。
 
-重要边界：当前 Phase 3 只能自动识别自己的手牌，尚未自动识别对手出牌、过牌和剩余张数。因此 Phase 4 的智能决策通过显式事件/JSONL replay 验证，默认不会拖慢 Phase 3 实时路径。均匀分配是可解释的概率基线，不是对手真实手牌预测；日志会保留 `uniform_opponent_model` 和 `rule_subset_only` 风险提示。
+重要边界：Phase 3 仍只负责自己的手牌；Phase 6 在独立实时入口中增加对手出牌、过牌、角色和余牌识别，再把稳定事件送入 Phase 4。均匀分配是可解释的概率基线，不是对手真实手牌预测；日志会保留 `uniform_opponent_model` 和 `rule_subset_only` 风险提示。
 
 ## Phase 5A：工程化展示
 
@@ -365,6 +365,53 @@ make demo-gif
 ```
 
 真实窗口独立 holdout 的采集与评测说明见 [`docs/REAL_WINDOW_HOLDOUT.md`](docs/REAL_WINDOW_HOLDOUT.md)。工具支持 ROI 自动切牌、单行/交互标注、contact sheet、crop/ROI SHA256、训练集泄漏阻断、逐类别指标与混淆矩阵；尚未采集的数据不会被虚构为泛化指标。
+
+## Phase 6：完整场面感知与实时胜率助手
+
+Phase 6 新增只读实时闭环：
+
+```text
+WindowServer 窗口级 Retina 截图 -> 归一化场面 ROI -> 三家 play/pass/角色/余牌观测
+  -> 连续帧稳定与轮次校验 -> ObservableGameState
+  -> 后台蒙特卡洛 Top-3 -> 置顶助手窗/JSONL
+```
+
+首次使用先启动 Mac “斗地主”客户端并标定：
+
+```bash
+python -m scripts.calibrate_live_game \
+  --app-name 斗地主 \
+  --save-config configs/live_game.local.json
+```
+
+标定会按牌桌 Window ID 抓取窗口，即使牌桌被 Codex 等窗口遮挡也不会混入前台画面，并生成本地配置、ROI 预览和 contact sheet。随后需要从真实对局中采集 `role`、`remaining`、`pass/neutral`、`turn` 模板，并录制 5–10 局用于 replay 验收：
+
+```bash
+python -m scripts.record_live_game \
+  --config configs/live_game.local.json \
+  --session game-001 \
+  --frames 800
+```
+
+准备好模板和模型后运行置顶助手窗：
+
+```bash
+python -m scripts.run_live_assistant \
+  --config configs/live_game.local.json
+```
+
+终端调试模式：
+
+```bash
+python -m scripts.run_live_assistant \
+  --config configs/live_game.local.json \
+  --no-ui \
+  --no-clear
+```
+
+实时入口仅在一局开始时完成 54 张牌一致性初始化；中途启动、漏事件、余牌冲突、非法牌型或低置信度都会进入 `uncertain` 并暂停推荐。Top-1 按估计团队胜率优先，默认计算预算为 1.5 秒且至少完成 32 组 sampled worlds。完整采集、模板标注和验收步骤见 [Phase 6 使用说明](docs/PHASE6_LIVE_ASSISTANT.md)。
+
+录制数据可以通过 `scripts.replay_live_game` 离线重放，并用 `scripts.evaluate_live_replay` 生成事件 F1、牌点整组准确率、余牌准确率和牌数守恒报告。
 
 ## 配置与日志
 - 配置文件支持 YAML/JSON，示例见 `configs/app.example.yaml`。

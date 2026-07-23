@@ -21,6 +21,7 @@ from src.pipeline.calibration import (
     calibrate_roi,
     load_runtime_config,
     parse_window_info,
+    parse_window_candidates,
     save_runtime_config,
 )
 from src.pipeline.stabilizer import ObservationStabilizer
@@ -168,6 +169,34 @@ def test_parse_window_info_and_calibrate_roi() -> None:
     assert calibration.count == 17
     assert calibration.step_x == 60
     assert calibration.crop_size == (63, 105)
+
+
+def test_parse_window_candidates_keeps_standard_game_window() -> None:
+    output = (
+        "157\t86\t66\t20\tWindow\tAXDialog\n"
+        "147\t82\t1176\t767\t斗地主\tAXStandardWindow\n"
+    )
+
+    candidates = parse_window_candidates(output, app_name="斗地主")
+
+    assert candidates == [
+        (
+            WindowInfo(
+                app_name="斗地主",
+                window_name="Window",
+                window_box=(157, 86, 223, 106),
+            ),
+            "AXDialog",
+        ),
+        (
+            WindowInfo(
+                app_name="斗地主",
+                window_name="斗地主",
+                window_box=(147, 82, 1323, 849),
+            ),
+            "AXStandardWindow",
+        ),
+    ]
 
 
 def test_runtime_config_roundtrip(tmp_path: Path) -> None:

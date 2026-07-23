@@ -207,7 +207,7 @@ def _run_phase4_scenario(
     fingerprints = tuple(_decision_fingerprint(result.to_log_payload()) for result in results)
     first = results[0]
     latencies = [result.elapsed_ms for result in results]
-    scores = [evaluation.strategy_score for evaluation in first.rankings]
+    win_rates = [evaluation.estimated_win_rate for evaluation in first.rankings]
     checks = [
         {
             "name": f"{path.stem}_state_decision_ready",
@@ -229,8 +229,8 @@ def _run_phase4_scenario(
         },
         {
             "name": f"{path.stem}_top_k_sorted",
-            "passed": scores == sorted(scores, reverse=True),
-            "evidence": scores,
+            "passed": win_rates == sorted(win_rates, reverse=True),
+            "evidence": win_rates,
         },
     ]
     return {

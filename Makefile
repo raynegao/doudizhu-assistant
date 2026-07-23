@@ -1,6 +1,6 @@
 PYTHON ?= python
 
-.PHONY: test demo benchmark docker-demo web-demo demo-gif holdout-evaluate
+.PHONY: test demo benchmark docker-demo web-demo demo-gif holdout-evaluate live-calibrate live-assistant
 
 test:
 	$(PYTHON) -m pytest -q
@@ -27,3 +27,11 @@ holdout-evaluate:
 		--manifest data/real_window_holdout/manifest.jsonl \
 		--training-manifest data/cards_cls/manifest.jsonl \
 		--output-dir runs/real-window-holdout
+
+live-calibrate:
+	$(PYTHON) -m scripts.calibrate_live_game \
+		--save-config configs/live_game.local.json
+
+live-assistant:
+	$(PYTHON) -m scripts.run_live_assistant \
+		--config configs/live_game.local.json

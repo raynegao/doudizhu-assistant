@@ -2,7 +2,7 @@
 
 ## 当前进度
 
-当前项目已完成 Phase 1、Phase 2、Phase 3 第一版、Phase 3.5、Phase 4 和 Phase 5A/5B 工程展示；真实窗口独立 holdout 的采集结果仍待数据到位后执行。
+当前项目已完成 Phase 1–5B，并完成 Phase 6 的代码与自动化测试闭环；Phase 6 的真实窗口模板、完整对局 replay 和数值指标仍待 5–10 局真实数据到位后执行。
 
 | 阶段 | 状态 | 已验证闭环 |
 | --- | --- | --- |
@@ -13,10 +13,11 @@
 | Phase 4 | 已完成 | 显式事件状态 -> 对手牌采样 -> 蒙特卡洛 -> Top-K 推荐/JSONL |
 | Phase 5A | 已完成 | 三场景 Showcase -> 固定指纹/基准 -> HTML/JSON -> CI/Docker |
 | Phase 5B | 已完成（评测待数据） | 最小只读 Web/API、Demo GIF 生成、真实窗口独立 holdout 评测流程 |
+| Phase 6 | 代码已完成（真实验收待数据） | Retina 窗口 -> 场面观测 -> 视觉事件 -> 状态跟踪 -> 异步 Top-3 -> 置顶小窗 |
 
 当前自动化测试基线以最新 CI 为准；Phase 2 本地小样本 train/val/test 为 `1589/422/99`，三组准确率均为 `100%`，`error_count = 0`。这些数据只证明当前固定 ROI/CNN 小样本闭环，不代表真实游戏窗口泛化准确率。
 
-当前主要缺口：真实窗口尚未自动识别上一手牌、过牌和对手剩余张数；Phase 2 的真实窗口独立 holdout 已有可复现评测入口，但仍缺待采集的独立标注样本；公开发布模型资产需要另行规划。Phase 5B 已补齐本地 Web/API 与 GIF 生成，不把不完整视觉输入伪装成自动整局跟踪。
+当前主要缺口：Phase 6 已有出牌/过牌/角色/余牌的识别接口和严格事件门控，但仍缺 5–10 局真实录像、模板和独立 replay 指标，因此暂不宣称已经达到真实对局 F1/准确率目标；公开发布模型资产也需要另行规划。
 
 ## Phase 1：规则引擎 MVP
 
@@ -175,3 +176,28 @@ Phase 5B 已实现范围：
 - 如需公开发布，再规划 GitHub Release 模型资产和 SHA256 下载流程。
 
 模型权重继续不直接进入 Git；自动点击、强化学习和云部署不进入当前范围。
+
+## Phase 6：完整场面感知与实时胜率助手
+
+状态：代码闭环已完成，真实对局指标等待独立录制数据。
+
+完成项：
+
+- WindowServer Window ID 窗口级截图和 Retina 逻辑/像素转换；窗口被遮挡时仍读取牌桌，移动后无需重写归一化 ROI。
+- 归一化 `LiveLayoutConfig`、ROI 预览、contact sheet 和本地配置。
+- `SceneObservation` / `SeatObservation`：三家出牌、过牌、角色、余牌和置信度。
+- `VisualEventTracker`：连续帧稳定、空白到动作门控、余牌交叉校验、54 张牌守恒和不确定状态阻断。
+- `LiveGameRuntime`：截图、视觉、状态、后台决策和 JSONL 编排。
+- Top-1 改为估计胜率优先；Phase 6 默认 1.5 秒预算、至少 32 组 sampled worlds 和 Top-3。
+- Tkinter 只读置顶助手窗；不读取鼠标、不点击游戏、不自动代打。
+- 标定、模板采集、完整窗口录制和出牌 crop 标注脚本。
+
+运行入口：
+
+```bash
+python -m scripts.calibrate_live_game --save-config configs/live_game.local.json
+python -m scripts.record_live_game --config configs/live_game.local.json --session game-001
+python -m scripts.run_live_assistant --config configs/live_game.local.json
+```
+
+验收边界：必须使用未参与模板/微调的完整对局 replay 验证出牌/过牌 F1、牌点整组准确率、余牌准确率和整局状态守恒。没有真实数据时，只能确认代码、状态保护和合成测试通过。

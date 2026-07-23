@@ -8,7 +8,7 @@
 
 ## 2. 当前结构评审
 
-当前仓库已经完成 Phase 1 规则引擎 MVP、Phase 2 本地 CNN 牌面识别 replay、Phase 3/3.5 实时识别与稳定化、Phase 4 显式牌局状态/蒙特卡洛决策闭环，以及 Phase 5A 可复现工程展示：
+当前仓库已经完成 Phase 1 规则引擎 MVP、Phase 2 本地 CNN 牌面识别 replay、Phase 3/3.5 实时识别与稳定化、Phase 4 显式牌局状态/蒙特卡洛决策、Phase 5 工程展示，以及 Phase 6 完整场面感知代码闭环：
 
 ```text
 configs/
@@ -73,7 +73,7 @@ pytest.ini
 requirements-dev.txt
 ```
 
-整体模块方向合理，已经把采集、视觉、状态、决策和 UI 分成不同包。Phase 1 提供规则/CLI 基础；Phase 2 提供 CNN/replay；Phase 3/3.5 提供 Mac 实时截屏、窗口标定和跨帧投票；Phase 4 把显式 game/play/pass 事件归约成不可变状态，再完成未知牌采样、三人 rollout、Top-K 推荐和风险日志。主要缺口转为真实窗口对手事件识别、GUI 展示和部署/作品集层。
+整体模块方向合理，已经把采集、视觉、跟踪、状态、决策和 UI 分成不同包。Phase 6 使用 Retina-aware 窗口帧和归一化 ROI 生成 `SceneObservation`，由 `VisualEventTracker` 产生既有 `ObservedAction`，再由 `LiveGameRuntime` 异步计算胜率并推送只读置顶窗。当前缺口转为真实完整对局数据和独立 replay 指标，而不是代码接口缺失。
 
 ## 3. 推荐分层
 
@@ -296,6 +296,25 @@ Phase 5A 已完成：
 - 精简架构图、录屏说明和中英文作品集材料。
 
 Phase 5B 已增加最小只读 Web API/UI、可重复生成的本地 Demo GIF，以及真实窗口独立 holdout 的 manifest/错误报告流程。真实窗口独立 holdout 的数值结果必须等待未参与训练的标注数据，不得用历史固定 ROI 指标替代。
+
+### Phase 6：完整场面感知与实时胜率助手
+
+状态：核心代码、CLI 和自动化测试已实现；真实对局指标等待 5–10 局独立录制数据。
+
+```text
+macOS WindowServer window capture + Retina geometry -> LiveLayoutConfig ROIs -> SceneObservation
+  -> VisualEventTracker -> ObservableGameState
+  -> async Monte Carlo -> LiveDecisionRecord -> read-only Tk overlay / JSONL
+```
+
+关键边界：
+
+- 仅支持当前 Mac 经典玩法窗口；按 Window ID 抓取，不受普通窗口遮挡影响；从完整新局开始跟踪。
+- 视觉事件必须连续稳定并符合当前行动者、合法牌型和余牌变化。
+- 任何漏事件、低置信度或牌数冲突都切换为 `uncertain`，不继续输出伪胜率。
+- 推荐按估计团队胜率排序，策略分只作为解释字段。
+- UI 只消费运行快照，不承载截图、状态更新或决策主循环。
+- 不自动点击；均匀未知牌模型仍属于可解释概率基线。
 
 ## 6. 逐层模块职责
 
@@ -537,16 +556,16 @@ Phase 5A 已提供 core-only CPU `Dockerfile`，通过 `.dockerignore` 排除 `.
 - 前后端实时交互
 - 工程可维护性和部署意识
 
-Phase 5A/5B 已补齐可复现 Showcase、三类事件场景、指标证据、CI、CPU Docker、本地只读 Web/API、GIF 生成和真实窗口 holdout 工具链。当前主要短板转为：尚未采集满足覆盖要求的独立 holdout 数据，实时视觉仍不能自动生成对手出牌/过牌/剩余张数事件，模型 Release 尚未公开。
+Phase 5A/5B 已补齐可复现 Showcase、三类事件场景、指标证据、CI、CPU Docker、本地只读 Web/API、GIF 和真实窗口 holdout 工具链。Phase 6 已补齐对手出牌/过牌/剩余张数事件接口、严格状态门控和置顶展示。当前主要短板是尚未采集满足覆盖要求的 5–10 局完整数据，因此真实事件 F1 和整局跟踪成功率仍未知；模型 Release 也尚未公开。
 
 ## 12. 当前架构结论
 
-当前目录划分已经形成 Phase 1–5A 的可测试闭环：规则、CNN/replay、实时识别、窗口/跨帧稳定、显式事件状态、蒙特卡洛决策，以及可复现报告/CI/Docker。最需要避免的是在对手事件视觉输入尚未具备时，把离线状态模型描述成真实窗口自动整局跟踪。
+当前目录划分已经形成 Phase 1–6 的可测试闭环：规则、CNN/replay、Retina 窗口、场面识别、视觉事件状态、异步蒙特卡洛、置顶 UI，以及可复现报告/CI/Docker。最需要避免的是在真实完整对局 holdout 尚未通过时，把代码闭环描述成已经验证的高准确率自动整局跟踪。
 
 推荐下一阶段目标（真实窗口验证与事件感知）：
 
 ```text
-采集独立 holdout -> 防泄漏评测 -> 针对性修正 CNN -> 对手出牌/过牌/剩余张数事件感知 -> 可选模型 Release
+录制 5–10 局 -> 模板/牌面微调 -> 完整 replay holdout -> 错例修正 -> 可选模型 Release
 ```
 
 下一阶段先取得真实窗口证据，再决定是否调整 CNN；自动操作和强化学习仍不进入当前路线。

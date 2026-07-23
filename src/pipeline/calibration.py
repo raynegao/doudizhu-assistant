@@ -85,9 +85,27 @@ class RuntimeConfig:
 
 
 def find_window(app_name: str = DEFAULT_APP_NAME, runner=subprocess.run) -> WindowInfo:
+    escaped_app_name = app_name.replace("\\", "\\\\").replace('"', '\\"')
     script = (
-        f'tell application "System Events" to tell process "{app_name}" '
-        'to get {position, size, name} of first window'
+        'tell application "System Events"\n'
+        f'  tell process "{escaped_app_name}"\n'
+        '    set outputText to ""\n'
+        '    repeat with candidateWindow in windows\n'
+        '      try\n'
+        '        set windowPosition to position of candidateWindow\n'
+        '        set windowSize to size of candidateWindow\n'
+        '        set windowName to name of candidateWindow\n'
+        '        set windowSubrole to subrole of candidateWindow\n'
+        '        set outputText to outputText & (item 1 of windowPosition as text) '
+        '& tab & (item 2 of windowPosition as text) & tab & '
+        '(item 1 of windowSize as text) & tab & '
+        '(item 2 of windowSize as text) & tab & windowName & tab & '
+        'windowSubrole & linefeed\n'
+        '      end try\n'
+        '    end repeat\n'
+        '    return outputText\n'
+        '  end tell\n'
+        'end tell'
     )
     try:
         result = runner(
@@ -99,7 +117,47 @@ def find_window(app_name: str = DEFAULT_APP_NAME, runner=subprocess.run) -> Wind
     except subprocess.CalledProcessError as exc:
         detail = (exc.stderr or exc.stdout or str(exc)).strip()
         raise WindowLookupError(f"Cannot find a visible macOS window for app '{app_name}'. {detail}") from exc
-    return parse_window_info(result.stdout, app_name=app_name)
+    candidates = parse_window_candidates(result.stdout, app_name=app_name)
+    if not candidates:
+        raise WindowLookupError(
+            f"Cannot find a visible macOS window for app '{app_name}'."
+        )
+    standard_windows = [
+        window
+        for window, subrole in candidates
+        if subrole == "AXStandardWindow"
+    ]
+    selectable = standard_windows or [window for window, _ in candidates]
+    return max(selectable, key=lambda window: window.width * window.height)
+
+
+def parse_window_candidates(
+    output: str,
+    app_name: str = DEFAULT_APP_NAME,
+) -> list[tuple[WindowInfo, str]]:
+    candidates: list[tuple[WindowInfo, str]] = []
+    for line in output.splitlines():
+        parts = [part.strip() for part in line.split("\t")]
+        if len(parts) < 6:
+            continue
+        try:
+            left, top, width, height = (int(float(part)) for part in parts[:4])
+        except ValueError:
+            continue
+        if width <= 0 or height <= 0:
+            continue
+        window_name = "\t".join(parts[4:-1]).strip() or app_name
+        candidates.append(
+            (
+                WindowInfo(
+                    app_name=app_name,
+                    window_name=window_name,
+                    window_box=(left, top, left + width, top + height),
+                ),
+                parts[-1],
+            )
+        )
+    return candidates
 
 
 def parse_window_info(output: str, app_name: str = DEFAULT_APP_NAME) -> WindowInfo:
