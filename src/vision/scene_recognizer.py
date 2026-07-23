@@ -233,7 +233,10 @@ class SceneRecognizer:
         for seat in PlayerSeat:
             count_crop = self.config.crop(frame.image, f"{seat.value}_remaining")
             match = self.templates.classify("remaining", count_crop)
-            count = _parse_remaining(match, self.config.template_threshold)
+            count = _parse_remaining(
+                match,
+                max(self.config.template_threshold, 0.94),
+            )
             confidence = match.confidence
             if seat is PlayerSeat.SELF and len(self_hand) in {17, 20}:
                 count = len(self_hand)

@@ -172,3 +172,55 @@ def test_visual_tracker_refuses_mid_round_initialization() -> None:
 
     assert update.mode is VisualTrackerMode.WAITING_FOR_ROUND
     assert update.state is None
+
+
+def test_visual_tracker_can_infer_missing_initial_landlord_20() -> None:
+    tracker = VisualEventTracker(
+        stability_frames=1,
+        round_id_factory=lambda _: "round-bootstrap",
+    )
+    hand = LANDLORD_HAND[:17]
+    scene = SceneObservation(
+        frame_id=1,
+        timestamp=1.0,
+        window_pixel_box=(0, 0, 100, 100),
+        self_hand=tuple(_card(rank) for rank in hand),
+        seats=(
+            SeatObservation(
+                seat=PlayerSeat.SELF,
+                signal=VisualSignal.NEUTRAL,
+                remaining_count=17,
+                role=SeatRole.FARMER,
+                confidence=0.99,
+                remaining_confidence=0.99,
+                role_confidence=0.99,
+            ),
+            SeatObservation(
+                seat=PlayerSeat.RIGHT,
+                signal=VisualSignal.NEUTRAL,
+                remaining_count=17,
+                role=SeatRole.FARMER,
+                confidence=0.99,
+                remaining_confidence=0.99,
+                role_confidence=0.99,
+            ),
+            SeatObservation(
+                seat=PlayerSeat.LEFT,
+                signal=VisualSignal.NEUTRAL,
+                remaining_count=None,
+                role=SeatRole.LANDLORD,
+                confidence=0.99,
+                remaining_confidence=0.0,
+                role_confidence=0.99,
+            ),
+        ),
+        self_turn=False,
+        self_turn_confidence=0.99,
+        confidence=0.99,
+    )
+
+    update = tracker.update(scene)
+
+    assert update.initialized is True
+    assert update.state is not None
+    assert update.state.remaining_for(PlayerSeat.LEFT) == 20

@@ -312,10 +312,18 @@ def _initial_state_payload(scene: SceneObservation) -> _InitialStatePayload | No
         seat: 20 if seat is landlord else 17
         for seat in PlayerSeat
     }
+    if any(
+        observation.signal is not VisualSignal.NEUTRAL
+        for observation in scene.seats
+    ):
+        return None
     remaining: dict[PlayerSeat, int] = {}
     for observation in scene.seats:
         if observation.remaining_count is None:
-            return None
+            if observation.seat is not landlord:
+                return None
+            remaining[observation.seat] = expected[observation.seat]
+            continue
         remaining[observation.seat] = observation.remaining_count
     if remaining != expected:
         return None
