@@ -1,4 +1,4 @@
-PYTHON ?= python
+PYTHON ?= $(if $(wildcard .venv/bin/python),.venv/bin/python,python)
 
 .PHONY: test demo benchmark docker-demo web-demo demo-gif holdout-evaluate live-calibrate live-assistant
 

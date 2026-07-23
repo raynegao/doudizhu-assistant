@@ -379,9 +379,7 @@ WindowServer 窗口级 Retina 截图 -> 归一化场面 ROI -> 三家 play/pass/
 首次使用先启动 Mac “斗地主”客户端并标定：
 
 ```bash
-python -m scripts.calibrate_live_game \
-  --app-name 斗地主 \
-  --save-config configs/live_game.local.json
+make live-calibrate
 ```
 
 标定会按牌桌 Window ID 抓取窗口，即使牌桌被 Codex 等窗口遮挡也不会混入前台画面，并生成本地配置、ROI 预览和 contact sheet。随后需要从真实对局中采集 `role`、`remaining`、`pass/neutral`、`turn` 模板，并录制 5–10 局用于 replay 验收：
@@ -396,9 +394,10 @@ python -m scripts.record_live_game \
 准备好模板和模型后运行置顶助手窗：
 
 ```bash
-python -m scripts.run_live_assistant \
-  --config configs/live_game.local.json
+make live-assistant
 ```
+
+本地存在 `.venv/bin/python` 时，Makefile 会自动使用该解释器；无需依赖当前 shell 是否已经执行 `source .venv/bin/activate`。
 
 终端调试模式：
 
