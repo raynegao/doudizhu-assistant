@@ -4,6 +4,7 @@ import queue
 from dataclasses import dataclass
 from typing import Any, Callable
 
+from src.capture.screen_geometry import WindowCaptureStatus
 from src.pipeline.live_runtime import LiveRuntimeSnapshot
 from src.state.events import PlayerSeat
 
@@ -21,6 +22,21 @@ class LiveOverlayViewModel:
 
     @classmethod
     def from_snapshot(cls, snapshot: LiveRuntimeSnapshot) -> "LiveOverlayViewModel":
+        if not snapshot.window_available:
+            return cls(
+                status=snapshot.window_message,
+                roles="识别状态：不可用",
+                remaining="余牌：--",
+                trick="当前牌：--",
+                best="推荐：已暂停",
+                top_k=(),
+                confidence="场面置信度：0.0%",
+                warnings=(
+                    "请打开斗地主窗口"
+                    if snapshot.window_status is WindowCaptureStatus.NOT_OPEN
+                    else "请还原斗地主窗口后继续"
+                ),
+            )
         state = snapshot.state
         if state is None:
             return cls(

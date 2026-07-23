@@ -165,6 +165,22 @@ def test_visual_tracker_blocks_remaining_count_mismatch() -> None:
     assert "remaining count mismatch" in update.message
 
 
+def test_visual_tracker_marks_active_round_uncertain_when_window_is_lost() -> None:
+    tracker = VisualEventTracker(
+        stability_frames=1,
+        round_id_factory=lambda _: "round-window-loss",
+    )
+    initialized = tracker.update(_scene(frame_id=1))
+    assert initialized.mode is VisualTrackerMode.TRACKING
+
+    update = tracker.handle_window_unavailable("斗地主窗口已最小化")
+
+    assert update.mode is VisualTrackerMode.UNCERTAIN
+    assert update.state is not None
+    assert update.state.phase.value == "uncertain"
+    assert "等待下一局" in update.message
+
+
 def test_visual_tracker_refuses_mid_round_initialization() -> None:
     tracker = VisualEventTracker(stability_frames=1)
 

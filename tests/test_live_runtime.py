@@ -6,7 +6,12 @@ from pathlib import Path
 
 from PIL import Image
 
-from src.capture.screen_geometry import CapturedWindow, ScreenGeometry
+from src.capture.screen_geometry import (
+    CapturedWindow,
+    ScreenGeometry,
+    WindowAvailabilityError,
+    WindowCaptureStatus,
+)
 from src.logic.monte_carlo import MonteCarloSettings, recommend_phase4
 from src.pipeline.calibration import WindowInfo
 from src.pipeline.live_layout import LiveLayoutConfig
@@ -30,6 +35,21 @@ class _FrameSource:
             pixel_box=(0, 0, 200, 100),
             geometry=ScreenGeometry((200, 100), (200, 100)),
         )
+
+
+class _UnavailableThenFrameSource:
+    def __init__(self, status: WindowCaptureStatus) -> None:
+        self.status = status
+        self.calls = 0
+
+    def capture(self, frame_id: int) -> CapturedWindow:
+        self.calls += 1
+        if self.calls == 1:
+            raise WindowAvailabilityError(
+                self.status,
+                "斗地主窗口当前无法识别",
+            )
+        return _FrameSource().capture(frame_id)
 
 
 class _Recognizer:
@@ -109,3 +129,44 @@ def test_live_runtime_schedules_and_logs_revision_scoped_decision(
     assert "scene_observation" in events
     assert "state_update" in events
     assert "live_decision" in events
+
+
+def test_live_runtime_waits_for_window_and_recovers(tmp_path: Path) -> None:
+    config = LiveLayoutConfig(
+        log_file=tmp_path / "live.jsonl",
+        error_frames_dir=tmp_path / "errors",
+    )
+    runtime = LiveGameRuntime(
+        config,
+        frame_source=_UnavailableThenFrameSource(
+            WindowCaptureStatus.NOT_OPEN,
+        ),
+        recognizer=_Recognizer(),
+        tracker=_Tracker(None),
+        sleeper=lambda _: None,
+    )
+    try:
+        waiting = runtime.run_once()
+        recovered = runtime.run_once()
+    finally:
+        runtime.close()
+
+    assert waiting.window_status is WindowCaptureStatus.NOT_OPEN
+    assert waiting.window_available is False
+    assert waiting.decision is None
+    waiting_view = LiveOverlayViewModel.from_snapshot(waiting)
+    assert "不可用" in waiting_view.roles
+    assert "已暂停" in waiting_view.best
+
+    assert recovered.window_status is WindowCaptureStatus.AVAILABLE
+    assert recovered.window_available is True
+    events = [
+        json.loads(line)
+        for line in config.log_file.read_text(encoding="utf-8").splitlines()
+    ]
+    transitions = [
+        event["status"]
+        for event in events
+        if event["event"] == "live_window_status"
+    ]
+    assert transitions == ["not_open", "available"]

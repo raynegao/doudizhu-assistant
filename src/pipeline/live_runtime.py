@@ -7,7 +7,13 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Callable, Iterator, Protocol
 
-from src.capture.screen_geometry import CapturedWindow, MacWindowCapture
+from src.capture.screen_geometry import (
+    CapturedWindow,
+    MacWindowCapture,
+    ScreenGeometryError,
+    WindowAvailabilityError,
+    WindowCaptureStatus,
+)
 from src.logic.monte_carlo import (
     MonteCarloSettings,
     Phase4DecisionResult,
@@ -68,15 +74,23 @@ class LiveRuntimeSnapshot:
     decision_pending: bool
     capture_latency_ms: float
     total_latency_ms: float
+    window_status: WindowCaptureStatus = WindowCaptureStatus.AVAILABLE
+    window_message: str = ""
 
     @property
     def state(self) -> ObservableGameState | None:
         return self.tracker_update.state
 
+    @property
+    def window_available(self) -> bool:
+        return self.window_status is WindowCaptureStatus.AVAILABLE
+
     def to_log_payload(self) -> dict[str, object]:
         return {
             "event": "live_runtime_snapshot",
             "frame_id": self.frame_id,
+            "window_status": self.window_status.value,
+            "window_message": self.window_message,
             "tracker_mode": self.tracker_update.mode.value,
             "decision_pending": self.decision_pending,
             "capture_latency_ms": round(self.capture_latency_ms, 3),
@@ -123,12 +137,33 @@ class LiveGameRuntime:
         self._decision: LiveDecisionRecord | None = None
         self._logged_decisions: set[tuple[str, int]] = set()
         self._last_error_frame: tuple[str | None, int] | None = None
+        self._last_window_status: WindowCaptureStatus | None = None
 
     def run_once(self, frame_id: int | None = None) -> LiveRuntimeSnapshot:
         current_frame_id = self._allocate_frame_id(frame_id)
         started = time.perf_counter()
-        frame = self.frame_source.capture(current_frame_id)
+        try:
+            frame = self.frame_source.capture(current_frame_id)
+        except WindowAvailabilityError as exc:
+            return self._window_unavailable_snapshot(
+                current_frame_id,
+                started,
+                status=exc.status,
+                message=str(exc),
+            )
+        except ScreenGeometryError as exc:
+            return self._window_unavailable_snapshot(
+                current_frame_id,
+                started,
+                status=WindowCaptureStatus.CAPTURE_ERROR,
+                message=f"斗地主窗口当前无法识别：{exc}",
+            )
         capture_latency_ms = (time.perf_counter() - started) * 1000
+        self._log_window_transition(
+            WindowCaptureStatus.AVAILABLE,
+            "已连接斗地主窗口，正在识别",
+            frame_id=current_frame_id,
+        )
         scene = self.recognizer.observe(frame)
         _write_jsonl(self.config.log_file, scene.to_log_payload())
 
@@ -153,6 +188,75 @@ class LiveGameRuntime:
         )
         _write_jsonl(self.config.log_file, snapshot.to_log_payload())
         return snapshot
+
+    def _window_unavailable_snapshot(
+        self,
+        frame_id: int,
+        started: float,
+        *,
+        status: WindowCaptureStatus,
+        message: str,
+    ) -> LiveRuntimeSnapshot:
+        self._log_window_transition(status, message, frame_id=frame_id)
+        handler = getattr(self.tracker, "handle_window_unavailable", None)
+        if callable(handler):
+            update = handler(message)
+        else:
+            update = VisualTrackerUpdate(
+                mode=getattr(
+                    self.tracker,
+                    "mode",
+                    VisualTrackerMode.WAITING_FOR_ROUND,
+                ),
+                message=message,
+                state=getattr(self.tracker, "state", None),
+                warnings=(message,),
+            )
+        scene = SceneObservation(
+            frame_id=frame_id,
+            timestamp=time.time(),
+            window_pixel_box=(0, 0, 0, 0),
+            self_hand=(),
+            seats=(),
+            self_turn=None,
+            self_turn_confidence=0.0,
+            confidence=0.0,
+            warnings=(message,),
+        )
+        snapshot = LiveRuntimeSnapshot(
+            frame_id=frame_id,
+            scene=scene,
+            tracker_update=update,
+            decision=None,
+            decision_pending=False,
+            capture_latency_ms=(time.perf_counter() - started) * 1000,
+            total_latency_ms=(time.perf_counter() - started) * 1000,
+            window_status=status,
+            window_message=message,
+        )
+        _write_jsonl(self.config.log_file, snapshot.to_log_payload())
+        return snapshot
+
+    def _log_window_transition(
+        self,
+        status: WindowCaptureStatus,
+        message: str,
+        *,
+        frame_id: int,
+    ) -> None:
+        if status is self._last_window_status:
+            return
+        self._last_window_status = status
+        _write_jsonl(
+            self.config.log_file,
+            {
+                "event": "live_window_status",
+                "frame_id": frame_id,
+                "status": status.value,
+                "message": message,
+                "timestamp": time.time(),
+            },
+        )
 
     def run_loop(
         self,
@@ -329,6 +433,13 @@ def _write_jsonl(path: Path, payload: dict[str, object]) -> None:
 
 
 def format_live_snapshot(snapshot: LiveRuntimeSnapshot) -> str:
+    if not snapshot.window_available:
+        return "\n".join([
+            "Dou Dizhu Phase 6 Live Assistant",
+            f"frame={snapshot.frame_id} window={snapshot.window_status.value}",
+            snapshot.window_message,
+            "状态：无法识别，已暂停推荐",
+        ])
     state = snapshot.state
     lines = [
         "Dou Dizhu Phase 6 Live Assistant",

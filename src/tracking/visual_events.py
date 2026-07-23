@@ -222,6 +222,18 @@ class VisualEventTracker:
             warnings=result.warnings,
         )
 
+    def handle_window_unavailable(self, reason: str) -> VisualTrackerUpdate:
+        if self._tracker is not None and self.mode is VisualTrackerMode.TRACKING:
+            return self._mark_uncertain(
+                f"{reason}；可能漏过场上事件，等待下一局完整初始化"
+            )
+        return VisualTrackerUpdate(
+            mode=self.mode,
+            message=reason,
+            state=self.state,
+            warnings=(reason,),
+        )
+
     def _initialize(
         self,
         scene: SceneObservation,

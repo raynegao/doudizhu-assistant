@@ -5,6 +5,7 @@ import subprocess
 import tempfile
 import time
 from dataclasses import dataclass
+from enum import Enum
 from pathlib import Path
 from typing import Callable
 
@@ -15,6 +16,19 @@ from src.pipeline.calibration import WindowInfo, find_window
 
 class ScreenGeometryError(RuntimeError):
     """Raised when logical macOS coordinates cannot be mapped to screenshot pixels."""
+
+
+class WindowCaptureStatus(str, Enum):
+    AVAILABLE = "available"
+    NOT_OPEN = "not_open"
+    MINIMIZED = "minimized"
+    CAPTURE_ERROR = "capture_error"
+
+
+class WindowAvailabilityError(ScreenGeometryError):
+    def __init__(self, status: WindowCaptureStatus, message: str) -> None:
+        super().__init__(message)
+        self.status = status
 
 
 @dataclass(frozen=True)
@@ -76,6 +90,7 @@ class CapturedWindow:
 class WindowServerInfo:
     window_id: int
     window: WindowInfo
+    is_onscreen: bool = True
 
 
 _WINDOW_LIST_SWIFT = r"""
@@ -92,6 +107,7 @@ for window in windows {
     let id = window[kCGWindowNumber as String] as? Int ?? 0
     let name = window[kCGWindowName as String] as? String ?? ""
     let layer = window[kCGWindowLayer as String] as? Int ?? 0
+    let isOnscreen = window[kCGWindowIsOnscreen as String] as? Bool ?? false
     guard let bounds = window[kCGWindowBounds as String] as? [String: Any],
           let x = bounds["X"] as? Double,
           let y = bounds["Y"] as? Double,
@@ -99,7 +115,7 @@ for window in windows {
           let height = bounds["Height"] as? Double else {
         continue
     }
-    print("\(id)\t\(x)\t\(y)\t\(width)\t\(height)\t\(layer)\t\(name)")
+    print("\(id)\t\(x)\t\(y)\t\(width)\t\(height)\t\(layer)\t\(isOnscreen ? 1 : 0)\t\(name)")
 }
 """
 
@@ -111,7 +127,7 @@ def parse_window_server_candidates(
 ) -> list[tuple[WindowServerInfo, int]]:
     candidates: list[tuple[WindowServerInfo, int]] = []
     for line in output.splitlines():
-        parts = line.split("\t", 6)
+        parts = line.split("\t", 7)
         if len(parts) < 7:
             continue
         try:
@@ -122,6 +138,12 @@ def parse_window_server_candidates(
             layer = int(parts[5])
         except ValueError:
             continue
+        if len(parts) >= 8:
+            is_onscreen = parts[6] == "1"
+            window_name = parts[7]
+        else:
+            is_onscreen = True
+            window_name = parts[6]
         if window_id <= 0 or width <= 0 or height <= 0:
             continue
         candidates.append(
@@ -130,9 +152,10 @@ def parse_window_server_candidates(
                     window_id=window_id,
                     window=WindowInfo(
                         app_name=app_name,
-                        window_name=parts[6].strip() or app_name,
+                        window_name=window_name.strip() or app_name,
                         window_box=(left, top, left + width, top + height),
                     ),
+                    is_onscreen=is_onscreen,
                 ),
                 layer,
             )
@@ -162,8 +185,9 @@ def find_window_server_window(
         ) from exc
     candidates = parse_window_server_candidates(result.stdout, app_name=app_name)
     if not candidates:
-        raise ScreenGeometryError(
-            f"cannot find a WindowServer window for app '{app_name}'"
+        raise WindowAvailabilityError(
+            WindowCaptureStatus.NOT_OPEN,
+            f"未检测到“{app_name}”窗口，请打开斗地主",
         )
     layer_zero = [info for info, layer in candidates if layer == 0]
     selectable = layer_zero or [info for info, _ in candidates]
@@ -282,9 +306,13 @@ class MacWindowCapture:
         return self._capture_screen_crop(frame_id)
 
     def _capture_window_level(self, frame_id: int) -> CapturedWindow:
-        if self._window_server_info is None:
-            self._window_server_info = self._window_server_finder(self.app_name)
-        info = self._window_server_info
+        info = self._window_server_finder(self.app_name)
+        self._window_server_info = info
+        if not info.is_onscreen:
+            raise WindowAvailabilityError(
+                WindowCaptureStatus.MINIMIZED,
+                "斗地主窗口已最小化，当前无法识别；请还原窗口",
+            )
         if self._geometry is None:
             self._geometry = self._geometry_provider()
         geometry = self._geometry
@@ -294,6 +322,11 @@ class MacWindowCapture:
         except ScreenGeometryError:
             self._window_server_info = self._window_server_finder(self.app_name)
             info = self._window_server_info
+            if not info.is_onscreen:
+                raise WindowAvailabilityError(
+                    WindowCaptureStatus.MINIMIZED,
+                    "斗地主窗口已最小化，当前无法识别；请还原窗口",
+                )
             pixel_box = geometry.logical_to_pixel_box(info.window.window_box)
             image = self._window_grabber(info.window_id).convert("RGB")
         expected_size = (
@@ -304,6 +337,11 @@ class MacWindowCapture:
             refreshed = self._window_server_finder(self.app_name)
             self._window_server_info = refreshed
             info = refreshed
+            if not info.is_onscreen:
+                raise WindowAvailabilityError(
+                    WindowCaptureStatus.MINIMIZED,
+                    "斗地主窗口已最小化，当前无法识别；请还原窗口",
+                )
             pixel_box = geometry.logical_to_pixel_box(info.window.window_box)
             expected_size = (
                 pixel_box[2] - pixel_box[0],
@@ -359,6 +397,8 @@ __all__ = [
     "MacWindowCapture",
     "ScreenGeometry",
     "ScreenGeometryError",
+    "WindowAvailabilityError",
+    "WindowCaptureStatus",
     "WindowServerInfo",
     "detect_screen_geometry",
     "find_window_server_window",

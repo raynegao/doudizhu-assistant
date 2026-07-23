@@ -3,10 +3,13 @@ from __future__ import annotations
 from pathlib import Path
 
 from PIL import Image
+import pytest
 
 from src.capture.screen_geometry import (
     MacWindowCapture,
     ScreenGeometry,
+    WindowAvailabilityError,
+    WindowCaptureStatus,
     WindowServerInfo,
     parse_desktop_bounds,
     parse_window_server_candidates,
@@ -88,10 +91,56 @@ def test_mac_window_capture_uses_window_server_image() -> None:
     assert frame.image.getpixel((0, 0)) == (0, 0, 128)
 
 
+def test_mac_window_capture_rejects_minimized_window() -> None:
+    window = WindowInfo(
+        app_name="斗地主",
+        window_name="斗地主",
+        window_box=(10, 20, 110, 120),
+    )
+    source = MacWindowCapture(
+        "斗地主",
+        geometry_provider=lambda: ScreenGeometry((200, 200), (400, 400)),
+        window_server_finder=lambda _: WindowServerInfo(
+            42,
+            window,
+            is_onscreen=False,
+        ),
+        window_grabber=lambda _: Image.new("RGB", (200, 200), "navy"),
+    )
+
+    with pytest.raises(WindowAvailabilityError) as error:
+        source.capture(1)
+
+    assert error.value.status is WindowCaptureStatus.MINIMIZED
+
+
+def test_mac_window_capture_detects_minimize_during_capture() -> None:
+    window = WindowInfo(
+        app_name="斗地主",
+        window_name="斗地主",
+        window_box=(10, 20, 110, 120),
+    )
+    states = iter((
+        WindowServerInfo(42, window, is_onscreen=True),
+        WindowServerInfo(42, window, is_onscreen=False),
+    ))
+    source = MacWindowCapture(
+        "斗地主",
+        geometry_provider=lambda: ScreenGeometry((200, 200), (400, 400)),
+        window_server_finder=lambda _: next(states),
+        window_grabber=lambda _: Image.new("RGB", (180, 180), "navy"),
+    )
+
+    with pytest.raises(WindowAvailabilityError) as error:
+        source.capture(1)
+
+    assert error.value.status is WindowCaptureStatus.MINIMIZED
+
+
 def test_parse_window_server_candidates() -> None:
     output = (
-        "65272\t157.0\t86.0\t66.0\t20.0\t0\tWindow\n"
-        "65244\t147.0\t82.0\t1176.0\t767.0\t0\t斗地主\n"
+        "65272\t157.0\t86.0\t66.0\t20.0\t0\t0\tWindow\n"
+        "65244\t147.0\t82.0\t1176.0\t767.0\t0\t1\t斗地主\n"
     )
 
     candidates = parse_window_server_candidates(output, app_name="斗地主")
@@ -104,6 +153,7 @@ def test_parse_window_server_candidates() -> None:
                 window_name="斗地主",
                 window_box=(147, 82, 1323, 849),
             ),
+            is_onscreen=True,
         ),
         0,
     )
