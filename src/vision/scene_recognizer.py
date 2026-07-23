@@ -1,9 +1,14 @@
 from __future__ import annotations
 
+import hashlib
+import os
+import platform
+import subprocess
+import tempfile
 from dataclasses import dataclass
 from enum import Enum
 from pathlib import Path
-from typing import Callable, Iterable, Sequence
+from typing import Callable, Iterable, Mapping, Sequence
 
 from PIL import Image, ImageOps, ImageStat
 import torch
@@ -66,6 +71,7 @@ class SeatObservation:
     pass_confidence: float = 0.0
     remaining_confidence: float = 0.0
     role_confidence: float = 0.0
+    remaining_verified: bool = True
 
     @property
     def card_set(self) -> CardSet:
@@ -82,6 +88,7 @@ class SeatObservation:
             "pass_confidence": round(self.pass_confidence, 6),
             "remaining_confidence": round(self.remaining_confidence, 6),
             "role_confidence": round(self.role_confidence, 6),
+            "remaining_verified": self.remaining_verified,
         }
 
 
@@ -180,6 +187,108 @@ class TemplateMatcher:
 CardPredictionFn = Callable[[Sequence[Image.Image]], Sequence[CardPrediction]]
 
 
+@dataclass(frozen=True)
+class RemainingTextMatch:
+    count: int | None
+    confidence: float
+
+
+class MacVisionRemainingReader:
+    """Read the two opponent counters with macOS Vision text recognition."""
+
+    def __init__(
+        self,
+        *,
+        source_path: Path | None = None,
+        runner: Callable[..., subprocess.CompletedProcess[str]] = subprocess.run,
+    ) -> None:
+        self.source_path = source_path or Path(__file__).with_name(
+            "macos_vision_ocr.swift"
+        )
+        self._runner = runner
+        self._binary_path: Path | None = None
+
+    def __call__(
+        self,
+        images: Mapping[PlayerSeat, Image.Image],
+    ) -> Mapping[PlayerSeat, RemainingTextMatch]:
+        binary = self._ensure_binary()
+        seats = [
+            seat
+            for seat in (PlayerSeat.LEFT, PlayerSeat.RIGHT)
+            if seat in images
+        ]
+        if not seats:
+            return {}
+        with tempfile.TemporaryDirectory(
+            prefix="doudizhu-remaining-ocr-"
+        ) as temp_dir:
+            paths: list[Path] = []
+            for seat in seats:
+                path = Path(temp_dir) / f"{seat.value}.png"
+                images[seat].convert("RGB").save(path)
+                paths.append(path)
+            try:
+                result = self._runner(
+                    [str(binary), *(str(path) for path in paths)],
+                    check=True,
+                    capture_output=True,
+                    text=True,
+                    timeout=5,
+                )
+            except (OSError, subprocess.SubprocessError):
+                return {}
+        matches: dict[PlayerSeat, RemainingTextMatch] = {}
+        for seat, line in zip(seats, result.stdout.splitlines()):
+            parts = line.rsplit("\t", 2)
+            if len(parts) != 3:
+                continue
+            try:
+                count = int(parts[1])
+                confidence = float(parts[2])
+            except ValueError:
+                continue
+            if 0 <= count <= 20 and 0.0 <= confidence <= 1.0:
+                matches[seat] = RemainingTextMatch(count, confidence)
+        return matches
+
+    def _ensure_binary(self) -> Path:
+        if self._binary_path is not None:
+            return self._binary_path
+        source = self.source_path.read_bytes()
+        digest = hashlib.sha256(source).hexdigest()[:12]
+        binary = Path(tempfile.gettempdir()) / (
+            f"doudizhu-macos-vision-ocr-{digest}"
+        )
+        if not binary.exists():
+            temporary = binary.with_name(f"{binary.name}.{os.getpid()}.tmp")
+            try:
+                self._runner(
+                    [
+                        "/usr/bin/swiftc",
+                        "-O",
+                        str(self.source_path),
+                        "-o",
+                        str(temporary),
+                    ],
+                    check=True,
+                    capture_output=True,
+                    text=True,
+                    timeout=30,
+                )
+                temporary.replace(binary)
+            finally:
+                temporary.unlink(missing_ok=True)
+        self._binary_path = binary
+        return binary
+
+
+RemainingReader = Callable[
+    [Mapping[PlayerSeat, Image.Image]],
+    Mapping[PlayerSeat, RemainingTextMatch],
+]
+
+
 class SceneRecognizer:
     def __init__(
         self,
@@ -187,6 +296,7 @@ class SceneRecognizer:
         *,
         predictor: CardPredictionFn | None = None,
         template_matcher: TemplateMatcher | None = None,
+        remaining_reader: RemainingReader | None = None,
     ) -> None:
         self.config = config
         self.templates = template_matcher or TemplateMatcher(config.templates_dir)
@@ -206,11 +316,17 @@ class SceneRecognizer:
             self.predictor = model_predictor
         else:
             self.predictor = predictor
+        if remaining_reader is not None:
+            self.remaining_reader: RemainingReader | None = remaining_reader
+        elif platform.system() == "Darwin":
+            self.remaining_reader = MacVisionRemainingReader()
+        else:
+            self.remaining_reader = None
 
     def observe(self, frame: CapturedWindow) -> SceneObservation:
         warnings: list[str] = []
         roles: dict[PlayerSeat, tuple[SeatRole, float]] = {}
-        remaining: dict[PlayerSeat, tuple[int | None, float]] = {}
+        remaining: dict[PlayerSeat, tuple[int | None, float, bool]] = {}
 
         for seat in PlayerSeat:
             role_match = self.templates.classify("role", self.config.crop(frame.image, f"{seat.value}_role"))
@@ -230,18 +346,35 @@ class SceneRecognizer:
                 f"self_hand_not_initial: recognized={len(self_hand)} expected={expected_hand_count}"
             )
 
+        count_crops = {
+            seat: self.config.crop(frame.image, f"{seat.value}_remaining")
+            for seat in PlayerSeat
+        }
+        ocr_matches: Mapping[PlayerSeat, RemainingTextMatch] = {}
+        if self.remaining_reader is not None:
+            try:
+                ocr_matches = self.remaining_reader(count_crops)
+            except (OSError, subprocess.SubprocessError, ValueError):
+                warnings.append("remaining_ocr_unavailable")
+
         for seat in PlayerSeat:
-            count_crop = self.config.crop(frame.image, f"{seat.value}_remaining")
+            count_crop = count_crops[seat]
             match = self.templates.classify("remaining", count_crop)
-            count = _parse_remaining(
+            template_count = _parse_remaining(
                 match,
                 max(self.config.template_threshold, 0.94),
             )
-            confidence = match.confidence
+            count, confidence, verified = _resolve_remaining(
+                template_count=template_count,
+                template_confidence=match.confidence,
+                text_match=ocr_matches.get(seat),
+                template_threshold=self.config.template_threshold,
+            )
             if seat is PlayerSeat.SELF and len(self_hand) in {17, 20}:
                 count = len(self_hand)
                 confidence = _minimum_card_confidence(self_hand)
-            remaining[seat] = count, confidence
+                verified = True
+            remaining[seat] = count, confidence, verified
             if count is None:
                 warnings.append(f"{seat.value}_remaining_unavailable")
 
@@ -295,7 +428,7 @@ class SceneRecognizer:
         seat: PlayerSeat,
         *,
         role: tuple[SeatRole, float],
-        remaining: tuple[int | None, float],
+        remaining: tuple[int | None, float, bool],
     ) -> SeatObservation:
         play_crop = self.config.crop(image, f"{seat.value}_play")
         pass_crop = self.config.crop(image, f"{seat.value}_pass")
@@ -345,6 +478,7 @@ class SceneRecognizer:
             pass_confidence=pass_match.confidence,
             remaining_confidence=remaining[1],
             role_confidence=role[1],
+            remaining_verified=remaining[2],
         )
 
     def _observe_initial_hand(
@@ -396,6 +530,32 @@ def _parse_remaining(match: TemplateMatch, threshold: float) -> int | None:
     except ValueError:
         return None
     return value if 0 <= value <= 20 else None
+
+
+def _resolve_remaining(
+    *,
+    template_count: int | None,
+    template_confidence: float,
+    text_match: RemainingTextMatch | None,
+    template_threshold: float,
+) -> tuple[int | None, float, bool]:
+    if (
+        text_match is not None
+        and text_match.count is not None
+        and text_match.confidence >= 0.50
+    ):
+        return text_match.count, text_match.confidence, True
+    # Whole-ROI templates are useful as a best-effort display value, but an
+    # unseen number can still look very similar because most pixels are the
+    # unchanged seat background. Only near-exact matches may block tracking.
+    return (
+        template_count,
+        template_confidence,
+        bool(
+            template_count is not None
+            and template_confidence >= max(template_threshold, 0.995)
+        ),
+    )
 
 
 def _minimum_card_confidence(cards: Sequence[VisualCard]) -> float:
@@ -652,6 +812,8 @@ def _card_rank_crop(card: Image.Image) -> Image.Image:
 __all__ = [
     "SceneObservation",
     "SceneRecognizer",
+    "MacVisionRemainingReader",
+    "RemainingTextMatch",
     "SeatObservation",
     "SeatRole",
     "TemplateMatch",

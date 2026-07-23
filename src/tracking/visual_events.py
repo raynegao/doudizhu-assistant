@@ -2,9 +2,11 @@ from __future__ import annotations
 
 from dataclasses import dataclass, replace
 from enum import Enum
-from typing import Callable
+from typing import Callable, Sequence
 
 from src.logic.action_validation import validate_observed_action
+from src.logic.rules import Play, PlayType
+from src.state.cards import CardSet
 from src.state.events import ObservedAction, PlayerSeat, RoundPhase
 from src.state.game_tracker import GameStateTracker, StateUpdateStatus
 from src.state.observable_state import ObservableGameState
@@ -12,6 +14,7 @@ from src.vision.scene_recognizer import (
     SceneObservation,
     SeatObservation,
     SeatRole,
+    VisualCard,
     VisualSignal,
 )
 
@@ -102,7 +105,10 @@ class VisualEventTracker:
         return state
 
     def update(self, scene: SceneObservation) -> VisualTrackerUpdate:
-        initial = _initial_state_payload(scene)
+        initial = _initial_state_payload(
+            scene,
+            confidence_threshold=self.confidence_threshold,
+        )
         if initial is not None:
             stable_count = self._initial_stable.update(initial.fingerprint)
             should_initialize = self._tracker is None or self.mode in {
@@ -117,7 +123,10 @@ class VisualEventTracker:
         if self._tracker is None:
             return VisualTrackerUpdate(
                 mode=VisualTrackerMode.WAITING_FOR_ROUND,
-                message="等待完整新局：地主、17/20 张初始手牌和三家初始余牌必须稳定",
+                message=(
+                    "等待新局：完整初始场面，或可由地主首手安全重建的场面，"
+                    "必须连续稳定"
+                ),
                 state=None,
                 warnings=scene.warnings,
             )
@@ -239,10 +248,11 @@ class VisualEventTracker:
         scene: SceneObservation,
         initial: "_InitialStatePayload",
     ) -> VisualTrackerUpdate:
+        round_id = self.round_id_factory(scene)
         try:
             state = ObservableGameState.from_inputs(
                 initial.hand,
-                round_id=self.round_id_factory(scene),
+                round_id=round_id,
                 landlord=initial.landlord,
                 current_actor=initial.landlord,
                 remaining_cards=initial.remaining,
@@ -250,11 +260,36 @@ class VisualEventTracker:
             )
         except ValueError as exc:
             return self._mark_uncertain(f"cannot initialize visual round: {exc}")
-        self._tracker = GameStateTracker(
+        if initial.warnings:
+            state = replace(
+                state,
+                warnings=tuple(
+                    dict.fromkeys((*state.warnings, *initial.warnings))
+                ),
+            )
+        tracker = GameStateTracker(
             state,
             validator=validate_observed_action,
             confidence_threshold=self.confidence_threshold,
         )
+        opening_event: ObservedAction | None = None
+        if initial.opening_cards:
+            opening_event = ObservedAction(
+                event_id=f"{round_id}:1:{initial.landlord.value}",
+                sequence_no=1,
+                actor=initial.landlord,
+                cards=initial.opening_card_set,
+                confidence=initial.opening_confidence,
+                source="live_visual_bootstrap",
+            )
+            result = tracker.apply(opening_event)
+            if result.status is not StateUpdateStatus.APPLIED:
+                return self._mark_uncertain(
+                    f"cannot reconstruct landlord opening play: {result.message}",
+                    event=opening_event,
+                )
+            state = result.state
+        self._tracker = tracker
         self.mode = VisualTrackerMode.TRACKING
         self._uncertain_reason = None
         self._seat_stable = {seat: _StableValue() for seat in PlayerSeat}
@@ -264,13 +299,13 @@ class VisualEventTracker:
         }
         return VisualTrackerUpdate(
             mode=self.mode,
-            message=(
-                f"新局已初始化：地主={initial.landlord.value}，"
-                f"当前行动者={initial.landlord.value}"
-            ),
+            message=_initialization_message(initial, state),
             state=state,
+            event=opening_event,
             initialized=True,
-            warnings=scene.warnings,
+            warnings=tuple(
+                dict.fromkeys((*scene.warnings, *initial.warnings))
+            ),
         )
 
     def _mark_uncertain(
@@ -296,6 +331,13 @@ class _InitialStatePayload:
     hand: tuple[str, ...]
     remaining: dict[PlayerSeat, int]
     confidence: float
+    opening_cards: tuple[str, ...] = ()
+    opening_confidence: float = 1.0
+    warnings: tuple[str, ...] = ()
+
+    @property
+    def opening_card_set(self) -> CardSet:
+        return CardSet.parse(self.opening_cards)
 
     @property
     def fingerprint(self) -> tuple[object, ...]:
@@ -303,10 +345,15 @@ class _InitialStatePayload:
             self.landlord.value,
             self.hand,
             tuple((seat.value, self.remaining[seat]) for seat in PlayerSeat),
+            self.opening_cards,
         )
 
 
-def _initial_state_payload(scene: SceneObservation) -> _InitialStatePayload | None:
+def _initial_state_payload(
+    scene: SceneObservation,
+    *,
+    confidence_threshold: float,
+) -> _InitialStatePayload | None:
     landlords = [
         observation.seat
         for observation in scene.seats
@@ -324,21 +371,6 @@ def _initial_state_payload(scene: SceneObservation) -> _InitialStatePayload | No
         seat: 20 if seat is landlord else 17
         for seat in PlayerSeat
     }
-    if any(
-        observation.signal is not VisualSignal.NEUTRAL
-        for observation in scene.seats
-    ):
-        return None
-    remaining: dict[PlayerSeat, int] = {}
-    for observation in scene.seats:
-        if observation.remaining_count is None:
-            if observation.seat is not landlord:
-                return None
-            remaining[observation.seat] = expected[observation.seat]
-            continue
-        remaining[observation.seat] = observation.remaining_count
-    if remaining != expected:
-        return None
     hand = tuple(card.rank for card in scene.self_hand)
     if len(hand) != expected[PlayerSeat.SELF]:
         return None
@@ -348,23 +380,213 @@ def _initial_state_payload(scene: SceneObservation) -> _InitialStatePayload | No
         return None
     if len(hand_set) != len(hand):
         return None
-    confidences = [
-        scene.confidence,
-        *(card.confidence for card in scene.self_hand),
-        *(seat.role_confidence for seat in scene.seats),
-        *(seat.remaining_confidence for seat in scene.seats),
-    ]
-    positive_confidences = [value for value in confidences if value > 0]
-    if not positive_confidences:
+    hand_confidence, hand_warnings = _stable_hand_confidence(
+        scene.self_hand,
+        confidence_threshold=confidence_threshold,
+    )
+    if hand_confidence < confidence_threshold:
         return None
-    confidence = min(positive_confidences)
-    if confidence < 0.70:
+
+    if any(
+        observation.signal is not VisualSignal.NEUTRAL
+        for observation in scene.seats
+    ):
+        return _opening_state_payload(
+            scene,
+            landlord=landlord,
+            hand=hand,
+            expected=expected,
+            hand_confidence=hand_confidence,
+            hand_warnings=hand_warnings,
+            confidence_threshold=confidence_threshold,
+        )
+
+    remaining: dict[PlayerSeat, int] = {}
+    inferred_warnings: list[str] = []
+    for observation in scene.seats:
+        expected_count = expected[observation.seat]
+        if observation.remaining_count is None:
+            if observation.seat is not landlord:
+                return None
+            remaining[observation.seat] = expected_count
+            inferred_warnings.append(
+                f"inferred_initial_{observation.seat.value}_remaining={expected_count}"
+            )
+            continue
+        if observation.remaining_count != expected_count:
+            if observation.seat is landlord and not observation.remaining_verified:
+                remaining[observation.seat] = expected_count
+                inferred_warnings.append(
+                    f"ignored_unverified_initial_{observation.seat.value}_remaining="
+                    f"{observation.remaining_count}"
+                )
+                continue
+            return None
+        remaining[observation.seat] = observation.remaining_count
+
+    confidence = _initial_observation_confidence(
+        scene,
+        hand_confidence=hand_confidence,
+        include_action=None,
+    )
+    if confidence < confidence_threshold:
         return None
     return _InitialStatePayload(
         landlord=landlord,
         hand=hand,
         remaining=remaining,
         confidence=confidence,
+        warnings=tuple((*hand_warnings, *inferred_warnings)),
+    )
+
+
+def _opening_state_payload(
+    scene: SceneObservation,
+    *,
+    landlord: PlayerSeat,
+    hand: tuple[str, ...],
+    expected: dict[PlayerSeat, int],
+    hand_confidence: float,
+    hand_warnings: tuple[str, ...],
+    confidence_threshold: float,
+) -> _InitialStatePayload | None:
+    if landlord is PlayerSeat.SELF:
+        # A self-landlord hand has already changed after its first play, so the
+        # missing cards cannot be reconstructed from the screen alone.
+        return None
+    active = [
+        observation
+        for observation in scene.seats
+        if observation.signal is not VisualSignal.NEUTRAL
+    ]
+    if (
+        len(active) != 1
+        or active[0].seat is not landlord
+        or active[0].signal is not VisualSignal.PLAY
+        or not active[0].cards
+    ):
+        return None
+    opening = active[0]
+    opening_confidence = _action_confidence(opening)
+    if opening_confidence < confidence_threshold:
+        return None
+    opening_count = len(opening.cards)
+    derived_landlord_remaining = expected[landlord] - opening_count
+    if derived_landlord_remaining <= 0:
+        return None
+
+    if Play.parse(opening.card_set.cards).type is PlayType.INVALID:
+        return None
+
+    inferred_warnings: list[str] = []
+    for observation in scene.seats:
+        if observation.seat is PlayerSeat.SELF:
+            continue
+        if observation.seat is landlord:
+            if (
+                observation.remaining_verified
+                and observation.remaining_count is not None
+                and observation.remaining_count != derived_landlord_remaining
+            ):
+                return None
+            if observation.remaining_count != derived_landlord_remaining:
+                inferred_warnings.append(
+                    f"inferred_opening_{landlord.value}_remaining="
+                    f"{derived_landlord_remaining}"
+                )
+            continue
+        if observation.remaining_count != expected[observation.seat]:
+            return None
+
+    next_actor = {
+        PlayerSeat.SELF: PlayerSeat.RIGHT,
+        PlayerSeat.RIGHT: PlayerSeat.LEFT,
+        PlayerSeat.LEFT: PlayerSeat.SELF,
+    }[landlord]
+    if next_actor is PlayerSeat.SELF and scene.self_turn is False:
+        return None
+    if next_actor is not PlayerSeat.SELF and scene.self_turn is True:
+        return None
+
+    confidence = _initial_observation_confidence(
+        scene,
+        hand_confidence=hand_confidence,
+        include_action=opening,
+    )
+    if confidence < confidence_threshold:
+        return None
+    return _InitialStatePayload(
+        landlord=landlord,
+        hand=hand,
+        remaining=expected,
+        confidence=confidence,
+        opening_cards=tuple(card.rank for card in opening.cards),
+        opening_confidence=opening_confidence,
+        warnings=tuple((*hand_warnings, *inferred_warnings)),
+    )
+
+
+def _stable_hand_confidence(
+    cards: Sequence[VisualCard],
+    *,
+    confidence_threshold: float,
+) -> tuple[float, tuple[str, ...]]:
+    values = sorted(card.confidence for card in cards)
+    if not values:
+        return 0.0, ()
+    below = [card for card in cards if card.confidence < confidence_threshold]
+    if not below:
+        return values[0], ()
+    outlier_floor = max(0.55, confidence_threshold - 0.15)
+    if (
+        len(below) == 1
+        and below[0].confidence >= outlier_floor
+        and len(values) >= 2
+    ):
+        warning = (
+            f"accepted_single_hand_confidence_outlier:"
+            f"{below[0].rank}={below[0].confidence:.3f}"
+        )
+        return values[1], (warning,)
+    return values[0], ()
+
+
+def _initial_observation_confidence(
+    scene: SceneObservation,
+    *,
+    hand_confidence: float,
+    include_action: SeatObservation | None,
+) -> float:
+    confidences = [
+        hand_confidence,
+        *(seat.role_confidence for seat in scene.seats),
+    ]
+    for seat in scene.seats:
+        if seat.seat is PlayerSeat.SELF:
+            continue
+        if seat.remaining_count is not None:
+            confidences.append(seat.remaining_confidence)
+    if include_action is not None:
+        confidences.append(_action_confidence(include_action))
+    if scene.self_turn is not None:
+        confidences.append(scene.self_turn_confidence)
+    positive = [value for value in confidences if value > 0]
+    return min(positive) if positive else 0.0
+
+
+def _initialization_message(
+    initial: _InitialStatePayload,
+    state: ObservableGameState,
+) -> str:
+    if initial.opening_cards:
+        return (
+            f"已由地主首手安全重建新局：地主={initial.landlord.value}，"
+            f"首手={' '.join(initial.opening_cards)}，"
+            f"当前行动者={state.current_actor.value}"
+        )
+    return (
+        f"新局已初始化：地主={initial.landlord.value}，"
+        f"当前行动者={state.current_actor.value}"
     )
 
 
@@ -393,7 +615,11 @@ def _remaining_count_error(
 ) -> str | None:
     # The current Mac client does not expose a dedicated self count in all layouts;
     # self remaining is exactly derived from the tracked hand.
-    if event.actor is PlayerSeat.SELF or observation.remaining_count is None:
+    if (
+        event.actor is PlayerSeat.SELF
+        or observation.remaining_count is None
+        or not observation.remaining_verified
+    ):
         return None
     expected = state.remaining_for(event.actor) - len(event.cards)
     if observation.remaining_count != expected:

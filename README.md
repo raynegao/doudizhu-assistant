@@ -371,7 +371,7 @@ make demo-gif
 Phase 6 新增只读实时闭环：
 
 ```text
-WindowServer 窗口级 Retina 截图 -> 归一化场面 ROI -> 三家 play/pass/角色/余牌观测
+WindowServer 窗口级 Retina 截图 -> 归一化场面 ROI -> 三家 play/pass/角色/原生 OCR 余牌观测
   -> 连续帧稳定与轮次校验 -> ObservableGameState
   -> 后台蒙特卡洛 Top-3 -> 置顶助手窗/JSONL
 ```
@@ -410,7 +410,7 @@ python -m scripts.run_live_assistant \
   --no-clear
 ```
 
-实时入口仅在一局开始时完成 54 张牌一致性初始化；中途启动、漏事件、余牌冲突、非法牌型或低置信度都会进入 `uncertain` 并暂停推荐。Top-1 按估计团队胜率优先，默认计算预算为 1.5 秒且至少完成 32 组 sampled worlds。完整采集、模板标注和验收步骤见 [Phase 6 使用说明](docs/PHASE6_LIVE_ASSISTANT.md)。
+实时入口优先在一局开始时完成 54 张牌一致性初始化。如果助手漏掉了纯空场初始帧，但画面仍稳定显示地主第一手、自己的完整 17 张农民手牌、角色和另一名农民的 17 张，系统会先验证首手牌型与 54 张守恒，再安全重建首个事件。更晚的中途启动、漏事件、可信余牌冲突、非法牌型或多项低置信度仍会暂停推荐。Top-1 按估计团队胜率优先，默认计算预算为 1.5 秒且至少完成 32 组 sampled worlds。完整采集、模板标注和验收步骤见 [Phase 6 使用说明](docs/PHASE6_LIVE_ASSISTANT.md)。
 
 录制数据可以通过 `scripts.replay_live_game` 离线重放，并用 `scripts.evaluate_live_replay` 生成事件 F1、牌点整组准确率、余牌准确率和牌数守恒报告。
 

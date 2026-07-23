@@ -5,7 +5,9 @@ from pathlib import Path
 from PIL import Image, ImageDraw
 
 from src.vision.scene_recognizer import (
+    RemainingTextMatch,
     TemplateMatcher,
+    _resolve_remaining,
     infer_overlapping_hand_boxes,
     segment_card_boxes,
 )
@@ -77,3 +79,29 @@ def test_infer_overlapping_hand_boxes_uses_visible_white_extent() -> None:
     assert boxes[0][0] == 40
     assert boxes[-1][2] <= image.width
     assert all(box[3] <= image.height for box in boxes)
+
+
+def test_native_text_count_overrides_unverified_whole_roi_template() -> None:
+    count, confidence, verified = _resolve_remaining(
+        template_count=16,
+        template_confidence=0.979,
+        text_match=RemainingTextMatch(count=13, confidence=1.0),
+        template_threshold=0.78,
+    )
+
+    assert count == 13
+    assert confidence == 1.0
+    assert verified is True
+
+
+def test_similar_whole_roi_template_is_not_verified_without_text() -> None:
+    count, confidence, verified = _resolve_remaining(
+        template_count=16,
+        template_confidence=0.979,
+        text_match=None,
+        template_threshold=0.78,
+    )
+
+    assert count == 16
+    assert confidence == 0.979
+    assert verified is False
