@@ -316,6 +316,8 @@ class SceneRecognizer:
             self.predictor = model_predictor
         else:
             self.predictor = predictor
+        self._rank_references: dict[str, list[frozenset[int]]] = {}
+        self._reference_hand_fingerprint: tuple[str, ...] | None = None
         if remaining_reader is not None:
             self.remaining_reader: RemainingReader | None = remaining_reader
         elif platform.system() == "Darwin":
@@ -337,14 +339,16 @@ class SceneRecognizer:
 
         self_role = roles[PlayerSeat.SELF][0]
         expected_hand_count = 20 if self_role is SeatRole.LANDLORD else 17
-        self_hand = self._observe_initial_hand(
-            self.config.crop(frame.image, "self_hand"),
+        self_hand_crop = self.config.crop(frame.image, "self_hand")
+        self_hand = self._observe_hand(
+            self_hand_crop,
             expected_count=expected_hand_count,
         )
-        if len(self_hand) != expected_hand_count:
+        if not self_hand:
             warnings.append(
-                f"self_hand_not_initial: recognized={len(self_hand)} expected={expected_hand_count}"
+                f"self_hand_unavailable: expected_at_most={expected_hand_count}"
             )
+        self._remember_rank_references(self_hand_crop, self_hand)
 
         count_crops = {
             seat: self.config.crop(frame.image, f"{seat.value}_remaining")
@@ -370,7 +374,10 @@ class SceneRecognizer:
                 text_match=ocr_matches.get(seat),
                 template_threshold=self.config.template_threshold,
             )
-            if seat is PlayerSeat.SELF and len(self_hand) in {17, 20}:
+            if (
+                seat is PlayerSeat.SELF
+                and 0 < len(self_hand) <= expected_hand_count
+            ):
                 count = len(self_hand)
                 confidence = _minimum_card_confidence(self_hand)
                 verified = True
@@ -441,17 +448,33 @@ class SceneRecognizer:
             cards: tuple[VisualCard, ...] = ()
             confidence = pass_match.confidence
         else:
-            boxes = segment_card_boxes(play_crop)
+            # The self action ROI overlaps the large control buttons in this
+            # client and produces false card-like regions. Self plays are more
+            # reliably derived from the stable hand difference in the tracker.
+            boxes = (
+                ()
+                if seat is PlayerSeat.SELF
+                else segment_card_boxes(play_crop)
+            )
             crops = [_card_rank_crop(play_crop.crop(box)) for box in boxes]
             predictions = self.predictor(crops)
-            cards = tuple(
-                VisualCard(
-                    rank=prediction.rank,
-                    confidence=prediction.confidence,
-                    box=boxes[index],
+            observed_cards: list[VisualCard] = []
+            for index, prediction in enumerate(predictions):
+                rank = prediction.rank
+                confidence = prediction.confidence
+                reference_match = self._match_rank_reference(
+                    play_crop.crop(boxes[index])
                 )
-                for index, prediction in enumerate(predictions)
-            )
+                if reference_match is not None:
+                    rank, confidence = reference_match
+                observed_cards.append(
+                    VisualCard(
+                        rank=rank,
+                        confidence=confidence,
+                        box=boxes[index],
+                    )
+                )
+            cards = tuple(observed_cards)
             if cards and all(
                 card.confidence >= self.config.confidence_threshold
                 for card in cards
@@ -481,13 +504,18 @@ class SceneRecognizer:
             remaining_verified=remaining[2],
         )
 
-    def _observe_initial_hand(
+    def _observe_hand(
         self,
         image: Image.Image,
         *,
         expected_count: int,
     ) -> tuple[VisualCard, ...]:
-        boxes = infer_overlapping_hand_boxes(image, expected_count)
+        visible_count = infer_visible_hand_count(
+            image,
+            maximum=expected_count,
+        )
+        count = visible_count or expected_count
+        boxes = infer_overlapping_hand_boxes(image, count)
         if not boxes:
             return ()
         crops = [image.crop(box) for box in boxes]
@@ -500,6 +528,56 @@ class SceneRecognizer:
             )
             for index, prediction in enumerate(predictions)
         )
+
+    def _remember_rank_references(
+        self,
+        hand_image: Image.Image,
+        cards: Sequence[VisualCard],
+    ) -> None:
+        fingerprint = tuple(card.rank for card in cards)
+        if fingerprint == self._reference_hand_fingerprint:
+            return
+        self._reference_hand_fingerprint = fingerprint
+        for card in cards:
+            if card.confidence < max(0.85, self.config.confidence_threshold):
+                continue
+            signature = _rank_glyph_signature(hand_image.crop(card.box))
+            if not signature:
+                continue
+            references = self._rank_references.setdefault(card.rank, [])
+            if any(
+                _glyph_similarity(signature, existing) >= 0.98
+                for existing in references
+            ):
+                continue
+            references.append(signature)
+            del references[:-4]
+
+    def _match_rank_reference(
+        self,
+        card_image: Image.Image,
+    ) -> tuple[str, float] | None:
+        signature = _rank_glyph_signature(card_image)
+        if not signature:
+            return None
+        scores = sorted(
+            (
+                max(
+                    _glyph_similarity(signature, reference)
+                    for reference in references
+                ),
+                rank,
+            )
+            for rank, references in self._rank_references.items()
+            if references
+        )
+        if not scores:
+            return None
+        best_score, best_rank = scores[-1]
+        runner_up = scores[-2][0] if len(scores) > 1 else 0.0
+        if best_score < 0.78 or best_score - runner_up < 0.12:
+            return None
+        return best_rank, min(0.999, max(self.config.confidence_threshold, best_score))
 
 
 def _template_similarity(image: Image.Image, template: Image.Image) -> float:
@@ -562,6 +640,106 @@ def _minimum_card_confidence(cards: Sequence[VisualCard]) -> float:
     return min((card.confidence for card in cards), default=0.0)
 
 
+def _rank_glyph_signature(image: Image.Image) -> frozenset[int]:
+    grayscale = image.convert("L")
+    width, height = grayscale.size
+    pixels = grayscale.load()
+    foreground = {
+        (x, y)
+        for y in range(height)
+        for x in range(width)
+        if pixels[x, y] < 130
+    }
+    components: list[set[tuple[int, int]]] = []
+    while foreground:
+        start = foreground.pop()
+        component = {start}
+        stack = [start]
+        while stack:
+            x, y = stack.pop()
+            for offset_y in (-1, 0, 1):
+                for offset_x in (-1, 0, 1):
+                    neighbor = (x + offset_x, y + offset_y)
+                    if neighbor in foreground:
+                        foreground.remove(neighbor)
+                        component.add(neighbor)
+                        stack.append(neighbor)
+        if len(component) >= 20:
+            components.append(component)
+
+    def bounds(
+        component: set[tuple[int, int]],
+    ) -> tuple[int, int, int, int]:
+        xs = [point[0] for point in component]
+        ys = [point[1] for point in component]
+        return min(xs), min(ys), max(xs) + 1, max(ys) + 1
+
+    candidates = []
+    for component in components:
+        left, top, right, bottom = bounds(component)
+        if (
+            top < height * 0.45
+            and left < width * 0.40
+            and bottom - top > height * 0.12
+            and right - left > width * 0.12
+            and bottom - top < height * 0.70
+            and right - left < width * 0.70
+        ):
+            candidates.append((component, (left, top, right, bottom)))
+    if not candidates:
+        return frozenset()
+
+    primary_component, primary_box = min(
+        candidates,
+        key=lambda item: (item[1][1], item[1][0]),
+    )
+    primary_top, primary_bottom = primary_box[1], primary_box[3]
+    selected = set(primary_component)
+    for component, box in candidates:
+        if component is primary_component:
+            continue
+        overlap = min(primary_bottom, box[3]) - max(primary_top, box[1])
+        if overlap > 0:
+            selected.update(component)
+
+    left = min(point[0] for point in selected)
+    top = min(point[1] for point in selected)
+    right = max(point[0] for point in selected) + 1
+    bottom = max(point[1] for point in selected) + 1
+    mask = Image.new("L", (right - left, bottom - top))
+    mask_pixels = mask.load()
+    for x, y in selected:
+        mask_pixels[x - left, y - top] = 255
+    fitted = ImageOps.contain(
+        mask,
+        (52, 52),
+        method=Image.Resampling.NEAREST,
+    )
+    normalized = Image.new("L", (64, 64))
+    normalized.paste(
+        fitted,
+        (
+            (normalized.width - fitted.width) // 2,
+            (normalized.height - fitted.height) // 2,
+        ),
+    )
+    return frozenset(
+        y * normalized.width + x
+        for y in range(normalized.height)
+        for x in range(normalized.width)
+        if normalized.getpixel((x, y)) > 0
+    )
+
+
+def _glyph_similarity(
+    left: frozenset[int],
+    right: frozenset[int],
+) -> float:
+    if not left or not right:
+        return 0.0
+    return len(left & right) / len(left | right)
+
+
 def _is_card_white(pixel: tuple[int, ...]) -> bool:
     red, green, blue = pixel[:3]
     return max(red, green, blue) >= 175 and min(red, green, blue) >= 115
@@ -611,16 +789,33 @@ def segment_card_boxes(image: Image.Image) -> tuple[tuple[int, int, int, int], .
     for left, right in _active_x_runs(rgb):
         if right - left < minimum_width:
             continue
-        ys = [
-            y
-            for x in range(left, right)
+        row_counts = [
+            sum(
+                _is_card_white(pixels[x, y])
+                for x in range(left, right)
+            )
             for y in range(height)
-            if _is_card_white(pixels[x, y])
         ]
-        if not ys:
+        row_runs = _boolean_runs(
+            [
+                count >= max(4, round((right - left) * 0.25))
+                for count in row_counts
+            ],
+            max_gap=2,
+        )
+        row_runs = [
+            run
+            for run in row_runs
+            if run[1] - run[0] >= max(12, round(height * 0.10))
+        ]
+        if not row_runs:
             continue
-        top = max(0, min(ys) - 2)
-        bottom = min(height, max(ys) + 3)
+        row_top, row_bottom = max(
+            row_runs,
+            key=lambda run: run[1] - run[0],
+        )
+        top = max(0, row_top - 2)
+        bottom = min(height, row_bottom + 3)
         if bottom - top < max(12, round(height * 0.10)):
             continue
         box_width = right - left
@@ -638,6 +833,17 @@ def segment_card_boxes(image: Image.Image) -> tuple[tuple[int, int, int, int], .
     if boxes:
         return tuple(boxes)
     return _segment_overlapping_card_boxes(rgb)
+
+
+def infer_visible_hand_count(
+    image: Image.Image,
+    *,
+    maximum: int = 20,
+) -> int | None:
+    count = len(segment_card_boxes(image))
+    if 1 <= count <= maximum:
+        return count
+    return None
 
 
 def _segment_overlapping_card_boxes(
@@ -820,6 +1026,7 @@ __all__ = [
     "TemplateMatcher",
     "VisualCard",
     "VisualSignal",
+    "infer_visible_hand_count",
     "infer_overlapping_hand_boxes",
     "segment_card_boxes",
 ]

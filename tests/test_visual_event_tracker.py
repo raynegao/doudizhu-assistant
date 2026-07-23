@@ -44,13 +44,16 @@ def _scene(
     left_signal: VisualSignal = VisualSignal.NEUTRAL,
     left_cards: tuple[str, ...] = (),
     left_remaining: int = 17,
+    visible_hand: tuple[str, ...] | None = None,
+    self_turn: bool | None = None,
 ) -> SceneObservation:
+    hand = LANDLORD_HAND if visible_hand is None else visible_hand
     seats = (
         SeatObservation(
             seat=PlayerSeat.SELF,
             signal=self_signal,
             cards=tuple(_card(rank) for rank in self_cards),
-            remaining_count=20,
+            remaining_count=len(hand),
             role=SeatRole.LANDLORD,
             confidence=0.99,
             pass_confidence=0.99 if self_signal is VisualSignal.PASS else 0.0,
@@ -85,10 +88,10 @@ def _scene(
         frame_id=frame_id,
         timestamp=float(frame_id),
         window_pixel_box=(0, 0, 100, 100),
-        self_hand=tuple(_card(rank) for rank in LANDLORD_HAND),
+        self_hand=tuple(_card(rank) for rank in hand),
         seats=seats,
-        self_turn=None,
-        self_turn_confidence=0.0,
+        self_turn=self_turn,
+        self_turn_confidence=0.99 if self_turn is not None else 0.0,
         confidence=0.99,
     )
 
@@ -205,6 +208,56 @@ def test_visual_tracker_initializes_and_advances_play_pass_round() -> None:
     assert left_pass.state is not None
     assert left_pass.state.current_actor is PlayerSeat.SELF
     assert not left_pass.state.trick_target
+
+
+def test_visual_tracker_derives_self_play_and_two_passes_from_scene_state() -> None:
+    tracker = VisualEventTracker(
+        stability_frames=2,
+        round_id_factory=lambda _: "round-hand-diff",
+    )
+    tracker.update(_scene(frame_id=1))
+    tracker.update(_scene(frame_id=2))
+    remaining_hand = LANDLORD_HAND[1:]
+
+    stabilizing = tracker.update(_scene(
+        frame_id=3,
+        visible_hand=remaining_hand,
+        self_turn=False,
+    ))
+    self_play = tracker.update(_scene(
+        frame_id=4,
+        visible_hand=remaining_hand,
+        self_turn=False,
+    ))
+
+    assert stabilizing.event is None
+    assert self_play.event is not None
+    assert self_play.event.cards.cards == ("3",)
+    assert self_play.event.source == "live_hand_diff"
+    assert self_play.state is not None
+    assert self_play.state.remaining_for(PlayerSeat.SELF) == 19
+    assert self_play.state.current_actor is PlayerSeat.RIGHT
+
+    right_pass = tracker.update(_scene(
+        frame_id=5,
+        visible_hand=remaining_hand,
+        self_turn=True,
+    ))
+    left_pass = tracker.update(_scene(
+        frame_id=6,
+        visible_hand=remaining_hand,
+        self_turn=True,
+    ))
+
+    assert right_pass.event is not None and right_pass.event.is_pass
+    assert right_pass.event.actor is PlayerSeat.RIGHT
+    assert right_pass.event.source == "live_turn_inferred_pass"
+    assert left_pass.event is not None and left_pass.event.is_pass
+    assert left_pass.event.actor is PlayerSeat.LEFT
+    assert left_pass.state is not None
+    assert left_pass.state.current_actor is PlayerSeat.SELF
+    assert not left_pass.state.trick_target
+    assert left_pass.state.decision_ready is True
 
 
 def test_visual_tracker_blocks_remaining_count_mismatch() -> None:

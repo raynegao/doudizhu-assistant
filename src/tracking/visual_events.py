@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+from collections import Counter
 from dataclasses import dataclass, replace
 from enum import Enum
 from typing import Callable, Sequence
@@ -147,8 +148,62 @@ class VisualEventTracker:
         state = self._tracker.state
         expected = state.current_actor
         observation = scene.seat(expected)
-        fingerprint = _seat_fingerprint(observation)
+        fingerprint = _seat_fingerprint(
+            observation,
+            self_hand=scene.self_hand if expected is PlayerSeat.SELF else (),
+        )
         stable_count = self._seat_stable[expected].update(fingerprint)
+
+        if expected is PlayerSeat.SELF:
+            hand_change = _self_hand_change(
+                state,
+                scene,
+                confidence_threshold=self.confidence_threshold,
+            )
+            if hand_change is not None:
+                required = min(2, self.stability_frames)
+                if stable_count < required:
+                    return VisualTrackerUpdate(
+                        mode=self.mode,
+                        message=(
+                            f"稳定自己的手牌变化 {stable_count}/{required}"
+                        ),
+                        state=state,
+                        warnings=scene.warnings,
+                    )
+                if hand_change.error is not None:
+                    return self._mark_uncertain(hand_change.error)
+                assert hand_change.cards is not None
+                event = ObservedAction(
+                    event_id=(
+                        f"{state.round_id}:{state.last_sequence_no + 1}:"
+                        f"{expected.value}"
+                    ),
+                    sequence_no=state.last_sequence_no + 1,
+                    actor=expected,
+                    cards=hand_change.cards,
+                    confidence=hand_change.confidence,
+                    source="live_hand_diff",
+                )
+                return self._apply_event(
+                    scene,
+                    observation,
+                    event,
+                )
+
+        if _can_infer_opponent_pass(state, scene, observation):
+            event = ObservedAction(
+                event_id=(
+                    f"{state.round_id}:{state.last_sequence_no + 1}:"
+                    f"{expected.value}"
+                ),
+                sequence_no=state.last_sequence_no + 1,
+                actor=expected,
+                cards=CardSet(()),
+                confidence=_inferred_pass_confidence(scene, observation),
+                source="live_turn_inferred_pass",
+            )
+            return self._apply_event(scene, observation, event)
 
         if observation.signal is VisualSignal.NEUTRAL:
             self._armed[expected] = True
@@ -170,7 +225,10 @@ class VisualEventTracker:
                 state=state,
                 warnings=scene.warnings,
             )
-        if not self._armed[expected]:
+        if (
+            not self._armed[expected]
+            and not _remaining_confirms_play(state, observation)
+        ):
             return VisualTrackerUpdate(
                 mode=self.mode,
                 message=f"忽略 {expected.value} 的旧场面提示，等待空白到动作的新变化",
@@ -201,6 +259,17 @@ class VisualEventTracker:
             confidence=confidence,
             source="live_visual",
         )
+        return self._apply_event(scene, observation, event)
+
+    def _apply_event(
+        self,
+        scene: SceneObservation,
+        observation: SeatObservation,
+        event: ObservedAction,
+    ) -> VisualTrackerUpdate:
+        assert self._tracker is not None
+        state = self._tracker.state
+        expected = event.actor
         count_error = _remaining_count_error(state, observation, event)
         if count_error is not None:
             return self._mark_uncertain(count_error, event=event)
@@ -347,6 +416,13 @@ class _InitialStatePayload:
             tuple((seat.value, self.remaining[seat]) for seat in PlayerSeat),
             self.opening_cards,
         )
+
+
+@dataclass(frozen=True)
+class _SelfHandChange:
+    cards: CardSet | None
+    confidence: float
+    error: str | None = None
 
 
 def _initial_state_payload(
@@ -590,11 +666,108 @@ def _initialization_message(
     )
 
 
-def _seat_fingerprint(observation: SeatObservation) -> tuple[object, ...]:
+def _seat_fingerprint(
+    observation: SeatObservation,
+    *,
+    self_hand: Sequence[VisualCard] = (),
+) -> tuple[object, ...]:
     return (
         observation.signal.value,
         tuple(card.rank for card in observation.cards),
+        tuple(card.rank for card in self_hand),
     )
+
+
+def _self_hand_change(
+    state: ObservableGameState,
+    scene: SceneObservation,
+    *,
+    confidence_threshold: float,
+) -> _SelfHandChange | None:
+    if not scene.self_hand or len(scene.self_hand) >= len(state.self_hand):
+        return None
+    observed_cards = tuple(card.rank for card in scene.self_hand)
+    observed = Counter(observed_cards)
+    previous = Counter(state.self_hand.cards)
+    unexpected = observed - previous
+    confidence, _ = _stable_hand_confidence(
+        scene.self_hand,
+        confidence_threshold=confidence_threshold,
+    )
+    if unexpected:
+        return _SelfHandChange(
+            cards=None,
+            confidence=confidence,
+            error=(
+                "self hand change contains ranks outside the tracked hand: "
+                + " ".join(sorted(unexpected.elements()))
+            ),
+        )
+    removed = previous - observed
+    cards = CardSet.parse(
+        card
+        for rank, count in removed.items()
+        for card in [rank] * count
+    )
+    if not cards:
+        return None
+    if confidence < confidence_threshold:
+        return _SelfHandChange(
+            cards=None,
+            confidence=confidence,
+            error=(
+                f"self hand change confidence {confidence:.3f} is below "
+                f"{confidence_threshold:.3f}"
+            ),
+        )
+    return _SelfHandChange(cards=cards, confidence=confidence)
+
+
+def _remaining_confirms_play(
+    state: ObservableGameState,
+    observation: SeatObservation,
+) -> bool:
+    return bool(
+        observation.signal is VisualSignal.PLAY
+        and observation.remaining_verified
+        and observation.remaining_count
+        == state.remaining_for(observation.seat) - len(observation.cards)
+    )
+
+
+def _can_infer_opponent_pass(
+    state: ObservableGameState,
+    scene: SceneObservation,
+    observation: SeatObservation,
+) -> bool:
+    if (
+        observation.seat is PlayerSeat.SELF
+        or not state.trick_target
+        or not observation.remaining_verified
+        or observation.remaining_count != state.remaining_for(observation.seat)
+    ):
+        return False
+    if scene.self_turn is True:
+        return True
+    next_actor = state.next_player(observation.seat)
+    if next_actor is PlayerSeat.SELF:
+        return False
+    next_observation = scene.seat(next_actor)
+    return bool(
+        next_observation.remaining_verified
+        and next_observation.remaining_count is not None
+        and next_observation.remaining_count < state.remaining_for(next_actor)
+    )
+
+
+def _inferred_pass_confidence(
+    scene: SceneObservation,
+    observation: SeatObservation,
+) -> float:
+    confidences = [observation.remaining_confidence]
+    if scene.self_turn is True:
+        confidences.append(scene.self_turn_confidence)
+    return min(value for value in confidences if value > 0)
 
 
 def _action_confidence(observation: SeatObservation) -> float:
