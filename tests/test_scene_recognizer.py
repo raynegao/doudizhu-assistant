@@ -9,6 +9,7 @@ from src.vision.scene_recognizer import (
     RemainingTextMatch,
     SeatRole,
     TemplateMatcher,
+    _classify_role_badge,
     _glyph_similarity,
     _rank_glyph_signature,
     _resolve_roles_from_hand_count,
@@ -41,6 +42,36 @@ def test_template_matcher_chooses_real_image_label(tmp_path: Path) -> None:
     assert match.label == "pass"
     assert match.confidence == 1.0
     assert set(matcher.available_labels("pass")) == {"neutral", "pass"}
+
+
+def test_role_badge_classifier_is_independent_of_seat_background() -> None:
+    landlord = Image.new("RGB", (235, 115), (43, 73, 145))
+    farmer = Image.new("RGB", (223, 115), (43, 73, 145))
+    ImageDraw.Draw(landlord).rectangle(
+        (55, 42, 174, 54),
+        fill=(242, 177, 70),
+    )
+    ImageDraw.Draw(farmer).rectangle(
+        (52, 42, 171, 54),
+        fill=(244, 244, 244),
+    )
+
+    landlord_role, landlord_confidence = _classify_role_badge(landlord)
+    farmer_role, farmer_confidence = _classify_role_badge(farmer)
+
+    assert landlord_role is SeatRole.LANDLORD
+    assert farmer_role is SeatRole.FARMER
+    assert landlord_confidence >= 0.9
+    assert farmer_confidence >= 0.9
+
+
+def test_role_badge_classifier_rejects_background_without_glyphs() -> None:
+    role, confidence = _classify_role_badge(
+        Image.new("RGB", (223, 115), (43, 73, 145))
+    )
+
+    assert role is SeatRole.UNKNOWN
+    assert confidence == 0.0
 
 
 def test_segment_card_boxes_finds_separated_face_up_cards() -> None:

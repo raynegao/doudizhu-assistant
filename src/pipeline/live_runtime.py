@@ -122,14 +122,20 @@ class LiveGameRuntime:
         tracker: VisualEventTracker | None = None,
         decision_fn: DecisionFn = recommend_phase4,
         sleeper: Callable[[float], None] = time.sleep,
+        resume_session_id: str | None = None,
     ) -> None:
         self.config = config
+        self.resume_session_id = resume_session_id
         self.frame_source = frame_source or MacWindowCapture(config.app_name)
         self.recognizer = recognizer or SceneRecognizer(config)
         if tracker is not None:
             self.tracker = tracker
         else:
-            resumed_state = _load_round_context(config, self.recognizer)
+            resumed_state = _load_round_context(
+                config,
+                self.recognizer,
+                runtime_session_id=resume_session_id,
+            )
             self.tracker = VisualEventTracker(
                 stability_frames=config.stability_frames,
                 initial_stability_frames=config.initial_stability_frames,
@@ -438,7 +444,11 @@ class LiveGameRuntime:
             seed_path = _round_seed_path(self.config)
             seed_path.parent.mkdir(parents=True, exist_ok=True)
             frame.image.save(seed_path)
-        _write_round_checkpoint(_round_state_path(self.config), state)
+        _write_round_checkpoint(
+            _round_state_path(self.config),
+            state,
+            runtime_session_id=self.resume_session_id,
+        )
 
 
 def _round_state_path(config: LiveLayoutConfig) -> Path:
@@ -452,6 +462,8 @@ def _round_seed_path(config: LiveLayoutConfig) -> Path:
 def _load_round_context(
     config: LiveLayoutConfig,
     recognizer: SceneRecognizer,
+    *,
+    runtime_session_id: str | None = None,
 ) -> ObservableGameState | None:
     state_path = _round_state_path(config)
     seed_path = _round_seed_path(config)
@@ -468,6 +480,11 @@ def _load_round_context(
         if age_seconds > _ROUND_RESUME_MAX_AGE_SECONDS:
             return None
         payload = json.loads(state_path.read_text(encoding="utf-8"))
+        if (
+            runtime_session_id is not None
+            and payload.get("runtime_session_id") != runtime_session_id
+        ):
+            return None
         state = _state_from_checkpoint(payload)
         with Image.open(seed_path) as source:
             seed_cards = recognizer.seed_hand_references(source.convert("RGB"))
@@ -529,12 +546,16 @@ def _state_from_checkpoint(payload: object) -> ObservableGameState:
 def _write_round_checkpoint(
     path: Path,
     state: ObservableGameState,
+    *,
+    runtime_session_id: str | None = None,
 ) -> None:
     payload = {
         **state.to_log_payload(),
         "last_sequence_no": state.last_sequence_no,
         "saved_at": time.time(),
     }
+    if runtime_session_id is not None:
+        payload["runtime_session_id"] = runtime_session_id
     path.parent.mkdir(parents=True, exist_ok=True)
     temporary = path.with_suffix(path.suffix + ".tmp")
     temporary.write_text(

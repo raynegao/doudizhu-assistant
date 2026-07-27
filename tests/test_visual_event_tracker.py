@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+from dataclasses import replace
+
 from src.state.events import PlayerSeat
 from src.tracking.visual_events import (
     VisualEventTracker,
@@ -160,6 +162,27 @@ def _landlord_opening_scene(
     )
 
 
+def _scene_with_landlord(
+    scene: SceneObservation,
+    landlord: PlayerSeat,
+) -> SceneObservation:
+    return replace(
+        scene,
+        seats=tuple(
+            replace(
+                observation,
+                role=(
+                    SeatRole.LANDLORD
+                    if observation.seat is landlord
+                    else SeatRole.FARMER
+                ),
+                role_confidence=0.99,
+            )
+            for observation in scene.seats
+        ),
+    )
+
+
 def test_visual_tracker_initializes_and_advances_play_pass_round() -> None:
     tracker = VisualEventTracker(
         stability_frames=2,
@@ -213,6 +236,52 @@ def test_visual_tracker_initializes_and_advances_play_pass_round() -> None:
     assert left_pass.state is not None
     assert left_pass.state.current_actor is PlayerSeat.SELF
     assert not left_pass.state.trick_target
+
+
+def test_visual_tracker_pauses_on_transient_landlord_mismatch() -> None:
+    tracker = VisualEventTracker(
+        stability_frames=2,
+        round_id_factory=lambda _: "round-role-transient",
+    )
+    tracker.update(_scene(frame_id=1))
+    tracker.update(_scene(frame_id=2))
+
+    mismatch = tracker.update(_scene_with_landlord(
+        _scene(frame_id=3),
+        PlayerSeat.LEFT,
+    ))
+    recovered = tracker.update(_scene(frame_id=4))
+
+    assert mismatch.mode is VisualTrackerMode.TRACKING
+    assert mismatch.state is not None
+    assert mismatch.state.decision_ready is False
+    assert "地主位置已变化" in mismatch.message
+    assert recovered.mode is VisualTrackerMode.TRACKING
+    assert recovered.state is not None
+    assert recovered.state.decision_ready is True
+
+
+def test_visual_tracker_blocks_persistent_landlord_mismatch() -> None:
+    tracker = VisualEventTracker(
+        stability_frames=2,
+        round_id_factory=lambda _: "round-role-boundary",
+    )
+    tracker.update(_scene(frame_id=1))
+    tracker.update(_scene(frame_id=2))
+
+    tracker.update(_scene_with_landlord(
+        _scene(frame_id=3),
+        PlayerSeat.LEFT,
+    ))
+    boundary = tracker.update(_scene_with_landlord(
+        _scene(frame_id=4),
+        PlayerSeat.LEFT,
+    ))
+
+    assert boundary.mode is VisualTrackerMode.UNCERTAIN
+    assert boundary.state is not None
+    assert boundary.state.decision_ready is False
+    assert "新牌局" in boundary.message
 
 
 def test_visual_tracker_uses_faster_post_bidding_bootstrap_threshold() -> None:

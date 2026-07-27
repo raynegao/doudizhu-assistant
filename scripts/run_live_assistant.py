@@ -1,13 +1,19 @@
 from __future__ import annotations
 
 import argparse
+import multiprocessing
 import queue
-import threading
+import time
 import traceback
+import uuid
 from pathlib import Path
+from typing import Any
 
 from src.pipeline.live_layout import load_live_layout
-from src.pipeline.live_runtime import LiveGameRuntime, LiveRuntimeSnapshot, format_live_snapshot
+from src.pipeline.live_runtime import LiveGameRuntime, format_live_snapshot
+
+_RESTART_WINDOW_SECONDS = 30.0
+_MAX_FAILURES_IN_WINDOW = 3
 
 
 def build_parser() -> argparse.ArgumentParser:
@@ -26,11 +32,138 @@ def build_parser() -> argparse.ArgumentParser:
     return parser
 
 
+def _produce_live_snapshots(
+    config_path: Path,
+    max_frames: int | None,
+    snapshots: Any,
+    stopped: Any,
+    runtime_session_id: str,
+) -> None:
+    """Run macOS capture outside the Tk process.
+
+    Tk initializes CoreFoundation in the UI process.  Keeping all
+    ``screencapture``/Vision helper launches in this separate process avoids
+    unsafe fork-after-GUI behavior on macOS.
+    """
+
+    config = load_live_layout(config_path)
+    runtime = LiveGameRuntime(
+        config,
+        resume_session_id=runtime_session_id,
+    )
+    try:
+        for snapshot in runtime.run_loop(max_frames=max_frames):
+            if stopped.is_set():
+                break
+            while True:
+                try:
+                    snapshots.put_nowait(snapshot)
+                    break
+                except queue.Full:
+                    try:
+                        snapshots.get_nowait()
+                    except queue.Empty:
+                        pass
+    except BaseException:  # noqa: BLE001
+        traceback.print_exc()
+        raise
+    finally:
+        runtime.close()
+
+
+class _RuntimeProcessController:
+    def __init__(
+        self,
+        config_path: Path,
+        *,
+        max_frames: int | None,
+    ) -> None:
+        self.context = multiprocessing.get_context("spawn")
+        self.config_path = config_path
+        self.max_frames = max_frames
+        self.snapshots = self.context.Queue(maxsize=2)
+        self.stopped = self.context.Event()
+        self.runtime_session_id = uuid.uuid4().hex
+        self.process: Any | None = None
+        self.started_at = 0.0
+        self.failure_times: list[float] = []
+
+    def start(self) -> None:
+        process = self.context.Process(
+            target=_produce_live_snapshots,
+            args=(
+                self.config_path,
+                self.max_frames,
+                self.snapshots,
+                self.stopped,
+                self.runtime_session_id,
+            ),
+            name="doudizhu-live-runtime",
+        )
+        process.start()
+        self.process = process
+        self.started_at = time.monotonic()
+        print(
+            f"[live-assistant] recognition process started pid={process.pid}",
+            flush=True,
+        )
+
+    def ensure_running(self) -> str | None:
+        process = self.process
+        if self.stopped.is_set() or process is None:
+            return None
+        if process.is_alive():
+            if time.monotonic() - self.started_at >= _RESTART_WINDOW_SECONDS:
+                self.failure_times.clear()
+            return None
+        process.join(timeout=0)
+        if self.max_frames is not None and process.exitcode == 0:
+            return None
+
+        now = time.monotonic()
+        self.failure_times = [
+            failed_at
+            for failed_at in self.failure_times
+            if now - failed_at < _RESTART_WINDOW_SECONDS
+        ]
+        self.failure_times.append(now)
+        exit_code = process.exitcode
+        if len(self.failure_times) >= _MAX_FAILURES_IN_WINDOW:
+            return (
+                "识别进程连续异常退出，已停止自动恢复；"
+                f"最后退出码={exit_code}，请查看 logs/live_assistant.stdout.log"
+            )
+        print(
+            "[live-assistant] recognition process exited "
+            f"code={exit_code}; restarting "
+            f"({len(self.failure_times)}/{_MAX_FAILURES_IN_WINDOW})",
+            flush=True,
+        )
+        self.start()
+        return None
+
+    def stop(self) -> None:
+        if self.stopped.is_set():
+            return
+        self.stopped.set()
+        process = self.process
+        if process is None:
+            return
+        process.join(timeout=3.0)
+        if process.is_alive():
+            process.terminate()
+            process.join(timeout=2.0)
+        print("[live-assistant] stopped", flush=True)
+
+
 def main(argv: list[str] | None = None) -> int:
     args = build_parser().parse_args(argv)
-    config = load_live_layout(args.config)
-    runtime = LiveGameRuntime(config)
     if args.no_ui:
+        config = load_live_layout(args.config)
+        runtime = LiveGameRuntime(
+            config,
+            resume_session_id=uuid.uuid4().hex,
+        )
         try:
             for snapshot in runtime.run_loop(max_frames=args.max_frames):
                 if not args.no_clear:
@@ -42,57 +175,21 @@ def main(argv: list[str] | None = None) -> int:
 
     from src.ui.live_overlay import LiveAssistantOverlay
 
-    snapshots: "queue.Queue[LiveRuntimeSnapshot]" = queue.Queue(maxsize=2)
-    runtime_errors: "queue.Queue[str]" = queue.Queue(maxsize=1)
-    stopped = threading.Event()
-    failure: list[BaseException] = []
-
-    def produce() -> None:
-        try:
-            for snapshot in runtime.run_loop(max_frames=args.max_frames):
-                if stopped.is_set():
-                    break
-                while True:
-                    try:
-                        snapshots.put_nowait(snapshot)
-                        break
-                    except queue.Full:
-                        try:
-                            snapshots.get_nowait()
-                        except queue.Empty:
-                            pass
-        except BaseException as exc:  # noqa: BLE001
-            failure.append(exc)
-            traceback.print_exc()
-            try:
-                runtime_errors.put_nowait(f"{type(exc).__name__}: {exc}")
-            except queue.Full:
-                pass
-            stopped.set()
-        finally:
-            runtime.close()
-
-    worker = threading.Thread(
-        target=produce,
-        daemon=True,
-        name="doudizhu-live-runtime",
+    controller = _RuntimeProcessController(
+        args.config,
+        max_frames=args.max_frames,
     )
-    worker.start()
-
-    def stop() -> None:
-        stopped.set()
-        runtime.close()
-
+    controller.start()
     overlay = LiveAssistantOverlay(
-        snapshots,
-        runtime_errors=runtime_errors,
-        on_close=stop,
+        controller.snapshots,
+        on_close=controller.stop,
+        health_check=controller.ensure_running,
         geometry=args.overlay_geometry,
     )
-    overlay.run()
-    worker.join(timeout=2.0)
-    if failure:
-        raise failure[0]
+    try:
+        overlay.run()
+    finally:
+        controller.stop()
     return 0
 
 

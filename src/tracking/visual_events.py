@@ -113,6 +113,7 @@ class VisualEventTracker:
             else None
         )
         self._initial_stable = _StableValue()
+        self._role_stable = _StableValue()
         self._seat_stable = {seat: _StableValue() for seat in PlayerSeat}
         self._armed = {seat: False for seat in PlayerSeat}
         self._uncertain_reason: str | None = None
@@ -190,6 +191,45 @@ class VisualEventTracker:
             )
 
         state = self._tracker.state
+        observed_landlord = _observed_landlord(
+            scene,
+            confidence_threshold=self.confidence_threshold,
+        )
+        role_fingerprint = (
+            ("landlord", observed_landlord.value)
+            if observed_landlord is not None
+            else ("landlord", "unavailable")
+        )
+        role_stable_count = self._role_stable.update(role_fingerprint)
+        if (
+            observed_landlord is not None
+            and observed_landlord is not state.landlord
+        ):
+            reason = (
+                "检测到地主位置已变化："
+                f"状态={state.landlord.value}，画面={observed_landlord.value}"
+            )
+            if role_stable_count >= self.stability_frames:
+                return self._mark_uncertain(
+                    f"{reason}；判定已进入新牌局，等待完整开局重新建模"
+                )
+            paused_state = replace(
+                state,
+                phase=RoundPhase.UNCERTAIN,
+                warnings=tuple(
+                    dict.fromkeys((*state.warnings, reason))
+                ),
+            )
+            return VisualTrackerUpdate(
+                mode=self.mode,
+                message=(
+                    f"{reason}，正在确认 "
+                    f"{role_stable_count}/{self.stability_frames}"
+                ),
+                state=paused_state,
+                warnings=(reason,),
+            )
+
         expected = state.current_actor
         observation = scene.seat(expected)
         fingerprint = _seat_fingerprint(
@@ -405,6 +445,7 @@ class VisualEventTracker:
         self._tracker = tracker
         self.mode = VisualTrackerMode.TRACKING
         self._uncertain_reason = None
+        self._role_stable = _StableValue()
         self._seat_stable = {seat: _StableValue() for seat in PlayerSeat}
         self._armed = {
             seat: scene.seat(seat).signal is VisualSignal.NEUTRAL
@@ -591,6 +632,34 @@ def _initial_state_payload(
         confidence=confidence,
         warnings=tuple((*hand_warnings, *inferred_warnings)),
     )
+
+
+def _observed_landlord(
+    scene: SceneObservation,
+    *,
+    confidence_threshold: float,
+) -> PlayerSeat | None:
+    if len(scene.seats) != len(PlayerSeat):
+        return None
+    if any(
+        observation.role_confidence < confidence_threshold
+        or observation.role is SeatRole.UNKNOWN
+        for observation in scene.seats
+    ):
+        return None
+    landlords = [
+        observation.seat
+        for observation in scene.seats
+        if observation.role is SeatRole.LANDLORD
+    ]
+    farmers = [
+        observation.seat
+        for observation in scene.seats
+        if observation.role is SeatRole.FARMER
+    ]
+    if len(landlords) != 1 or len(farmers) != 2:
+        return None
+    return landlords[0]
 
 
 def _opening_state_payload(

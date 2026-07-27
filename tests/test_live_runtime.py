@@ -342,3 +342,35 @@ def test_live_runtime_restores_recent_round_checkpoint(
     assert restored.revision == phase4_ready_state.revision
     assert restored.self_hand == phase4_ready_state.self_hand
     assert restored.current_actor is phase4_ready_state.current_actor
+
+
+def test_live_runtime_rejects_checkpoint_from_previous_ui_session(
+    tmp_path: Path,
+    phase4_ready_state,
+) -> None:
+    config = LiveLayoutConfig(
+        log_file=tmp_path / "live.jsonl",
+        error_frames_dir=tmp_path / "errors",
+    )
+    _write_round_checkpoint(
+        _round_state_path(config),
+        phase4_ready_state,
+        runtime_session_id="previous-session",
+    )
+    seed_path = _round_seed_path(config)
+    seed_path.parent.mkdir(parents=True)
+    Image.new("RGB", (200, 100), "navy").save(seed_path)
+
+    runtime = LiveGameRuntime(
+        config,
+        frame_source=_FrameSource(),
+        recognizer=_ResumeRecognizer(phase4_ready_state.self_hand.cards),
+        sleeper=lambda _: None,
+        resume_session_id="new-session",
+    )
+    try:
+        restored = runtime.tracker.state
+    finally:
+        runtime.close()
+
+    assert restored is None

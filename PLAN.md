@@ -185,11 +185,12 @@ Phase 5B 已实现范围：
 
 - WindowServer Window ID 窗口级截图和 Retina 逻辑/像素转换；窗口被遮挡时仍读取牌桌，移动后无需重写归一化 ROI。
 - 归一化 `LiveLayoutConfig`、ROI 预览、contact sheet 和本地配置。
-- `SceneObservation` / `SeatObservation`：三家出牌、过牌、角色、余牌和置信度。
+- `SceneObservation` / `SeatObservation`：三家出牌、过牌、余牌和置信度；角色徽标按局部字色跨座位识别，并用 17/20 张结构校验。
 - `VisualEventTracker`：连续帧稳定、空白到动作门控、余牌交叉校验、54 张牌守恒和不确定状态阻断。
-- `LiveGameRuntime`：截图、视觉、状态、后台决策和 JSONL 编排。
+- `VisualEventTracker` 会把稳定地主位置变化作为新局边界，立即暂停旧状态的推荐。
+- `LiveGameRuntime`：截图、视觉、状态、后台决策和 JSONL 编排；断点仅在同一 UI 运行会话内恢复。
 - Top-1 改为估计胜率优先；Phase 6 默认 1.5 秒预算、至少 32 组 sampled worlds 和 Top-3。
-- Tkinter 只读置顶助手窗；不读取鼠标、不点击游戏、不自动代打。
+- Tkinter 只读置顶助手窗与截图/Vision 分进程运行，识别子进程异常退出自动拉起；不读取鼠标、不点击游戏、不自动代打。
 - 标定、模板采集、完整窗口录制和出牌 crop 标注脚本。
 
 运行入口：

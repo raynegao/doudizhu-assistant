@@ -129,6 +129,7 @@ class LiveAssistantOverlay:
         *,
         runtime_errors: "queue.Queue[str] | None" = None,
         on_close: Callable[[], None] | None = None,
+        health_check: Callable[[], str | None] | None = None,
         geometry: str = "250x430+0+70",
     ) -> None:
         import tkinter as tk
@@ -138,6 +139,7 @@ class LiveAssistantOverlay:
         self.runtime_errors = runtime_errors
         self._runtime_error: str | None = None
         self.on_close = on_close
+        self.health_check = health_check
         self.root = tk.Tk()
         self.root.title("斗地主助手")
         self.root.geometry(geometry)
@@ -196,6 +198,10 @@ class LiveAssistantOverlay:
     def _poll(self) -> None:
         if self._closed:
             return
+        if self.health_check is not None:
+            health_error = self.health_check()
+            if health_error is not None:
+                self._runtime_error = health_error
         latest_error: str | None = None
         if self.runtime_errors is not None:
             while True:

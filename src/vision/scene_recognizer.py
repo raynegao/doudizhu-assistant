@@ -332,10 +332,15 @@ class SceneRecognizer:
         remaining: dict[PlayerSeat, tuple[int | None, float, bool]] = {}
 
         for seat in PlayerSeat:
-            role_match = self.templates.classify(
-                "role",
-                self.config.crop(frame.image, f"{seat.value}_role"),
+            role_crop = self.config.crop(
+                frame.image,
+                f"{seat.value}_role",
             )
+            badge_role, badge_confidence = _classify_role_badge(role_crop)
+            if badge_role is not SeatRole.UNKNOWN:
+                raw_roles[seat] = badge_role, badge_confidence
+                continue
+            role_match = self.templates.classify("role", role_crop)
             role = _parse_role(role_match, self.config.template_threshold)
             raw_roles[seat] = role, role_match.confidence
 
@@ -646,6 +651,64 @@ def _parse_role(match: TemplateMatch, threshold: float) -> SeatRole:
     if match.confidence < threshold or match.label not in {"landlord", "farmer"}:
         return SeatRole.UNKNOWN
     return SeatRole(match.label)
+
+
+def _classify_role_badge(image: Image.Image) -> tuple[SeatRole, float]:
+    """Classify the small role badge without depending on its screen seat.
+
+    The current Mac client renders ``地主`` in gold and ``农民`` in white.
+    Whole-ROI templates are dominated by the seat-specific avatar fragment and
+    blue background, so a template recorded at the left seat can lose to a
+    wrong-label template recorded at the self seat.  Restricting the signal to
+    bright badge glyph pixels makes the same landlord template transferable
+    across all three seats.
+    """
+
+    rgb = np.asarray(image.convert("RGB"), dtype=np.int16)
+    if rgb.size == 0:
+        return SeatRole.UNKNOWN, 0.0
+    height, width = rgb.shape[:2]
+    top = max(0, round(height * 0.20))
+    bottom = max(top + 1, round(height * 0.98))
+    left = max(0, round(width * 0.03))
+    right = max(left + 1, round(width * 0.95))
+    badge = rgb[top:bottom, left:right]
+    red, green, blue = (
+        badge[:, :, 0],
+        badge[:, :, 1],
+        badge[:, :, 2],
+    )
+    yellow = (
+        (red > 170)
+        & (green > 100)
+        & (blue < 160)
+        & ((red - blue) > 45)
+    )
+    maximum = np.maximum.reduce((red, green, blue))
+    minimum = np.minimum.reduce((red, green, blue))
+    white = (
+        (red > 180)
+        & (green > 180)
+        & (blue > 180)
+        & ((maximum - minimum) < 35)
+    )
+    pixel_count = max(1, badge.shape[0] * badge.shape[1])
+    yellow_ratio = float(yellow.sum()) / pixel_count
+    white_ratio = float(white.sum()) / pixel_count
+    minimum_glyph_ratio = 0.01
+    if (
+        yellow_ratio >= minimum_glyph_ratio
+        and yellow_ratio >= white_ratio * 1.5
+    ):
+        confidence = min(0.999, 0.90 + yellow_ratio * 2.0)
+        return SeatRole.LANDLORD, confidence
+    if (
+        white_ratio >= minimum_glyph_ratio
+        and white_ratio >= yellow_ratio * 1.5
+    ):
+        confidence = min(0.999, 0.90 + white_ratio * 2.0)
+        return SeatRole.FARMER, confidence
+    return SeatRole.UNKNOWN, max(yellow_ratio, white_ratio)
 
 
 def _resolve_roles_from_hand_count(
