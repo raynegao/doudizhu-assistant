@@ -826,6 +826,71 @@ def test_auto_scanned_midgame_continues_through_full_trick_cycle() -> None:
     assert left_pass.state.decision_ready is True
 
 
+def test_tracker_catches_up_three_missed_actions_from_live_table() -> None:
+    tracker = VisualEventTracker(
+        stability_frames=2,
+        initial_stability_frames=2,
+    )
+    hand = REAL_LANDLORD_HAND[:15]
+    old_table = _scene(
+        frame_id=80,
+        visible_hand=hand,
+        left_signal=VisualSignal.PLAY,
+        left_cards=("Q", "Q"),
+        left_remaining=4,
+        right_remaining=5,
+        self_turn=True,
+    )
+    tracker.update(old_table)
+    initialized = tracker.update(replace(
+        old_table,
+        frame_id=81,
+        timestamp=81.0,
+    ))
+    assert initialized.initialized is True
+    assert initialized.state is not None
+    assert initialized.state.current_actor is PlayerSeat.SELF
+
+    current_table = _scene(
+        frame_id=82,
+        visible_hand=hand,
+        left_signal=VisualSignal.PLAY,
+        left_cards=("BJ",),
+        left_remaining=3,
+        right_remaining=5,
+        self_turn=True,
+    )
+    self_pass = tracker.update(current_table)
+    right_pass = tracker.update(replace(
+        current_table,
+        frame_id=83,
+        timestamp=83.0,
+    ))
+    tracker.update(replace(
+        current_table,
+        frame_id=84,
+        timestamp=84.0,
+    ))
+    left_play = tracker.update(replace(
+        current_table,
+        frame_id=85,
+        timestamp=85.0,
+    ))
+
+    assert self_pass.event is not None and self_pass.event.is_pass
+    assert self_pass.event.actor is PlayerSeat.SELF
+    assert right_pass.event is not None and right_pass.event.is_pass
+    assert right_pass.event.actor is PlayerSeat.RIGHT
+    assert left_play.event is not None
+    assert left_play.event.actor is PlayerSeat.LEFT
+    assert left_play.event.cards.cards == ("BJ",)
+    assert left_play.state is not None
+    assert left_play.state.revision == 3
+    assert left_play.state.current_actor is PlayerSeat.SELF
+    assert left_play.state.trick_target.cards == ("BJ",)
+    assert left_play.state.remaining_for(PlayerSeat.LEFT) == 3
+
+
 def test_visual_tracker_manual_scan_requires_self_turn() -> None:
     tracker = VisualEventTracker(stability_frames=3)
 

@@ -5,7 +5,6 @@ import binascii
 import hashlib
 import json
 import os
-import platform
 import subprocess
 import tempfile
 from dataclasses import dataclass
@@ -208,6 +207,126 @@ class RemainingTextMatch:
     confidence: float
 
 
+class CvRemainingReader:
+    """Read the yellow remaining-card digits directly from the table pixels.
+
+    macOS Vision frequently ignores a single outlined digit because it does
+    not consider it a text line.  The game counter is much more constrained:
+    it is always one or two yellow glyphs in the range 1..20.  Segmenting that
+    colour and comparing normalized glyph silhouettes is both faster and more
+    reliable for the live client.
+    """
+
+    def __init__(
+        self,
+        *,
+        template_images: Sequence[tuple[str, Image.Image]] = (),
+    ) -> None:
+        rank_references = _load_builtin_rank_references()
+        self._digit_references: dict[str, list[frozenset[int]]] = {
+            digit: list(rank_references.get(digit, ()))
+            for digit in "23456789"
+        }
+        # Whole-counter templates are still useful, but only as sources of
+        # individual glyph shapes.  This removes the seat background and card
+        # stack that made whole-ROI template matching confuse 3 with 16.
+        for label, image in template_images:
+            if not label.isdigit():
+                continue
+            masks = _remaining_digit_masks(image)
+            if len(masks) != len(label):
+                continue
+            for digit, mask in zip(label, masks):
+                signature = _remaining_glyph_signature(mask)
+                if not signature:
+                    continue
+                references = self._digit_references.setdefault(digit, [])
+                if any(
+                    _glyph_similarity(signature, existing) >= 0.98
+                    for existing in references
+                ):
+                    continue
+                references.append(signature)
+
+    def __call__(
+        self,
+        images: Mapping[PlayerSeat, Image.Image],
+    ) -> Mapping[PlayerSeat, RemainingTextMatch]:
+        matches: dict[PlayerSeat, RemainingTextMatch] = {}
+        for seat, image in images.items():
+            match = self.read(image)
+            if match.count is not None:
+                matches[seat] = match
+        return matches
+
+    def read(self, image: Image.Image) -> RemainingTextMatch:
+        masks = _remaining_digit_masks(image)
+        if not 1 <= len(masks) <= 2:
+            return RemainingTextMatch(None, 0.0)
+
+        digits: list[str] = []
+        confidences: list[float] = []
+        for index, mask in enumerate(masks):
+            digit, confidence = self._classify_digit(
+                mask,
+                index=index,
+                digit_count=len(masks),
+                prefix=digits,
+            )
+            if digit is None:
+                return RemainingTextMatch(None, confidence)
+            digits.append(digit)
+            confidences.append(confidence)
+
+        try:
+            count = int("".join(digits))
+        except ValueError:
+            return RemainingTextMatch(None, 0.0)
+        if not 1 <= count <= 20:
+            return RemainingTextMatch(None, min(confidences, default=0.0))
+        return RemainingTextMatch(count, min(confidences))
+
+    def _classify_digit(
+        self,
+        mask: np.ndarray,
+        *,
+        index: int,
+        digit_count: int,
+        prefix: Sequence[str],
+    ) -> tuple[str | None, float]:
+        signature = _remaining_glyph_signature(mask)
+        scored = sorted(
+            (
+                max(
+                    _glyph_similarity(signature, reference)
+                    for reference in references
+                ),
+                digit,
+            )
+            for digit, references in self._digit_references.items()
+            if references
+        )
+        if scored:
+            best_score, best_digit = scored[-1]
+            runner_up = scored[-2][0] if len(scored) > 1 else 0.0
+            if best_score >= 0.50 and best_score - runner_up >= 0.025:
+                confidence = min(
+                    0.995,
+                    0.72 + max(0.0, best_score - 0.45) * 1.35,
+                )
+                return best_digit, confidence
+
+        # 1 is the only counter digit without a card-rank counterpart.  It is
+        # either the complete value 1 or the leading digit of 10..19.
+        if index == 0 and (digit_count == 1 or digit_count == 2):
+            return "1", 0.86
+        # A second unmatched glyph after 1/2 can only be zero because the
+        # complete counter is constrained to 1..20.
+        if index == 1 and prefix and prefix[0] in {"1", "2"}:
+            return "0", 0.80
+        return None, scored[-1][0] if scored else 0.0
+
+
 class MacVisionRemainingReader:
     """Read the two opponent counters with macOS Vision text recognition."""
 
@@ -336,10 +455,10 @@ class SceneRecognizer:
         self._load_rank_reference_templates()
         if remaining_reader is not None:
             self.remaining_reader: RemainingReader | None = remaining_reader
-        elif platform.system() == "Darwin":
-            self.remaining_reader = MacVisionRemainingReader()
         else:
-            self.remaining_reader = None
+            self.remaining_reader = CvRemainingReader(
+                template_images=self.templates.template_images("remaining"),
+            )
 
     def observe(self, frame: CapturedWindow) -> SceneObservation:
         warnings: list[str] = []
@@ -857,6 +976,77 @@ def _resolve_remaining(
     )
 
 
+def _remaining_digit_masks(image: Image.Image) -> tuple[np.ndarray, ...]:
+    """Extract one or two filled yellow counter glyphs from a seat ROI."""
+
+    rgb = np.asarray(image.convert("RGB"), dtype=np.int16)
+    if rgb.size == 0:
+        return ()
+    red, green, blue = rgb[:, :, 0], rgb[:, :, 1], rgb[:, :, 2]
+    mask = (
+        (red > 145)
+        & (green > 70)
+        & (blue < 165)
+        & ((red - blue) > 45)
+        & ((green - blue) > 5)
+    )
+    active_columns = np.any(mask, axis=0)
+    runs: list[tuple[int, int]] = []
+    start: int | None = None
+    for index, active in enumerate(active_columns):
+        if active and start is None:
+            start = index
+        if start is not None and (
+            not active or index == len(active_columns) - 1
+        ):
+            stop = index if not active else index + 1
+            if stop - start >= 2:
+                runs.append((start, stop))
+            start = None
+
+    glyphs: list[np.ndarray] = []
+    minimum_height = max(8, round(image.height * 0.18))
+    for left, right in runs:
+        region = mask[:, left:right]
+        active_rows = np.flatnonzero(np.any(region, axis=1))
+        if active_rows.size == 0:
+            continue
+        top = int(active_rows[0])
+        bottom = int(active_rows[-1]) + 1
+        glyph = region[top:bottom]
+        if glyph.shape[0] < minimum_height:
+            continue
+        glyphs.append(glyph)
+    return tuple(glyphs)
+
+
+def _remaining_glyph_signature(mask: np.ndarray) -> frozenset[int]:
+    if mask.size == 0 or not bool(mask.any()):
+        return frozenset()
+    glyph = Image.fromarray(
+        np.where(mask, 255, 0).astype(np.uint8),
+        mode="L",
+    )
+    fitted = ImageOps.contain(
+        glyph,
+        (52, 52),
+        method=Image.Resampling.NEAREST,
+    )
+    normalized = Image.new("L", (64, 64))
+    normalized.paste(
+        fitted,
+        (
+            (normalized.width - fitted.width) // 2,
+            (normalized.height - fitted.height) // 2,
+        ),
+    )
+    pixels = np.asarray(normalized, dtype=np.uint8)
+    return frozenset(
+        int(index)
+        for index in np.flatnonzero(pixels.reshape(-1) > 0)
+    )
+
+
 def _minimum_card_confidence(cards: Sequence[VisualCard]) -> float:
     return min((card.confidence for card in cards), default=0.0)
 
@@ -1359,6 +1549,7 @@ def _card_rank_crop(card: Image.Image) -> Image.Image:
 
 
 __all__ = [
+    "CvRemainingReader",
     "SceneObservation",
     "SceneRecognizer",
     "MacVisionRemainingReader",

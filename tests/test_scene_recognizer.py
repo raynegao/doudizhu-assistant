@@ -8,6 +8,7 @@ from src.pipeline.live_layout import LiveLayoutConfig
 from src.state.cards import RANKS
 from src.state.events import PlayerSeat
 from src.vision.scene_recognizer import (
+    CvRemainingReader,
     RemainingTextMatch,
     SceneRecognizer,
     SeatRole,
@@ -347,6 +348,39 @@ def test_native_text_count_overrides_unverified_whole_roi_template() -> None:
     assert count == 13
     assert confidence == 1.0
     assert verified is True
+
+
+def test_cv_remaining_reader_segments_real_counter_templates() -> None:
+    templates = (
+        Path(__file__).parents[1]
+        / "data"
+        / "live_game"
+        / "templates"
+    )
+    matcher = TemplateMatcher(templates)
+    reader = CvRemainingReader(
+        template_images=matcher.template_images("remaining"),
+    )
+
+    with Image.open(
+        templates
+        / "remaining"
+        / "16"
+        / "left_remaining-1784789776534.png"
+    ) as left_image:
+        left_match = reader.read(left_image)
+    with Image.open(
+        templates
+        / "remaining"
+        / "17"
+        / "right_remaining-1784789777204.png"
+    ) as right_image:
+        right_match = reader.read(right_image)
+
+    assert left_match.count == 16
+    assert right_match.count == 17
+    assert left_match.confidence >= 0.80
+    assert right_match.confidence >= 0.80
 
 
 def test_similar_whole_roi_template_is_not_verified_without_text() -> None:
