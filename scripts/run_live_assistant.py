@@ -3,6 +3,7 @@ from __future__ import annotations
 import argparse
 import queue
 import threading
+import traceback
 from pathlib import Path
 
 from src.pipeline.live_layout import load_live_layout
@@ -42,6 +43,7 @@ def main(argv: list[str] | None = None) -> int:
     from src.ui.live_overlay import LiveAssistantOverlay
 
     snapshots: "queue.Queue[LiveRuntimeSnapshot]" = queue.Queue(maxsize=2)
+    runtime_errors: "queue.Queue[str]" = queue.Queue(maxsize=1)
     stopped = threading.Event()
     failure: list[BaseException] = []
 
@@ -61,6 +63,11 @@ def main(argv: list[str] | None = None) -> int:
                             pass
         except BaseException as exc:  # noqa: BLE001
             failure.append(exc)
+            traceback.print_exc()
+            try:
+                runtime_errors.put_nowait(f"{type(exc).__name__}: {exc}")
+            except queue.Full:
+                pass
             stopped.set()
         finally:
             runtime.close()
@@ -78,6 +85,7 @@ def main(argv: list[str] | None = None) -> int:
 
     overlay = LiveAssistantOverlay(
         snapshots,
+        runtime_errors=runtime_errors,
         on_close=stop,
         geometry=args.overlay_geometry,
     )

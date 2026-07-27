@@ -327,22 +327,36 @@ class SceneRecognizer:
 
     def observe(self, frame: CapturedWindow) -> SceneObservation:
         warnings: list[str] = []
-        roles: dict[PlayerSeat, tuple[SeatRole, float]] = {}
+        raw_roles: dict[PlayerSeat, tuple[SeatRole, float]] = {}
         remaining: dict[PlayerSeat, tuple[int | None, float, bool]] = {}
 
         for seat in PlayerSeat:
-            role_match = self.templates.classify("role", self.config.crop(frame.image, f"{seat.value}_role"))
+            role_match = self.templates.classify(
+                "role",
+                self.config.crop(frame.image, f"{seat.value}_role"),
+            )
             role = _parse_role(role_match, self.config.template_threshold)
-            roles[seat] = role, role_match.confidence
+            raw_roles[seat] = role, role_match.confidence
+
+        self_hand_crop = self.config.crop(frame.image, "self_hand")
+        visible_hand_count = infer_visible_hand_count(
+            self_hand_crop,
+            maximum=20,
+        )
+        roles = _resolve_roles_from_hand_count(
+            raw_roles,
+            visible_hand_count=visible_hand_count,
+        )
+        for seat, (role, _) in roles.items():
             if role is SeatRole.UNKNOWN:
                 warnings.append(f"{seat.value}_role_unavailable")
 
         self_role = roles[PlayerSeat.SELF][0]
         expected_hand_count = 20 if self_role is SeatRole.LANDLORD else 17
-        self_hand_crop = self.config.crop(frame.image, "self_hand")
         self_hand = self._observe_hand(
             self_hand_crop,
             expected_count=expected_hand_count,
+            visible_count=visible_hand_count,
         )
         if not self_hand:
             warnings.append(
@@ -509,11 +523,13 @@ class SceneRecognizer:
         image: Image.Image,
         *,
         expected_count: int,
+        visible_count: int | None = None,
     ) -> tuple[VisualCard, ...]:
-        visible_count = infer_visible_hand_count(
-            image,
-            maximum=expected_count,
-        )
+        if visible_count is None:
+            visible_count = infer_visible_hand_count(
+                image,
+                maximum=20,
+            )
         count = visible_count or expected_count
         boxes = infer_overlapping_hand_boxes(image, count)
         if not boxes:
@@ -598,6 +614,23 @@ def _parse_role(match: TemplateMatch, threshold: float) -> SeatRole:
     if match.confidence < threshold or match.label not in {"landlord", "farmer"}:
         return SeatRole.UNKNOWN
     return SeatRole(match.label)
+
+
+def _resolve_roles_from_hand_count(
+    roles: Mapping[PlayerSeat, tuple[SeatRole, float]],
+    *,
+    visible_hand_count: int | None,
+) -> dict[PlayerSeat, tuple[SeatRole, float]]:
+    resolved = dict(roles)
+    # At the post-bidding start screen only the local landlord can visibly
+    # hold 20 cards.  This structural signal is stronger than a whole-ROI role
+    # template, whose mostly unchanged blue background can otherwise match the
+    # wrong seat/label with deceptively high confidence.
+    if visible_hand_count == 20:
+        resolved[PlayerSeat.SELF] = (SeatRole.LANDLORD, 1.0)
+        resolved[PlayerSeat.LEFT] = (SeatRole.FARMER, 1.0)
+        resolved[PlayerSeat.RIGHT] = (SeatRole.FARMER, 1.0)
+    return resolved
 
 
 def _parse_remaining(match: TemplateMatch, threshold: float) -> int | None:

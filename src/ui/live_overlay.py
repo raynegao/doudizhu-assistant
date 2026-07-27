@@ -21,6 +21,19 @@ class LiveOverlayViewModel:
     warnings: str
 
     @classmethod
+    def from_runtime_error(cls, message: str) -> "LiveOverlayViewModel":
+        return cls(
+            status="识别线程异常停止",
+            roles="识别状态：不可用",
+            remaining="余牌：--",
+            trick="当前牌：--",
+            best="推荐：已暂停",
+            top_k=(),
+            confidence="场面置信度：0.0%",
+            warnings=message,
+        )
+
+    @classmethod
     def from_snapshot(cls, snapshot: LiveRuntimeSnapshot) -> "LiveOverlayViewModel":
         if not snapshot.window_available:
             return cls(
@@ -113,6 +126,7 @@ class LiveAssistantOverlay:
         self,
         snapshots: "queue.Queue[LiveRuntimeSnapshot]",
         *,
+        runtime_errors: "queue.Queue[str] | None" = None,
         on_close: Callable[[], None] | None = None,
         geometry: str = "250x430+0+70",
     ) -> None:
@@ -120,6 +134,8 @@ class LiveAssistantOverlay:
 
         self._tk = tk
         self.snapshots = snapshots
+        self.runtime_errors = runtime_errors
+        self._runtime_error: str | None = None
         self.on_close = on_close
         self.root = tk.Tk()
         self.root.title("斗地主助手")
@@ -178,6 +194,21 @@ class LiveAssistantOverlay:
 
     def _poll(self) -> None:
         if self._closed:
+            return
+        latest_error: str | None = None
+        if self.runtime_errors is not None:
+            while True:
+                try:
+                    latest_error = self.runtime_errors.get_nowait()
+                except queue.Empty:
+                    break
+        if latest_error is not None:
+            self._runtime_error = latest_error
+        if self._runtime_error is not None:
+            self.present(
+                LiveOverlayViewModel.from_runtime_error(self._runtime_error)
+            )
+            self.root.after(80, self._poll)
             return
         latest: LiveRuntimeSnapshot | None = None
         while True:

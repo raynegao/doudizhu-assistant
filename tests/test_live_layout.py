@@ -78,7 +78,9 @@ def test_mac_window_capture_uses_window_server_image() -> None:
     )
     source = MacWindowCapture(
         "斗地主",
-        geometry_provider=lambda: ScreenGeometry((200, 200), (400, 400)),
+        geometry_provider=lambda: (_ for _ in ()).throw(
+            AssertionError("window-level capture must not grab the display")
+        ),
         window_server_finder=lambda _: WindowServerInfo(42, window),
         window_grabber=lambda _: Image.new("RGB", (200, 200), "navy"),
         clock=lambda: 123.0,

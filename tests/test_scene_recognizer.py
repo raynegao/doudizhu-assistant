@@ -4,11 +4,14 @@ from pathlib import Path
 
 from PIL import Image, ImageDraw
 
+from src.state.events import PlayerSeat
 from src.vision.scene_recognizer import (
     RemainingTextMatch,
+    SeatRole,
     TemplateMatcher,
     _glyph_similarity,
     _rank_glyph_signature,
+    _resolve_roles_from_hand_count,
     _resolve_remaining,
     infer_visible_hand_count,
     infer_overlapping_hand_boxes,
@@ -115,6 +118,25 @@ def test_infer_visible_hand_count_reads_overlapping_card_edges() -> None:
         )
 
     assert infer_visible_hand_count(image, maximum=17) == 14
+
+
+def test_twenty_visible_cards_override_misleading_role_templates() -> None:
+    roles = {
+        PlayerSeat.SELF: (SeatRole.FARMER, 0.92),
+        PlayerSeat.LEFT: (SeatRole.LANDLORD, 0.93),
+        PlayerSeat.RIGHT: (SeatRole.FARMER, 0.97),
+    }
+
+    resolved = _resolve_roles_from_hand_count(
+        roles,
+        visible_hand_count=20,
+    )
+
+    assert resolved == {
+        PlayerSeat.SELF: (SeatRole.LANDLORD, 1.0),
+        PlayerSeat.LEFT: (SeatRole.FARMER, 1.0),
+        PlayerSeat.RIGHT: (SeatRole.FARMER, 1.0),
+    }
 
 
 def _synthetic_rank_card(scale: float, *, rank: str) -> Image.Image:

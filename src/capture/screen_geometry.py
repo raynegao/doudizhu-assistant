@@ -272,6 +272,44 @@ def detect_screen_geometry(
     )
 
 
+def _geometry_from_window_image(
+    window: WindowInfo,
+    image_size: tuple[int, int],
+) -> ScreenGeometry:
+    if window.width <= 0 or window.height <= 0:
+        raise ScreenGeometryError("window dimensions must be positive")
+    scale_x = image_size[0] / window.width
+    scale_y = image_size[1] / window.height
+    if min(scale_x, scale_y) <= 0:
+        raise ScreenGeometryError("window image dimensions must be positive")
+    # A normal macOS window capture uses the same backing scale on both axes.
+    # Keep a small tolerance for rounded logical bounds.
+    if abs(scale_x - scale_y) > 0.03:
+        raise ScreenGeometryError(
+            "window-level image scale is inconsistent: "
+            f"{scale_x:.3f}x{scale_y:.3f}"
+        )
+    nearest_backing_scale = round((scale_x + scale_y) / 2)
+    if (
+        nearest_backing_scale <= 0
+        or abs(scale_x - nearest_backing_scale) > 0.03
+        or abs(scale_y - nearest_backing_scale) > 0.03
+    ):
+        raise ScreenGeometryError(
+            "window-level image does not match an integral macOS backing "
+            f"scale: {scale_x:.3f}x{scale_y:.3f}"
+        )
+    logical_width = max(window.window_box[2], window.width)
+    logical_height = max(window.window_box[3], window.height)
+    return ScreenGeometry(
+        logical_size=(logical_width, logical_height),
+        pixel_size=(
+            round(logical_width * scale_x),
+            round(logical_height * scale_y),
+        ),
+    )
+
+
 class MacWindowCapture:
     """Capture a macOS window with Retina-aware coordinate conversion."""
 
@@ -313,10 +351,6 @@ class MacWindowCapture:
                 WindowCaptureStatus.MINIMIZED,
                 "斗地主窗口已最小化，当前无法识别；请还原窗口",
             )
-        if self._geometry is None:
-            self._geometry = self._geometry_provider()
-        geometry = self._geometry
-        pixel_box = geometry.logical_to_pixel_box(info.window.window_box)
         try:
             image = self._window_grabber(info.window_id).convert("RGB")
         except ScreenGeometryError:
@@ -327,13 +361,16 @@ class MacWindowCapture:
                     WindowCaptureStatus.MINIMIZED,
                     "斗地主窗口已最小化，当前无法识别；请还原窗口",
                 )
-            pixel_box = geometry.logical_to_pixel_box(info.window.window_box)
             image = self._window_grabber(info.window_id).convert("RGB")
-        expected_size = (
-            pixel_box[2] - pixel_box[0],
-            pixel_box[3] - pixel_box[1],
-        )
-        if image.size != expected_size:
+        # A WindowServer image already has the exact target-window pixels.
+        # Derive the Retina scale from that image instead of taking an
+        # additional full-display screenshot.  The latter requires the
+        # launching host (for example Terminal from a desktop shortcut) to
+        # have Screen Recording permission and used to terminate the worker
+        # with "could not create image from display".
+        try:
+            geometry = _geometry_from_window_image(info.window, image.size)
+        except ScreenGeometryError:
             refreshed = self._window_server_finder(self.app_name)
             self._window_server_info = refreshed
             info = refreshed
@@ -342,16 +379,9 @@ class MacWindowCapture:
                     WindowCaptureStatus.MINIMIZED,
                     "斗地主窗口已最小化，当前无法识别；请还原窗口",
                 )
-            pixel_box = geometry.logical_to_pixel_box(info.window.window_box)
-            expected_size = (
-                pixel_box[2] - pixel_box[0],
-                pixel_box[3] - pixel_box[1],
-            )
-            if image.size != expected_size:
-                raise ScreenGeometryError(
-                    f"window-level image size {image.size} does not match "
-                    f"expected {expected_size}"
-                )
+            image = self._window_grabber(info.window_id).convert("RGB")
+            geometry = _geometry_from_window_image(info.window, image.size)
+        pixel_box = geometry.logical_to_pixel_box(info.window.window_box)
         return CapturedWindow(
             frame_id=frame_id,
             timestamp=self._clock(),

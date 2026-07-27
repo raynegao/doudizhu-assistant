@@ -226,6 +226,16 @@ def test_live_runtime_waits_for_window_and_recovers(tmp_path: Path) -> None:
     assert transitions == ["not_open", "available"]
 
 
+def test_live_overlay_exposes_background_runtime_error() -> None:
+    view = LiveOverlayViewModel.from_runtime_error(
+        "ScreenGeometryError: capture failed"
+    )
+
+    assert view.status == "识别线程异常停止"
+    assert "已暂停" in view.best
+    assert "capture failed" in view.warnings
+
+
 def test_live_runtime_bootstraps_after_switching_to_post_bidding_table(
     tmp_path: Path,
 ) -> None:
