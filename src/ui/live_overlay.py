@@ -34,14 +34,14 @@ class LiveOverlayViewModel:
                 warnings=(
                     "请打开斗地主窗口"
                     if snapshot.window_status is WindowCaptureStatus.NOT_OPEN
-                    else "请还原斗地主窗口后继续"
+                    else "请切换到或还原斗地主窗口后继续"
                 ),
             )
         state = snapshot.state
         if state is None:
             return cls(
                 status=snapshot.tracker_update.message,
-                roles="等待完整新局",
+                roles="等待地主/加倍完成",
                 remaining="余牌：--",
                 trick="当前牌：--",
                 best="推荐：--",
@@ -130,7 +130,7 @@ class LiveAssistantOverlay:
         self._closed = False
 
         self.status = tk.StringVar(value="正在启动…")
-        self.roles = tk.StringVar(value="等待完整新局")
+        self.roles = tk.StringVar(value="等待地主/加倍完成")
         self.remaining = tk.StringVar(value="余牌：--")
         self.trick = tk.StringVar(value="当前牌：--")
         self.best = tk.StringVar(value="推荐：--")

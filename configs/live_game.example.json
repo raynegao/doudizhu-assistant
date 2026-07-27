@@ -22,6 +22,7 @@
   "log_file": "logs/live_assistant.jsonl",
   "error_frames_dir": "data/live_game/errors",
   "interval_seconds": 0.25,
+  "initial_stability_frames": 2,
   "stability_frames": 3,
   "confidence_threshold": 0.7,
   "pass_threshold": 0.82,

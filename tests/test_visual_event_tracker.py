@@ -210,6 +210,25 @@ def test_visual_tracker_initializes_and_advances_play_pass_round() -> None:
     assert not left_pass.state.trick_target
 
 
+def test_visual_tracker_uses_faster_post_bidding_bootstrap_threshold() -> None:
+    tracker = VisualEventTracker(
+        stability_frames=3,
+        initial_stability_frames=2,
+        round_id_factory=lambda _: "round-post-bidding",
+    )
+
+    stabilizing = tracker.update(_scene(frame_id=1, self_turn=True))
+    initialized = tracker.update(_scene(frame_id=2, self_turn=True))
+
+    assert stabilizing.mode is VisualTrackerMode.WAITING_FOR_ROUND
+    assert stabilizing.state is None
+    assert "正在建立牌局 1/2" in stabilizing.message
+    assert initialized.initialized is True
+    assert initialized.state is not None
+    assert initialized.state.current_actor is PlayerSeat.SELF
+    assert initialized.state.decision_ready is True
+
+
 def test_visual_tracker_derives_self_play_and_two_passes_from_scene_state() -> None:
     tracker = VisualEventTracker(
         stability_frames=2,

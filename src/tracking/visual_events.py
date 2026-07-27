@@ -74,12 +74,20 @@ class VisualEventTracker:
         self,
         *,
         stability_frames: int = 3,
+        initial_stability_frames: int | None = None,
         confidence_threshold: float = 0.70,
         round_id_factory: RoundIdFactory | None = None,
     ) -> None:
         if stability_frames <= 0:
             raise ValueError("stability_frames must be positive")
+        if initial_stability_frames is not None and initial_stability_frames <= 0:
+            raise ValueError("initial_stability_frames must be positive")
         self.stability_frames = stability_frames
+        self.initial_stability_frames = (
+            stability_frames
+            if initial_stability_frames is None
+            else initial_stability_frames
+        )
         self.confidence_threshold = confidence_threshold
         self.round_id_factory = round_id_factory or (
             lambda scene: f"live-{int(scene.timestamp * 1000)}"
@@ -116,8 +124,20 @@ class VisualEventTracker:
                 VisualTrackerMode.UNCERTAIN,
                 VisualTrackerMode.FINISHED,
             }
-            if should_initialize and stable_count >= self.stability_frames:
+            if should_initialize and stable_count >= self.initial_stability_frames:
                 return self._initialize(scene, initial)
+            if should_initialize:
+                return VisualTrackerUpdate(
+                    mode=VisualTrackerMode.WAITING_FOR_ROUND,
+                    message=(
+                        "已识别地主、角色和完整初始手牌，正在建立牌局 "
+                        f"{stable_count}/{self.initial_stability_frames}"
+                    ),
+                    state=None,
+                    warnings=tuple(
+                        dict.fromkeys((*scene.warnings, *initial.warnings))
+                    ),
+                )
         else:
             self._initial_stable.update(("not_initial",))
 
@@ -125,8 +145,8 @@ class VisualEventTracker:
             return VisualTrackerUpdate(
                 mode=VisualTrackerMode.WAITING_FOR_ROUND,
                 message=(
-                    "等待新局：完整初始场面，或可由地主首手安全重建的场面，"
-                    "必须连续稳定"
+                    "等待地主和加倍完成后的完整初始场面；"
+                    "也支持由地主首手安全重建"
                 ),
                 state=None,
                 warnings=scene.warnings,

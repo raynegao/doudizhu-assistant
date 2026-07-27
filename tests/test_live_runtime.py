@@ -16,9 +16,25 @@ from src.logic.monte_carlo import MonteCarloSettings, recommend_phase4
 from src.pipeline.calibration import WindowInfo
 from src.pipeline.live_layout import LiveLayoutConfig
 from src.pipeline.live_runtime import LiveGameRuntime
+from src.state.events import PlayerSeat
 from src.tracking.visual_events import VisualTrackerMode, VisualTrackerUpdate
 from src.ui.live_overlay import LiveOverlayViewModel
-from src.vision.scene_recognizer import SceneObservation
+from src.vision.scene_recognizer import (
+    SceneObservation,
+    SeatObservation,
+    SeatRole,
+    VisualCard,
+    VisualSignal,
+)
+
+
+POST_BIDDING_HAND = (
+    "3", "3", "3", "3",
+    "4", "4", "4", "4",
+    "5", "5", "5", "5",
+    "6", "6", "6", "6",
+    "7", "7", "7", "7",
+)
 
 
 class _FrameSource:
@@ -63,6 +79,44 @@ class _Recognizer:
             self_turn=True,
             self_turn_confidence=1.0,
             confidence=1.0,
+        )
+
+
+class _PostBiddingRecognizer:
+    def observe(self, frame: CapturedWindow) -> SceneObservation:
+        cards = tuple(
+            VisualCard(
+                rank=rank,
+                confidence=0.99,
+                box=(0, 0, 10, 20),
+            )
+            for rank in POST_BIDDING_HAND
+        )
+        seats = tuple(
+            SeatObservation(
+                seat=seat,
+                signal=VisualSignal.NEUTRAL,
+                remaining_count=20 if seat is PlayerSeat.SELF else 17,
+                role=(
+                    SeatRole.LANDLORD
+                    if seat is PlayerSeat.SELF
+                    else SeatRole.FARMER
+                ),
+                confidence=0.99,
+                remaining_confidence=0.99,
+                role_confidence=0.99,
+            )
+            for seat in PlayerSeat
+        )
+        return SceneObservation(
+            frame_id=frame.frame_id,
+            timestamp=frame.timestamp,
+            window_pixel_box=frame.pixel_box,
+            self_hand=cards,
+            seats=seats,
+            self_turn=True,
+            self_turn_confidence=0.99,
+            confidence=0.99,
         )
 
 
@@ -170,3 +224,51 @@ def test_live_runtime_waits_for_window_and_recovers(tmp_path: Path) -> None:
         if event["event"] == "live_window_status"
     ]
     assert transitions == ["not_open", "available"]
+
+
+def test_live_runtime_bootstraps_after_switching_to_post_bidding_table(
+    tmp_path: Path,
+) -> None:
+    config = LiveLayoutConfig(
+        log_file=tmp_path / "live.jsonl",
+        error_frames_dir=tmp_path / "errors",
+        initial_stability_frames=2,
+        stability_frames=3,
+        simulations=2,
+        max_depth=4,
+        time_budget_ms=0,
+        min_rollouts_per_action=1,
+        top_k=1,
+        max_candidates=2,
+    )
+    runtime = LiveGameRuntime(
+        config,
+        frame_source=_UnavailableThenFrameSource(
+            WindowCaptureStatus.CAPTURE_ERROR,
+        ),
+        recognizer=_PostBiddingRecognizer(),
+        sleeper=lambda _: None,
+    )
+    try:
+        outside_game = runtime.run_once()
+        stabilizing = runtime.run_once()
+        initialized = runtime.run_once()
+        decided = initialized
+        for _ in range(20):
+            time.sleep(0.01)
+            decided = runtime.run_once()
+            if decided.decision is not None:
+                break
+    finally:
+        runtime.close()
+
+    assert outside_game.window_available is False
+    assert stabilizing.state is None
+    assert "正在建立牌局 1/2" in stabilizing.tracker_update.message
+    assert initialized.state is not None
+    assert initialized.tracker_update.initialized is True
+    assert initialized.state.landlord is PlayerSeat.SELF
+    assert initialized.state.current_actor is PlayerSeat.SELF
+    assert initialized.state.decision_ready is True
+    assert decided.decision is not None
+    assert decided.decision.state_revision == 0

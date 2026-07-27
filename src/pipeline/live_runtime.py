@@ -123,6 +123,7 @@ class LiveGameRuntime:
         self.recognizer = recognizer or SceneRecognizer(config)
         self.tracker = tracker or VisualEventTracker(
             stability_frames=config.stability_frames,
+            initial_stability_frames=config.initial_stability_frames,
             confidence_threshold=config.confidence_threshold,
         )
         self.decision_fn = decision_fn
@@ -450,7 +451,7 @@ def format_live_snapshot(snapshot: LiveRuntimeSnapshot) -> str:
         snapshot.tracker_update.message,
     ]
     if state is None:
-        lines.append("状态：等待完整新局")
+        lines.append("状态：等待地主/加倍完成后的完整开局")
         return "\n".join(lines)
     remaining = state.remaining_by_player
     lines.extend([

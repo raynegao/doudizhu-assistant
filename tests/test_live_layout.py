@@ -176,6 +176,7 @@ def test_live_layout_roundtrip_and_preview(tmp_path: Path) -> None:
     contact = render_roi_contact_sheet(image, loaded, cell_size=(120, 80))
 
     assert loaded.roi("self_turn") == NormalizedBox(0.4, 0.4, 0.6, 0.6)
+    assert loaded.initial_stability_frames == 2
     assert preview.size == image.size
     assert contact.width == 360
     assert contact.height > 80

@@ -92,6 +92,7 @@ class LiveLayoutConfig:
     log_file: Path = Path("logs/live_assistant.jsonl")
     error_frames_dir: Path = Path("data/live_game/errors")
     interval_seconds: float = 0.25
+    initial_stability_frames: int = 2
     stability_frames: int = 3
     confidence_threshold: float = 0.70
     pass_threshold: float = 0.82
@@ -109,6 +110,8 @@ class LiveLayoutConfig:
             raise ValueError(f"live layout is missing required ROIs: {', '.join(missing)}")
         if self.interval_seconds <= 0:
             raise ValueError("interval_seconds must be positive")
+        if self.initial_stability_frames <= 0:
+            raise ValueError("initial_stability_frames must be positive")
         if self.stability_frames <= 0:
             raise ValueError("stability_frames must be positive")
         if not 0.0 <= self.confidence_threshold <= 1.0:
@@ -142,6 +145,7 @@ class LiveLayoutConfig:
             "log_file": self.log_file.as_posix(),
             "error_frames_dir": self.error_frames_dir.as_posix(),
             "interval_seconds": self.interval_seconds,
+            "initial_stability_frames": self.initial_stability_frames,
             "stability_frames": self.stability_frames,
             "confidence_threshold": self.confidence_threshold,
             "pass_threshold": self.pass_threshold,
@@ -174,6 +178,12 @@ def live_layout_from_dict(data: Mapping[str, object]) -> LiveLayoutConfig:
         log_file=Path(str(data.get("log_file", defaults.log_file))),
         error_frames_dir=Path(str(data.get("error_frames_dir", defaults.error_frames_dir))),
         interval_seconds=float(data.get("interval_seconds", defaults.interval_seconds)),
+        initial_stability_frames=int(
+            data.get(
+                "initial_stability_frames",
+                defaults.initial_stability_frames,
+            )
+        ),
         stability_frames=int(data.get("stability_frames", defaults.stability_frames)),
         confidence_threshold=float(data.get("confidence_threshold", defaults.confidence_threshold)),
         pass_threshold=float(data.get("pass_threshold", defaults.pass_threshold)),
