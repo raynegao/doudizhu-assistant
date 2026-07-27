@@ -1,6 +1,9 @@
 from __future__ import annotations
 
+import base64
+import binascii
 import hashlib
+import json
 import os
 import platform
 import subprocess
@@ -16,7 +19,7 @@ import torch
 
 from src.capture.screen_geometry import CapturedWindow
 from src.pipeline.live_layout import LiveLayoutConfig
-from src.state.cards import CardSet, normalize_rank
+from src.state.cards import RANKS, CardSet, normalize_rank
 from src.state.events import PlayerSeat
 from src.vision.card_classifier import (
     CardPrediction,
@@ -328,7 +331,7 @@ class SceneRecognizer:
             self.predictor = model_predictor
         else:
             self.predictor = predictor
-        self._rank_references: dict[str, list[frozenset[int]]] = {}
+        self._rank_references = _load_builtin_rank_references()
         self._reference_hand_fingerprint: tuple[str, ...] | None = None
         self._load_rank_reference_templates()
         if remaining_reader is not None:
@@ -918,6 +921,69 @@ def _glyph_similarity(
     if not left or not right:
         return 0.0
     return len(left & right) / len(left | right)
+
+
+_RANK_GLYPH_GRID_SIZE = 64
+_RANK_GLYPH_BYTE_COUNT = (_RANK_GLYPH_GRID_SIZE**2) // 8
+_BUILTIN_RANK_GLYPHS = (
+    Path(__file__).with_name("assets") / "rank_glyph_signatures.json"
+)
+
+
+def _encode_glyph_signature(signature: frozenset[int]) -> str:
+    bits = bytearray(_RANK_GLYPH_BYTE_COUNT)
+    for index in signature:
+        if not 0 <= index < _RANK_GLYPH_GRID_SIZE**2:
+            raise ValueError(f"glyph signature index out of range: {index}")
+        bits[index // 8] |= 1 << (index % 8)
+    return base64.b64encode(bytes(bits)).decode("ascii")
+
+
+def _decode_glyph_signature(encoded: str) -> frozenset[int]:
+    raw = base64.b64decode(encoded.encode("ascii"), validate=True)
+    if len(raw) != _RANK_GLYPH_BYTE_COUNT:
+        raise ValueError(
+            f"invalid glyph signature size: {len(raw)} bytes"
+        )
+    return frozenset(
+        byte_index * 8 + bit_index
+        for byte_index, value in enumerate(raw)
+        for bit_index in range(8)
+        if value & (1 << bit_index)
+    )
+
+
+def _load_builtin_rank_references(
+    path: Path = _BUILTIN_RANK_GLYPHS,
+) -> dict[str, list[frozenset[int]]]:
+    try:
+        payload = json.loads(path.read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError):
+        return {}
+    if (
+        payload.get("format") != "rank-glyph-signatures-v1"
+        or payload.get("grid_size") != _RANK_GLYPH_GRID_SIZE
+        or not isinstance(payload.get("ranks"), dict)
+    ):
+        return {}
+    references: dict[str, list[frozenset[int]]] = {}
+    for rank in RANKS:
+        encoded_items = payload["ranks"].get(rank, ())
+        if not isinstance(encoded_items, list):
+            continue
+        decoded: list[frozenset[int]] = []
+        for encoded in encoded_items[:12]:
+            if not isinstance(encoded, str):
+                continue
+            try:
+                signature = _decode_glyph_signature(encoded)
+            except (ValueError, binascii.Error):
+                continue
+            if signature:
+                decoded.append(signature)
+        if decoded:
+            references[rank] = decoded
+    return references
 
 
 def _is_card_white(pixel: tuple[int, ...]) -> bool:

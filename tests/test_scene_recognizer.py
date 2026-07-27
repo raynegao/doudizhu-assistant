@@ -5,6 +5,7 @@ from pathlib import Path
 from PIL import Image, ImageDraw
 
 from src.pipeline.live_layout import LiveLayoutConfig
+from src.state.cards import RANKS
 from src.state.events import PlayerSeat
 from src.vision.scene_recognizer import (
     RemainingTextMatch,
@@ -12,7 +13,10 @@ from src.vision.scene_recognizer import (
     SeatRole,
     TemplateMatcher,
     _classify_role_badge,
+    _decode_glyph_signature,
+    _encode_glyph_signature,
     _glyph_similarity,
+    _load_builtin_rank_references,
     _rank_glyph_signature,
     _resolve_roles_from_hand_count,
     _resolve_remaining,
@@ -294,6 +298,17 @@ def test_scene_recognizer_preloads_real_rank_glyph_templates(
     assert match is not None
     assert match[0] == "6"
     assert match[1] >= 0.9
+
+
+def test_builtin_rank_glyph_asset_is_complete_and_decodable() -> None:
+    references = _load_builtin_rank_references()
+
+    assert set(references) == set(RANKS)
+    assert all(references[rank] for rank in RANKS)
+    sample = references["Q"][0]
+    assert _decode_glyph_signature(
+        _encode_glyph_signature(sample)
+    ) == sample
 
 
 def test_native_text_count_overrides_unverified_whole_roi_template() -> None:

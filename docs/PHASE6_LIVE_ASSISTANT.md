@@ -65,6 +65,13 @@ python -m scripts.add_live_template --kind turn --label inactive --roi self_turn
 
 建议每个标签从不同对局采集至少 3 个模板。模板、截图和模型都是本地数据，不提交 Git。
 
+牌点识别另外内置 `src/vision/assets/rank_glyph_signatures.json`。它只包含从真实 crop 归一化得到的 64×64 二值字形位图，不包含牌局截图；因此全新检出即使没有 `data/live_game/templates/rank/`，也能修正横幅遮挡下的手牌 CNN 结果。已有新的独立标注集时可运行：
+
+```bash
+python -m scripts.export_rank_glyph_signatures \
+  --source data/cards_cls/test
+```
+
 若新局开始时尚无地主 `20` 模板，跟踪器只会在三家角色明确、两名农民均为 17、自己的完整初始手牌稳定且三个出牌区都为空时，按规则补全地主初始 20 张。唯一例外是地主第一手仍完整显示：系统会验证该牌型、首手后的推导余牌、下一行动者和 54 张守恒，再把它记录为第 1 个视觉事件。
 
 macOS 实时入口会优先使用系统 Vision 文字识别读取左右余牌。整块余牌 ROI 的大部分像素是固定背景，未采集的数字可能与已有模板得到较高相似度，因此模板只作为兼容回退：`remaining_count` 会保留最佳匹配用于日志，但只有接近完全一致的模板才标记为 `remaining_verified` 并参与冲突阻断；否则状态机按已经确认的出牌张数扣减，不会把“13 误匹配为 16”当成可信事实。
@@ -167,7 +174,7 @@ Makefile 会优先使用项目 `.venv/bin/python`，无需手动激活虚拟环�
 - 当前 trick 中，若对手余牌未减少且界面已明确回到自己的回合，状态机会按行动顺序补记“不出”；
 - 两名对手连续不出后清空当前 trick，当前行动者回到最后出牌者；若是自己，立即触发自由出牌 Top-3 计算。
 
-低置信度、漏事件或冲突会切换到 `uncertain`，保存错误帧到 `data/live_game/errors/` 并等待下一局。日志默认写入 `logs/live_assistant.jsonl`，包含 `scene_observation`、`play/pass_observed`、`state_update`、`live_decision` 和运行延迟。
+低置信度、漏事件或冲突会切换到 `uncertain`，保存错误帧到 `data/live_game/errors/` 并暂停推荐；下次稳定识别到自己回合时会自动重建，也可按“扫描当前牌局”立即请求重扫。日志默认写入 `logs/live_assistant.jsonl`，包含 `scene_observation`、`play/pass_observed`、`state_update`、`live_decision` 和运行延迟。
 
 默认决策预算为 1.5 秒、至少 32 组 sampled worlds、Top-3，并按估计团队胜率优先排序。
 

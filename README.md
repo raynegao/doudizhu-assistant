@@ -115,8 +115,9 @@ python -m scripts.evaluate_card_cnn \
 - `models/card_cnn.metrics.json`：训练过程中的最佳 epoch 和 train/val/test 指标。
 - `models/card_cnn.confusion_matrix.csv`：混淆矩阵。
 - `models/card_cnn.error_report.jsonl`：错例报告。
+- `src/vision/assets/rank_glyph_signatures.json`：从真实牌点 crop 导出的 64×64 匿名二值字形特征；随代码提交，用于在没有本地模板目录时纠正提示横幅遮挡下的 CNN 误识别，不包含原始截图。
 
-这些数据和模型目录默认不提交 Git。Phase 2 默认在 Mac 本地完成，不依赖 Windows/WSL。
+数据和模型目录默认不提交 Git；仅提交上述不可逆还原原图的轻量字形特征。需要从新标注集刷新时运行 `python -m scripts.export_rank_glyph_signatures`。Phase 2 默认在 Mac 本地完成，不依赖 Windows/WSL。
 
 ## Phase 2D：Mac 斗地主 ROI 切牌
 
