@@ -10,6 +10,7 @@ from enum import Enum
 from pathlib import Path
 from typing import Callable, Iterable, Mapping, Sequence
 
+import numpy as np
 from PIL import Image, ImageOps, ImageStat
 import torch
 
@@ -809,20 +810,23 @@ def _is_card_white(pixel: tuple[int, ...]) -> bool:
     return max(red, green, blue) >= 175 and min(red, green, blue) >= 115
 
 
-def _active_x_runs(
-    image: Image.Image,
+def _card_white_mask(image: Image.Image) -> np.ndarray:
+    pixels = np.asarray(image.convert("RGB"), dtype=np.uint8)
+    return (
+        (pixels.max(axis=2) >= 175)
+        & (pixels.min(axis=2) >= 115)
+    )
+
+
+def _active_x_runs_from_mask(
+    white_mask: np.ndarray,
     *,
-    min_column_ratio: float = 0.08,
-    max_gap: int = 2,
+    min_column_ratio: float,
+    max_gap: int,
 ) -> list[tuple[int, int]]:
-    rgb = image.convert("RGB")
-    width, height = rgb.size
-    pixels = rgb.load()
+    height, width = white_mask.shape
     minimum = max(3, round(height * min_column_ratio))
-    active = [
-        sum(_is_card_white(pixels[x, y]) for y in range(height)) >= minimum
-        for x in range(width)
-    ]
+    active = (white_mask.sum(axis=0) >= minimum).tolist()
     runs: list[tuple[int, int]] = []
     start: int | None = None
     gap = 0
@@ -842,6 +846,19 @@ def _active_x_runs(
     return runs
 
 
+def _active_x_runs(
+    image: Image.Image,
+    *,
+    min_column_ratio: float = 0.08,
+    max_gap: int = 2,
+) -> list[tuple[int, int]]:
+    return _active_x_runs_from_mask(
+        _card_white_mask(image),
+        min_column_ratio=min_column_ratio,
+        max_gap=max_gap,
+    )
+
+
 def segment_card_boxes(image: Image.Image) -> tuple[tuple[int, int, int, int], ...]:
     """Locate separated or overlapped face-up cards on the blue table."""
 
@@ -849,20 +866,18 @@ def segment_card_boxes(image: Image.Image) -> tuple[tuple[int, int, int, int], .
     minimum_width = max(10, round(width * 0.03))
     boxes: list[tuple[int, int, int, int]] = []
     rgb = image.convert("RGB")
-    pixels = rgb.load()
-    for left, right in _active_x_runs(rgb):
+    white_mask = _card_white_mask(rgb)
+    for left, right in _active_x_runs_from_mask(
+        white_mask,
+        min_column_ratio=0.08,
+        max_gap=2,
+    ):
         if right - left < minimum_width:
             continue
-        row_counts = [
-            sum(
-                _is_card_white(pixels[x, y])
-                for x in range(left, right)
-            )
-            for y in range(height)
-        ]
+        row_counts = white_mask[:, left:right].sum(axis=1)
         row_runs = _boolean_runs(
             [
-                count >= max(4, round((right - left) * 0.25))
+                int(count) >= max(4, round((right - left) * 0.25))
                 for count in row_counts
             ],
             max_gap=2,
@@ -885,18 +900,16 @@ def segment_card_boxes(image: Image.Image) -> tuple[tuple[int, int, int, int], .
         box_width = right - left
         box_height = bottom - top
         aspect_ratio = box_width / box_height
-        white_pixels = sum(
-            _is_card_white(pixels[x, y])
-            for x in range(left, right)
-            for y in range(top, bottom)
-        )
-        white_ratio = white_pixels / max(1, box_width * box_height)
+        white_ratio = float(white_mask[top:bottom, left:right].mean())
         if not 0.28 <= aspect_ratio <= 1.20 or white_ratio < 0.60:
             continue
         boxes.append((left, top, right, bottom))
     if boxes:
         return tuple(boxes)
-    return _segment_overlapping_card_boxes(rgb)
+    return _segment_overlapping_card_boxes(
+        rgb,
+        white_mask=white_mask,
+    )
 
 
 def infer_visible_hand_count(
@@ -904,7 +917,13 @@ def infer_visible_hand_count(
     *,
     maximum: int = 20,
 ) -> int | None:
-    count = len(segment_card_boxes(image))
+    # The local client's hand is always overlapped. Trying separated-card
+    # segmentation first scans the same large ROI twice and made each live
+    # frame take multiple seconds.
+    boxes = _segment_overlapping_card_boxes(image)
+    if not boxes:
+        boxes = segment_card_boxes(image)
+    count = len(boxes)
     if 1 <= count <= maximum:
         return count
     return None
@@ -912,19 +931,24 @@ def infer_visible_hand_count(
 
 def _segment_overlapping_card_boxes(
     image: Image.Image,
+    *,
+    white_mask: np.ndarray | None = None,
 ) -> tuple[tuple[int, int, int, int], ...]:
     width, height = image.size
-    x_runs = _active_x_runs(image)
+    if white_mask is None:
+        white_mask = _card_white_mask(image)
+    x_runs = _active_x_runs_from_mask(
+        white_mask,
+        min_column_ratio=0.08,
+        max_gap=2,
+    )
     if not x_runs:
         return ()
     left, right = max(x_runs, key=lambda run: run[1] - run[0])
-    row_counts = [
-        sum(_is_card_white(image.getpixel((x, y))) for x in range(left, right))
-        for y in range(height)
-    ]
+    row_counts = white_mask[:, left:right].sum(axis=1)
     minimum_row = max(8, round((right - left) * 0.25))
     row_runs = _boolean_runs(
-        [count >= minimum_row for count in row_counts],
+        [int(count) >= minimum_row for count in row_counts],
         max_gap=2,
     )
     row_runs = [
@@ -939,14 +963,18 @@ def _segment_overlapping_card_boxes(
     if card_height <= 0:
         return ()
 
-    grayscale = image.convert("L")
-    edge_scores = []
-    for x in range(max(left + 1, 1), min(right + 1, width)):
-        score = sum(
-            abs(grayscale.getpixel((x, y)) - grayscale.getpixel((x - 1, y)))
-            for y in range(top, bottom)
-        ) / card_height
-        edge_scores.append((x, score))
+    grayscale = np.asarray(image.convert("L"), dtype=np.int16)
+    edge_start = max(left + 1, 1)
+    edge_stop = min(right + 1, width)
+    differences = np.abs(
+        grayscale[top:bottom, edge_start:edge_stop]
+        - grayscale[top:bottom, edge_start - 1:edge_stop - 1]
+    )
+    mean_scores = differences.mean(axis=0)
+    edge_scores = [
+        (edge_start + index, float(score))
+        for index, score in enumerate(mean_scores)
+    ]
     if not edge_scores:
         return ()
     maximum_edge = max(score for _, score in edge_scores)
@@ -990,19 +1018,24 @@ def infer_overlapping_hand_boxes(
         return ()
     width, height = image.size
     rgb = image.convert("RGB")
-    white_columns = _active_x_runs(rgb, min_column_ratio=0.15, max_gap=3)
+    white_mask = _card_white_mask(rgb)
+    white_columns = _active_x_runs_from_mask(
+        white_mask,
+        min_column_ratio=0.15,
+        max_gap=3,
+    )
     if not white_columns:
         return ()
     left = min(run[0] for run in white_columns)
     right = max(run[1] for run in white_columns)
     if right - left < width * 0.35:
         return ()
-    row_counts = [
-        sum(_is_card_white(rgb.getpixel((x, y))) for x in range(left, right))
-        for y in range(height)
-    ]
+    row_counts = white_mask[:, left:right].sum(axis=1)
     row_runs = _boolean_runs(
-        [count >= max(8, round((right - left) * 0.25)) for count in row_counts],
+        [
+            int(row_count) >= max(8, round((right - left) * 0.25))
+            for row_count in row_counts
+        ],
         max_gap=2,
     )
     if row_runs:

@@ -235,7 +235,7 @@ class VisualEventTracker:
                     event,
                 )
 
-        if _can_infer_opponent_pass(state, scene, observation):
+        if _can_infer_pass(state, scene, observation):
             event = ObservedAction(
                 event_id=(
                     f"{state.round_id}:{state.last_sequence_no + 1}:"
@@ -812,29 +812,58 @@ def _remaining_confirms_play(
     )
 
 
-def _can_infer_opponent_pass(
+def _can_infer_pass(
     state: ObservableGameState,
     scene: SceneObservation,
     observation: SeatObservation,
 ) -> bool:
     if (
-        observation.seat is PlayerSeat.SELF
-        or not state.trick_target
+        not state.trick_target
         or not observation.remaining_verified
         or observation.remaining_count != state.remaining_for(observation.seat)
     ):
         return False
-    if scene.self_turn is True:
+    if observation.seat is PlayerSeat.SELF:
+        try:
+            if scene.self_hand_set != state.self_hand:
+                return False
+        except ValueError:
+            return False
+    elif scene.self_turn is True:
         return True
-    next_actor = state.next_player(observation.seat)
-    if next_actor is PlayerSeat.SELF:
-        return False
-    next_observation = scene.seat(next_actor)
-    return bool(
-        next_observation.remaining_verified
-        and next_observation.remaining_count is not None
-        and next_observation.remaining_count < state.remaining_for(next_actor)
+
+    # A second consecutive pass clears the trick and returns the lead to its
+    # last player; otherwise normal turn order continues.
+    successor = (
+        state.trick_leader
+        if state.consecutive_passes == 1
+        else state.next_player(observation.seat)
     )
+    if successor is None:
+        return False
+    if successor is PlayerSeat.SELF:
+        return scene.self_turn is True
+    successor_observation = scene.seat(successor)
+    if _remaining_confirms_play(state, successor_observation):
+        return True
+
+    # If this would only be the first pass, the successor may also have passed
+    # before the next captured frame. A verified play by the following actor
+    # proves both intervening passes without guessing any cards.
+    if (
+        state.consecutive_passes == 0
+        and successor_observation.remaining_verified
+        and successor_observation.remaining_count
+        == state.remaining_for(successor)
+    ):
+        following = state.next_player(successor)
+        if following is PlayerSeat.SELF:
+            return scene.self_turn is True
+        return _remaining_confirms_play(
+            state,
+            scene.seat(following),
+        )
+    return False
 
 
 def _inferred_pass_confidence(

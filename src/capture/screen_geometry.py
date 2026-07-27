@@ -344,8 +344,17 @@ class MacWindowCapture:
         return self._capture_screen_crop(frame_id)
 
     def _capture_window_level(self, frame_id: int) -> CapturedWindow:
-        info = self._window_server_finder(self.app_name)
-        self._window_server_info = info
+        # Querying CGWindowList through a new Swift process costs hundreds of
+        # milliseconds. Reuse the stable Window ID for normal frames and
+        # refresh periodically so moves/minimize transitions still propagate.
+        should_refresh = (
+            self._window_server_info is None
+            or (frame_id > 0 and (frame_id - 1) % 4 == 0)
+        )
+        if should_refresh:
+            self._window_server_info = self._window_server_finder(self.app_name)
+        assert self._window_server_info is not None
+        info = self._window_server_info
         if not info.is_onscreen:
             raise WindowAvailabilityError(
                 WindowCaptureStatus.MINIMIZED,

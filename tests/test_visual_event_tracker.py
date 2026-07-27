@@ -333,6 +333,40 @@ def test_visual_tracker_continues_after_self_play_opponent_bomb_and_pass() -> No
     assert left_pass.state.trick_target.cards == ("10", "10", "10", "10")
     assert left_pass.state.decision_ready is True
 
+    later = dict(
+        visible_hand=remaining_hand,
+        right_signal=VisualSignal.PLAY,
+        right_cards=("4",),
+        right_remaining=12,
+        left_signal=VisualSignal.PLAY,
+        left_cards=("8",),
+        left_remaining=16,
+        self_turn=True,
+    )
+    inferred_self_pass = tracker.update(_scene(frame_id=9, **later))
+    tracker.update(_scene(frame_id=10, **later))
+    tracker.update(_scene(frame_id=11, **later))
+    right_lead = tracker.update(_scene(frame_id=12, **later))
+    tracker.update(_scene(frame_id=13, **later))
+    tracker.update(_scene(frame_id=14, **later))
+    left_play = tracker.update(_scene(frame_id=15, **later))
+
+    assert inferred_self_pass.event is not None
+    assert inferred_self_pass.event.actor is PlayerSeat.SELF
+    assert inferred_self_pass.event.is_pass
+    assert inferred_self_pass.event.source == "live_turn_inferred_pass"
+    assert right_lead.event is not None
+    assert right_lead.event.actor is PlayerSeat.RIGHT
+    assert right_lead.event.cards.cards == ("4",)
+    assert left_play.event is not None
+    assert left_play.event.actor is PlayerSeat.LEFT
+    assert left_play.event.cards.cards == ("8",)
+    assert left_play.state is not None
+    assert left_play.state.revision == 6
+    assert left_play.state.current_actor is PlayerSeat.SELF
+    assert left_play.state.trick_target.cards == ("8",)
+    assert left_play.state.decision_ready is True
+
 
 def test_visual_tracker_blocks_remaining_count_mismatch() -> None:
     tracker = VisualEventTracker(

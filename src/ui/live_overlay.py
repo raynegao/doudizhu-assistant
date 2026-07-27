@@ -90,6 +90,7 @@ class LiveOverlayViewModel:
             )
         return cls(
             status=(
+                f"R{state.revision} · F{snapshot.frame_id} · "
                 f"{snapshot.tracker_update.mode.value} · "
                 f"{snapshot.tracker_update.message}"
             ),

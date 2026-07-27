@@ -198,6 +198,8 @@ def test_live_runtime_schedules_and_logs_revision_scoped_decision(
     view = LiveOverlayViewModel.from_snapshot(snapshot)
     assert "最佳" in view.best
     assert view.top_k
+    assert f"R{phase4_ready_state.revision}" in view.status
+    assert f"F{snapshot.frame_id}" in view.status
     events = [
         json.loads(line)["event"]
         for line in config.log_file.read_text(encoding="utf-8").splitlines()

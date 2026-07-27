@@ -458,7 +458,13 @@ def _load_round_context(
     if not state_path.exists() or not seed_path.exists():
         return None
     try:
-        age_seconds = max(0.0, time.time() - state_path.stat().st_mtime)
+        latest_activity = state_path.stat().st_mtime
+        if config.log_file.exists():
+            latest_activity = max(
+                latest_activity,
+                config.log_file.stat().st_mtime,
+            )
+        age_seconds = max(0.0, time.time() - latest_activity)
         if age_seconds > _ROUND_RESUME_MAX_AGE_SECONDS:
             return None
         payload = json.loads(state_path.read_text(encoding="utf-8"))

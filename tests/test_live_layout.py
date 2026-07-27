@@ -93,6 +93,34 @@ def test_mac_window_capture_uses_window_server_image() -> None:
     assert frame.image.getpixel((0, 0)) == (0, 0, 128)
 
 
+def test_mac_window_capture_reuses_window_id_between_refresh_frames() -> None:
+    window = WindowInfo(
+        app_name="斗地主",
+        window_name="斗地主",
+        window_box=(10, 20, 110, 120),
+    )
+    finder_calls = 0
+
+    def find_window(_: str) -> WindowServerInfo:
+        nonlocal finder_calls
+        finder_calls += 1
+        return WindowServerInfo(42, window)
+
+    source = MacWindowCapture(
+        "斗地主",
+        window_server_finder=find_window,
+        window_grabber=lambda _: Image.new("RGB", (200, 200), "navy"),
+    )
+
+    source.capture(1)
+    source.capture(2)
+    source.capture(3)
+    source.capture(4)
+    source.capture(5)
+
+    assert finder_calls == 2
+
+
 def test_mac_window_capture_rejects_minimized_window() -> None:
     window = WindowInfo(
         app_name="斗地主",
