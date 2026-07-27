@@ -15,7 +15,12 @@ from src.capture.screen_geometry import (
 from src.logic.monte_carlo import MonteCarloSettings, recommend_phase4
 from src.pipeline.calibration import WindowInfo
 from src.pipeline.live_layout import LiveLayoutConfig
-from src.pipeline.live_runtime import LiveGameRuntime
+from src.pipeline.live_runtime import (
+    LiveGameRuntime,
+    _round_seed_path,
+    _round_state_path,
+    _write_round_checkpoint,
+)
 from src.state.events import PlayerSeat
 from src.tracking.visual_events import VisualTrackerMode, VisualTrackerUpdate
 from src.ui.live_overlay import LiveOverlayViewModel
@@ -117,6 +122,23 @@ class _PostBiddingRecognizer:
             self_turn=True,
             self_turn_confidence=0.99,
             confidence=0.99,
+        )
+
+
+class _ResumeRecognizer(_Recognizer):
+    def __init__(self, hand: tuple[str, ...]) -> None:
+        self.hand = hand
+        self.seed_calls = 0
+
+    def seed_hand_references(self, image: Image.Image):
+        self.seed_calls += 1
+        return tuple(
+            VisualCard(
+                rank=rank,
+                confidence=0.99,
+                box=(0, 0, 10, 20),
+            )
+            for rank in self.hand
         )
 
 
@@ -282,3 +304,39 @@ def test_live_runtime_bootstraps_after_switching_to_post_bidding_table(
     assert initialized.state.decision_ready is True
     assert decided.decision is not None
     assert decided.decision.state_revision == 0
+
+
+def test_live_runtime_restores_recent_round_checkpoint(
+    tmp_path: Path,
+    phase4_ready_state,
+) -> None:
+    config = LiveLayoutConfig(
+        log_file=tmp_path / "live.jsonl",
+        error_frames_dir=tmp_path / "errors",
+    )
+    _write_round_checkpoint(
+        _round_state_path(config),
+        phase4_ready_state,
+    )
+    seed_path = _round_seed_path(config)
+    seed_path.parent.mkdir(parents=True)
+    Image.new("RGB", (200, 100), "navy").save(seed_path)
+    recognizer = _ResumeRecognizer(phase4_ready_state.self_hand.cards)
+
+    runtime = LiveGameRuntime(
+        config,
+        frame_source=_FrameSource(),
+        recognizer=recognizer,
+        sleeper=lambda _: None,
+    )
+    try:
+        restored = runtime.tracker.state
+    finally:
+        runtime.close()
+
+    assert recognizer.seed_calls == 1
+    assert restored is not None
+    assert restored.round_id == phase4_ready_state.round_id
+    assert restored.revision == phase4_ready_state.revision
+    assert restored.self_hand == phase4_ready_state.self_hand
+    assert restored.current_actor is phase4_ready_state.current_actor

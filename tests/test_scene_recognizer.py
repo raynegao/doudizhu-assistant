@@ -104,6 +104,29 @@ def test_infer_overlapping_hand_boxes_uses_visible_white_extent() -> None:
     assert all(box[3] <= image.height for box in boxes)
 
 
+def test_infer_overlapping_hand_boxes_keeps_card_tops_above_notice() -> None:
+    image = Image.new("RGB", (900, 260), (30, 60, 130))
+    draw = ImageDraw.Draw(image)
+    for index in range(16):
+        left = 15 + index * 48
+        draw.rounded_rectangle(
+            (left, 10, left + 150, 240),
+            radius=6,
+            fill="white",
+            outline=(90, 90, 90),
+            width=2,
+        )
+    # The client displays this kind of full-width notice after an opponent
+    # plays a combination the user cannot beat.
+    draw.rectangle((0, 82, image.width, 170), fill=(75, 75, 85))
+
+    boxes = infer_overlapping_hand_boxes(image, 16)
+
+    assert len(boxes) == 16
+    assert all(box[1] <= 12 for box in boxes)
+    assert all(box[3] > 100 for box in boxes)
+
+
 def test_infer_visible_hand_count_reads_overlapping_card_edges() -> None:
     image = Image.new("RGB", (900, 260), (30, 60, 130))
     draw = ImageDraw.Draw(image)

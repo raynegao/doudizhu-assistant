@@ -27,6 +27,11 @@ FARMER_HAND = (
     "8", "8", "7", "7", "6", "6", "4", "3",
 )
 
+REAL_LANDLORD_HAND = (
+    "2", "2", "2", "A", "K", "Q", "J", "J", "9", "9",
+    "8", "7", "6", "6", "5", "5", "4", "4", "3", "3",
+)
+
 
 def _card(rank: str, confidence: float = 0.99) -> VisualCard:
     return VisualCard(rank=rank, confidence=confidence, box=(0, 0, 10, 20))
@@ -279,6 +284,56 @@ def test_visual_tracker_derives_self_play_and_two_passes_from_scene_state() -> N
     assert left_pass.state.decision_ready is True
 
 
+def test_visual_tracker_continues_after_self_play_opponent_bomb_and_pass() -> None:
+    tracker = VisualEventTracker(
+        stability_frames=3,
+        initial_stability_frames=2,
+        round_id_factory=lambda _: "round-real-regression",
+    )
+    initial = _scene(
+        frame_id=1,
+        visible_hand=REAL_LANDLORD_HAND,
+        self_turn=True,
+    )
+    tracker.update(initial)
+    tracker.update(_scene(
+        frame_id=2,
+        visible_hand=REAL_LANDLORD_HAND,
+        self_turn=True,
+    ))
+    remaining_hand = tuple(
+        rank
+        for rank in REAL_LANDLORD_HAND
+        if rank not in {"7", "2"}
+    )
+    current = dict(
+        visible_hand=remaining_hand,
+        right_signal=VisualSignal.PLAY,
+        right_cards=("10", "10", "10", "10"),
+        right_remaining=13,
+        left_remaining=17,
+        self_turn=True,
+    )
+
+    tracker.update(_scene(frame_id=3, **current))
+    self_play = tracker.update(_scene(frame_id=4, **current))
+    tracker.update(_scene(frame_id=5, **current))
+    tracker.update(_scene(frame_id=6, **current))
+    right_play = tracker.update(_scene(frame_id=7, **current))
+    left_pass = tracker.update(_scene(frame_id=8, **current))
+
+    assert self_play.event is not None
+    assert self_play.event.cards.cards == ("7", "2", "2", "2")
+    assert right_play.event is not None
+    assert right_play.event.cards.cards == ("10", "10", "10", "10")
+    assert left_pass.event is not None and left_pass.event.is_pass
+    assert left_pass.state is not None
+    assert left_pass.state.revision == 3
+    assert left_pass.state.current_actor is PlayerSeat.SELF
+    assert left_pass.state.trick_target.cards == ("10", "10", "10", "10")
+    assert left_pass.state.decision_ready is True
+
+
 def test_visual_tracker_blocks_remaining_count_mismatch() -> None:
     tracker = VisualEventTracker(
         stability_frames=1,
@@ -438,6 +493,12 @@ def test_visual_tracker_reconstructs_stable_landlord_opening_play() -> None:
         for warning in initialized.warnings
     )
     assert "安全重建" in initialized.message
+
+    same_opening = tracker.update(_landlord_opening_scene(frame_id=3))
+    assert same_opening.initialized is False
+    assert same_opening.state is not None
+    assert same_opening.state.round_id == "round-opening-bootstrap"
+    assert same_opening.state.revision == 1
 
 
 def test_visual_tracker_refuses_opening_when_verified_count_conflicts() -> None:

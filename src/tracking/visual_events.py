@@ -77,6 +77,7 @@ class VisualEventTracker:
         initial_stability_frames: int | None = None,
         confidence_threshold: float = 0.70,
         round_id_factory: RoundIdFactory | None = None,
+        initial_state: ObservableGameState | None = None,
     ) -> None:
         if stability_frames <= 0:
             raise ValueError("stability_frames must be positive")
@@ -92,8 +93,25 @@ class VisualEventTracker:
         self.round_id_factory = round_id_factory or (
             lambda scene: f"live-{int(scene.timestamp * 1000)}"
         )
-        self.mode = VisualTrackerMode.WAITING_FOR_ROUND
-        self._tracker: GameStateTracker | None = None
+        if (
+            initial_state is not None
+            and initial_state.phase is not RoundPhase.PLAYING
+        ):
+            raise ValueError("resumed visual state must be in playing phase")
+        self.mode = (
+            VisualTrackerMode.TRACKING
+            if initial_state is not None
+            else VisualTrackerMode.WAITING_FOR_ROUND
+        )
+        self._tracker: GameStateTracker | None = (
+            GameStateTracker(
+                initial_state,
+                validator=validate_observed_action,
+                confidence_threshold=confidence_threshold,
+            )
+            if initial_state is not None
+            else None
+        )
         self._initial_stable = _StableValue()
         self._seat_stable = {seat: _StableValue() for seat in PlayerSeat}
         self._armed = {seat: False for seat in PlayerSeat}
@@ -124,6 +142,12 @@ class VisualEventTracker:
                 VisualTrackerMode.UNCERTAIN,
                 VisualTrackerMode.FINISHED,
             }
+            if (
+                self._tracker is not None
+                and self.mode is VisualTrackerMode.TRACKING
+                and _is_new_initial_scene(self._tracker.state, initial)
+            ):
+                should_initialize = True
             if should_initialize and stable_count >= self.initial_stability_frames:
                 return self._initialize(scene, initial)
             if should_initialize:
@@ -443,6 +467,39 @@ class _SelfHandChange:
     cards: CardSet | None
     confidence: float
     error: str | None = None
+
+
+def _is_new_initial_scene(
+    state: ObservableGameState,
+    initial: _InitialStatePayload,
+) -> bool:
+    """Tell a resumed/active round apart from a newly dealt full hand."""
+
+    if state.landlord is not initial.landlord:
+        return True
+    if state.self_hand != CardSet.parse(initial.hand):
+        return True
+    expected_remaining = dict(initial.remaining)
+    expected_revision = 0
+    expected_actor = initial.landlord
+    expected_trick = CardSet(())
+    expected_played: tuple[str, ...] = ()
+    if initial.opening_cards:
+        expected_revision = 1
+        expected_remaining[initial.landlord] -= len(initial.opening_cards)
+        expected_actor = state.next_player(initial.landlord)
+        expected_trick = initial.opening_card_set
+        expected_played = initial.opening_card_set.cards
+    return not (
+        state.revision == expected_revision
+        and state.current_actor is expected_actor
+        and state.trick_target == expected_trick
+        and state.played_cards == expected_played
+        and all(
+            state.remaining_for(seat) == expected_remaining[seat]
+            for seat in PlayerSeat
+        )
+    )
 
 
 def _initial_state_payload(

@@ -443,6 +443,30 @@ class SceneRecognizer:
             warnings=tuple(dict.fromkeys(warnings)),
         )
 
+    def seed_hand_references(
+        self,
+        full_window_image: Image.Image,
+    ) -> tuple[VisualCard, ...]:
+        """Restore per-round rank references from a saved initial table frame."""
+
+        hand_image = self.config.crop(full_window_image, "self_hand")
+        visible_count = infer_visible_hand_count(hand_image, maximum=20)
+        if visible_count not in {17, 20}:
+            return ()
+        cards = self._observe_hand(
+            hand_image,
+            expected_count=visible_count,
+            visible_count=visible_count,
+        )
+        try:
+            card_set = CardSet.parse(card.rank for card in cards)
+        except ValueError:
+            return ()
+        if len(card_set) != visible_count:
+            return ()
+        self._remember_rank_references(hand_image, cards)
+        return cards
+
     def _observe_seat(
         self,
         image: Image.Image,
@@ -536,14 +560,21 @@ class SceneRecognizer:
             return ()
         crops = [image.crop(box) for box in boxes]
         predictions = self.predictor(crops)
-        return tuple(
-            VisualCard(
-                rank=prediction.rank,
-                confidence=prediction.confidence,
-                box=boxes[index],
+        observed: list[VisualCard] = []
+        for index, prediction in enumerate(predictions):
+            rank = prediction.rank
+            confidence = prediction.confidence
+            reference_match = self._match_rank_reference(crops[index])
+            if reference_match is not None:
+                rank, confidence = reference_match
+            observed.append(
+                VisualCard(
+                    rank=rank,
+                    confidence=confidence,
+                    box=boxes[index],
+                )
             )
-            for index, prediction in enumerate(predictions)
-        )
+        return tuple(observed)
 
     def _remember_rank_references(
         self,
@@ -975,10 +1006,23 @@ def infer_overlapping_hand_boxes(
         max_gap=2,
     )
     if row_runs:
-        start_y, card_bottom = max(
-            row_runs,
-            key=lambda run: run[1] - run[0],
+        # In-game notices such as “您当前没有牌大过对方” can cover the
+        # middle of every hand card and split the white card body into two
+        # runs.  The old longest-run rule then started below the notice and
+        # classified blank card bottoms.  Preserve the earliest card top and
+        # the latest card bottom so rank crops stay anchored at the glyphs.
+        early_runs = [
+            run
+            for run in row_runs
+            if run[0] <= round(height * 0.25)
+            and run[1] - run[0] >= max(12, round(height * 0.12))
+        ]
+        start_y = (
+            min(run[0] for run in early_runs)
+            if early_runs
+            else max(row_runs, key=lambda run: run[1] - run[0])[0]
         )
+        card_bottom = max(run[1] for run in row_runs)
     else:
         start_y = max(0, round(height * 0.04))
         card_bottom = height

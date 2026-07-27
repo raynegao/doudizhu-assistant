@@ -2,10 +2,13 @@ from __future__ import annotations
 
 import json
 import time
+from collections import Counter
 from concurrent.futures import Future, ThreadPoolExecutor
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Callable, Iterator, Protocol
+
+from PIL import Image
 
 from src.capture.screen_geometry import (
     CapturedWindow,
@@ -20,6 +23,7 @@ from src.logic.monte_carlo import (
     recommend_phase4,
 )
 from src.pipeline.live_layout import LiveLayoutConfig
+from src.state.cards import CardSet, parse_cards
 from src.state.events import PlayerSeat, RoundPhase
 from src.state.observable_state import ObservableGameState
 from src.tracking.visual_events import (
@@ -36,6 +40,7 @@ class WindowCapture(Protocol):
 
 
 DecisionFn = Callable[[ObservableGameState, MonteCarloSettings], Phase4DecisionResult]
+_ROUND_RESUME_MAX_AGE_SECONDS = 30 * 60
 
 
 @dataclass(frozen=True)
@@ -121,11 +126,16 @@ class LiveGameRuntime:
         self.config = config
         self.frame_source = frame_source or MacWindowCapture(config.app_name)
         self.recognizer = recognizer or SceneRecognizer(config)
-        self.tracker = tracker or VisualEventTracker(
-            stability_frames=config.stability_frames,
-            initial_stability_frames=config.initial_stability_frames,
-            confidence_threshold=config.confidence_threshold,
-        )
+        if tracker is not None:
+            self.tracker = tracker
+        else:
+            resumed_state = _load_round_context(config, self.recognizer)
+            self.tracker = VisualEventTracker(
+                stability_frames=config.stability_frames,
+                initial_stability_frames=config.initial_stability_frames,
+                confidence_threshold=config.confidence_threshold,
+                initial_state=resumed_state,
+            )
         self.decision_fn = decision_fn
         self._sleeper = sleeper
         self._next_frame_id = 1
@@ -169,6 +179,7 @@ class LiveGameRuntime:
         _write_jsonl(self.config.log_file, scene.to_log_payload())
 
         update = self.tracker.update(scene)
+        self._persist_round_context(frame, update)
         if update.event is not None:
             _write_jsonl(self.config.log_file, update.event.to_log_payload())
         _write_jsonl(self.config.log_file, update.to_log_payload())
@@ -407,6 +418,132 @@ class LiveGameRuntime:
         )
         frame.image.save(path)
         self._last_error_frame = key
+
+    def _persist_round_context(
+        self,
+        frame: CapturedWindow,
+        update: VisualTrackerUpdate,
+    ) -> None:
+        state = update.state
+        if state is not None and state.phase is RoundPhase.FINISHED:
+            _clear_round_context(self.config)
+            return
+        if (
+            state is None
+            or state.phase is not RoundPhase.PLAYING
+            or (not update.initialized and update.event is None)
+        ):
+            return
+        if update.initialized:
+            seed_path = _round_seed_path(self.config)
+            seed_path.parent.mkdir(parents=True, exist_ok=True)
+            frame.image.save(seed_path)
+        _write_round_checkpoint(_round_state_path(self.config), state)
+
+
+def _round_state_path(config: LiveLayoutConfig) -> Path:
+    return config.log_file.with_suffix(".state.json")
+
+
+def _round_seed_path(config: LiveLayoutConfig) -> Path:
+    return config.error_frames_dir.parent / "runtime" / "current_round_initial.png"
+
+
+def _load_round_context(
+    config: LiveLayoutConfig,
+    recognizer: SceneRecognizer,
+) -> ObservableGameState | None:
+    state_path = _round_state_path(config)
+    seed_path = _round_seed_path(config)
+    if not state_path.exists() or not seed_path.exists():
+        return None
+    try:
+        age_seconds = max(0.0, time.time() - state_path.stat().st_mtime)
+        if age_seconds > _ROUND_RESUME_MAX_AGE_SECONDS:
+            return None
+        payload = json.loads(state_path.read_text(encoding="utf-8"))
+        state = _state_from_checkpoint(payload)
+        with Image.open(seed_path) as source:
+            seed_cards = recognizer.seed_hand_references(source.convert("RGB"))
+    except (
+        AttributeError,
+        KeyError,
+        OSError,
+        TypeError,
+        ValueError,
+        json.JSONDecodeError,
+    ):
+        return None
+    if not seed_cards:
+        return None
+    seed_counts = Counter(card.rank for card in seed_cards)
+    if Counter(state.self_hand.cards) - seed_counts:
+        return None
+    return state
+
+
+def _state_from_checkpoint(payload: object) -> ObservableGameState:
+    if not isinstance(payload, dict):
+        raise ValueError("live round checkpoint must be an object")
+    if payload.get("phase") != RoundPhase.PLAYING.value:
+        raise ValueError("live round checkpoint is not active")
+    remaining_payload = payload.get("remaining_cards")
+    if not isinstance(remaining_payload, dict):
+        raise ValueError("live round checkpoint remaining_cards is invalid")
+    revision = int(payload.get("revision", 0))
+    return ObservableGameState(
+        round_id=str(payload["round_id"]),
+        revision=revision,
+        phase=RoundPhase.PLAYING,
+        landlord=PlayerSeat(str(payload["landlord"])),
+        turn_order=tuple(
+            PlayerSeat(str(seat))
+            for seat in payload.get("turn_order", ())
+        ),
+        self_hand=CardSet.parse(payload.get("self_hand", ())),
+        remaining_cards=tuple(
+            (seat, int(remaining_payload[seat.value]))
+            for seat in PlayerSeat
+        ),
+        current_actor=PlayerSeat(str(payload["current_actor"])),
+        trick_target=CardSet.parse(payload.get("trick_target", ())),
+        trick_leader=(
+            PlayerSeat(str(payload["trick_leader"]))
+            if payload.get("trick_leader") is not None
+            else None
+        ),
+        consecutive_passes=int(payload.get("consecutive_passes", 0)),
+        played_cards=parse_cards(payload.get("played_cards", ())),
+        last_sequence_no=int(payload.get("last_sequence_no", revision)),
+        state_confidence=float(payload.get("state_confidence", 1.0)),
+        warnings=tuple(str(item) for item in payload.get("warnings", ())),
+    )
+
+
+def _write_round_checkpoint(
+    path: Path,
+    state: ObservableGameState,
+) -> None:
+    payload = {
+        **state.to_log_payload(),
+        "last_sequence_no": state.last_sequence_no,
+        "saved_at": time.time(),
+    }
+    path.parent.mkdir(parents=True, exist_ok=True)
+    temporary = path.with_suffix(path.suffix + ".tmp")
+    temporary.write_text(
+        json.dumps(payload, ensure_ascii=False, indent=2) + "\n",
+        encoding="utf-8",
+    )
+    temporary.replace(path)
+
+
+def _clear_round_context(config: LiveLayoutConfig) -> None:
+    for path in (_round_state_path(config), _round_seed_path(config)):
+        try:
+            path.unlink()
+        except FileNotFoundError:
+            pass
 
 
 def _decision_allowed(state: ObservableGameState | None) -> bool:
