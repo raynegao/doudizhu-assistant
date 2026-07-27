@@ -13,6 +13,7 @@ from src.vision.scene_recognizer import (
     SeatRole,
     TemplateMatcher,
     _classify_role_badge,
+    _classify_turn_controls,
     _decode_glyph_signature,
     _encode_glyph_signature,
     _glyph_similarity,
@@ -78,6 +79,30 @@ def test_role_badge_classifier_rejects_background_without_glyphs() -> None:
 
     assert role is SeatRole.UNKNOWN
     assert confidence == 0.0
+
+
+def test_turn_control_classifier_uses_yellow_buttons_not_blue_background() -> None:
+    inactive = Image.new("RGB", (500, 240), (43, 73, 145))
+    active = inactive.copy()
+    draw = ImageDraw.Draw(active)
+    draw.rounded_rectangle(
+        (45, 55, 225, 205),
+        radius=20,
+        fill=(242, 166, 31),
+    )
+    draw.rounded_rectangle(
+        (275, 55, 455, 205),
+        radius=20,
+        fill=(242, 166, 31),
+    )
+
+    active_value, active_confidence = _classify_turn_controls(active)
+    inactive_value, inactive_confidence = _classify_turn_controls(inactive)
+
+    assert active_value is True
+    assert active_confidence >= 0.94
+    assert inactive_value is False
+    assert inactive_confidence >= 0.95
 
 
 def test_segment_card_boxes_finds_separated_face_up_cards() -> None:

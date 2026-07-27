@@ -429,13 +429,17 @@ class SceneRecognizer:
             )
             for seat in PlayerSeat
         )
-        turn_match = self.templates.classify("turn", self.config.crop(frame.image, "self_turn"))
-        self_turn: bool | None
-        if turn_match.confidence < self.config.template_threshold:
-            self_turn = None
-            warnings.append("self_turn_unavailable")
-        else:
-            self_turn = turn_match.label == "active"
+        turn_crop = self.config.crop(frame.image, "self_turn")
+        self_turn, turn_confidence = _classify_turn_controls(turn_crop)
+        if self_turn is None:
+            turn_match = self.templates.classify("turn", turn_crop)
+            if turn_match.confidence < self.config.template_threshold:
+                self_turn = None
+                turn_confidence = turn_match.confidence
+                warnings.append("self_turn_unavailable")
+            else:
+                self_turn = turn_match.label == "active"
+                turn_confidence = turn_match.confidence
 
         confidences = [
             confidence
@@ -449,8 +453,8 @@ class SceneRecognizer:
         ]
         if self_hand:
             confidences.append(_minimum_card_confidence(self_hand))
-        if turn_match.confidence > 0:
-            confidences.append(turn_match.confidence)
+        if turn_confidence > 0:
+            confidences.append(turn_confidence)
         scene_confidence = min(confidences) if confidences else 0.0
         return SceneObservation(
             frame_id=frame.frame_id,
@@ -459,7 +463,7 @@ class SceneRecognizer:
             self_hand=self_hand,
             seats=seats,
             self_turn=self_turn,
-            self_turn_confidence=turn_match.confidence,
+            self_turn_confidence=turn_confidence,
             confidence=scene_confidence,
             warnings=tuple(dict.fromkeys(warnings)),
         )
@@ -761,6 +765,43 @@ def _classify_role_badge(image: Image.Image) -> tuple[SeatRole, float]:
         confidence = min(0.999, 0.90 + white_ratio * 2.0)
         return SeatRole.FARMER, confidence
     return SeatRole.UNKNOWN, max(yellow_ratio, white_ratio)
+
+
+def _classify_turn_controls(
+    image: Image.Image,
+) -> tuple[bool | None, float]:
+    """Detect the yellow play controls without relying on blue background.
+
+    Whole-ROI active templates are mostly the unchanged table color.  With no
+    explicit inactive template, a blank opponent-turn crop can therefore look
+    deceptively similar to the active sample.  The current Mac client renders
+    large orange/yellow Hint and Play buttons only on the local turn, so their
+    saturated warm pixels are the transferable signal.
+    """
+
+    rgb = np.asarray(image.convert("RGB"), dtype=np.int16)
+    if rgb.size == 0:
+        return None, 0.0
+    red, green, blue = (
+        rgb[:, :, 0],
+        rgb[:, :, 1],
+        rgb[:, :, 2],
+    )
+    yellow = (
+        (red > 150)
+        & (green > 80)
+        & (blue < 110)
+        & ((red - blue) > 65)
+        & ((green - blue) > 25)
+    )
+    yellow_ratio = float(yellow.mean())
+    if yellow_ratio >= 0.08:
+        confidence = min(0.999, 0.94 + (yellow_ratio - 0.08) * 0.20)
+        return True, confidence
+    if yellow_ratio <= 0.02:
+        confidence = min(0.999, 0.95 + (0.02 - yellow_ratio) * 2.0)
+        return False, confidence
+    return None, max(0.0, 1.0 - abs(yellow_ratio - 0.05) / 0.03)
 
 
 def _resolve_roles_from_hand_count(
