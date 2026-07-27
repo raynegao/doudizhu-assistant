@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import json
 import time
+from dataclasses import replace
 from pathlib import Path
 
 from PIL import Image
@@ -123,6 +124,31 @@ class _PostBiddingRecognizer:
             self_turn_confidence=0.99,
             confidence=0.99,
         )
+
+
+class _FlakyPostBiddingRecognizer(_PostBiddingRecognizer):
+    def __init__(self) -> None:
+        self.calls = 0
+
+    def observe(self, frame: CapturedWindow) -> SceneObservation:
+        self.calls += 1
+        scene = super().observe(frame)
+        if self.calls >= 3:
+            return scene
+        seats = tuple(
+            (
+                replace(
+                    seat,
+                    remaining_count=None,
+                    remaining_confidence=0.0,
+                    remaining_verified=False,
+                )
+                if seat.seat is PlayerSeat.RIGHT
+                else seat
+            )
+            for seat in scene.seats
+        )
+        return replace(scene, seats=seats)
 
 
 class _ResumeRecognizer(_Recognizer):
@@ -374,3 +400,86 @@ def test_live_runtime_rejects_checkpoint_from_previous_ui_session(
         runtime.close()
 
     assert restored is None
+
+
+def test_live_runtime_manual_scan_initializes_without_stability_wait(
+    tmp_path: Path,
+) -> None:
+    config = LiveLayoutConfig(
+        log_file=tmp_path / "live.jsonl",
+        error_frames_dir=tmp_path / "errors",
+        initial_stability_frames=3,
+        stability_frames=3,
+        simulations=2,
+        max_depth=4,
+        time_budget_ms=0,
+        min_rollouts_per_action=1,
+        top_k=1,
+        max_candidates=2,
+    )
+    runtime = LiveGameRuntime(
+        config,
+        frame_source=_FrameSource(),
+        recognizer=_PostBiddingRecognizer(),
+        sleeper=lambda _: None,
+    )
+    try:
+        runtime.request_current_scan()
+        scanned = runtime.run_once()
+    finally:
+        runtime.close()
+
+    assert scanned.tracker_update.initialized is True
+    assert scanned.state is not None
+    assert scanned.state.current_actor is PlayerSeat.SELF
+    assert scanned.state.decision_ready is True
+    assert "已扫描当前牌局" in scanned.tracker_update.message
+    events = [
+        json.loads(line)
+        for line in config.log_file.read_text(encoding="utf-8").splitlines()
+    ]
+    scan_events = [
+        event for event in events
+        if event["event"] == "manual_current_scan"
+    ]
+    assert len(scan_events) == 1
+    assert scan_events[0]["success"] is True
+
+
+def test_live_runtime_manual_scan_retries_transient_ocr_failures(
+    tmp_path: Path,
+) -> None:
+    config = LiveLayoutConfig(
+        log_file=tmp_path / "live.jsonl",
+        error_frames_dir=tmp_path / "errors",
+        simulations=2,
+        max_depth=4,
+        time_budget_ms=0,
+        min_rollouts_per_action=1,
+        top_k=1,
+        max_candidates=2,
+    )
+    runtime = LiveGameRuntime(
+        config,
+        frame_source=_FrameSource(),
+        recognizer=_FlakyPostBiddingRecognizer(),
+        sleeper=lambda _: None,
+    )
+    try:
+        runtime.request_current_scan()
+        first = runtime.run_once()
+        second = runtime.run_once()
+        third = runtime.run_once()
+    finally:
+        runtime.close()
+
+    assert first.current_scan_pending is True
+    assert second.current_scan_pending is True
+    assert third.current_scan_pending is False
+    assert third.tracker_update.initialized is True
+    events = [
+        json.loads(line)
+        for line in config.log_file.read_text(encoding="utf-8").splitlines()
+        if json.loads(line)["event"] == "manual_current_scan"
+    ]
+    assert [event["retrying"] for event in events] == [True, True, False]

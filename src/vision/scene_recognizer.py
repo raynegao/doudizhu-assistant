@@ -16,7 +16,7 @@ import torch
 
 from src.capture.screen_geometry import CapturedWindow
 from src.pipeline.live_layout import LiveLayoutConfig
-from src.state.cards import CardSet
+from src.state.cards import CardSet, normalize_rank
 from src.state.events import PlayerSeat
 from src.vision.card_classifier import (
     CardPrediction,
@@ -139,6 +139,17 @@ class TemplateMatcher:
 
     def available_labels(self, kind: str) -> tuple[str, ...]:
         return tuple(sorted({label for label, _, _ in self._templates(kind)}))
+
+    def template_images(
+        self,
+        kind: str,
+    ) -> tuple[tuple[str, Image.Image], ...]:
+        """Return cached template images for feature-based recognizers."""
+
+        return tuple(
+            (label, image.copy())
+            for label, _, image in self._templates(kind)
+        )
 
     def classify(
         self,
@@ -319,6 +330,7 @@ class SceneRecognizer:
             self.predictor = predictor
         self._rank_references: dict[str, list[frozenset[int]]] = {}
         self._reference_hand_fingerprint: tuple[str, ...] | None = None
+        self._load_rank_reference_templates()
         if remaining_reader is not None:
             self.remaining_reader: RemainingReader | None = remaining_reader
         elif platform.system() == "Darwin":
@@ -570,7 +582,11 @@ class SceneRecognizer:
         for index, prediction in enumerate(predictions):
             rank = prediction.rank
             confidence = prediction.confidence
-            reference_match = self._match_rank_reference(crops[index])
+            reference_match = self._match_rank_reference(
+                crops[index],
+                minimum_similarity=0.68,
+                minimum_margin=0.05,
+            )
             if reference_match is not None:
                 rank, confidence = reference_match
             observed.append(
@@ -581,6 +597,24 @@ class SceneRecognizer:
                 )
             )
         return tuple(observed)
+
+    def _load_rank_reference_templates(self) -> None:
+        for label, image in self.templates.template_images("rank"):
+            try:
+                rank = normalize_rank(label)
+            except ValueError:
+                continue
+            signature = _rank_glyph_signature(image)
+            if not signature:
+                continue
+            references = self._rank_references.setdefault(rank, [])
+            if any(
+                _glyph_similarity(signature, existing) >= 0.98
+                for existing in references
+            ):
+                continue
+            references.append(signature)
+            del references[:-12]
 
     def _remember_rank_references(
         self,
@@ -609,6 +643,9 @@ class SceneRecognizer:
     def _match_rank_reference(
         self,
         card_image: Image.Image,
+        *,
+        minimum_similarity: float = 0.78,
+        minimum_margin: float = 0.12,
     ) -> tuple[str, float] | None:
         signature = _rank_glyph_signature(card_image)
         if not signature:
@@ -628,9 +665,21 @@ class SceneRecognizer:
             return None
         best_score, best_rank = scores[-1]
         runner_up = scores[-2][0] if len(scores) > 1 else 0.0
-        if best_score < 0.78 or best_score - runner_up < 0.12:
+        if (
+            best_score < minimum_similarity
+            or best_score - runner_up < minimum_margin
+        ):
             return None
-        return best_rank, min(0.999, max(self.config.confidence_threshold, best_score))
+        # IoU/Jaccard between rasterized glyphs is intentionally conservative:
+        # antialiasing and scale changes keep an otherwise unambiguous real
+        # match around 0.70-0.90.  Once both the absolute and runner-up gates
+        # have passed, calibrate that feature score into an observation
+        # confidence instead of treating raw pixel overlap as probability.
+        calibrated_confidence = 0.75 + best_score * 0.25
+        return best_rank, min(
+            0.999,
+            max(self.config.confidence_threshold, calibrated_confidence),
+        )
 
 
 def _template_similarity(image: Image.Image, template: Image.Image) -> float:
@@ -811,7 +860,10 @@ def _rank_glyph_signature(image: Image.Image) -> frozenset[int]:
             and bottom - top > height * 0.12
             and right - left > width * 0.12
             and bottom - top < height * 0.70
-            and right - left < width * 0.70
+            # Wide glyphs such as K can occupy about 73% of the visible card
+            # crop.  The previous 70% ceiling discarded them completely,
+            # which made a fresh mid-game scan depend on a lucky CNN result.
+            and right - left < width * 0.85
         ):
             candidates.append((component, (left, top, right, bottom)))
     if not candidates:
@@ -967,12 +1019,23 @@ def segment_card_boxes(image: Image.Image) -> tuple[tuple[int, int, int, int], .
         if not 0.28 <= aspect_ratio <= 1.20 or white_ratio < 0.60:
             continue
         boxes.append((left, top, right, bottom))
-    if boxes:
-        return tuple(boxes)
-    return _segment_overlapping_card_boxes(
+    overlapping_boxes = _segment_overlapping_card_boxes(
         rgb,
         white_mask=white_mask,
     )
+    if len(boxes) == 1 and len(overlapping_boxes) > 1:
+        left, top, right, bottom = boxes[0]
+        merged_aspect_ratio = (right - left) / max(1, bottom - top)
+        # Two tightly overlapped table cards form one continuous white region.
+        # Its bounding box is almost square, while one ordinary face-up card is
+        # substantially narrower than it is tall. Prefer the vertical-edge
+        # starts in that case so a pair such as QQ/88 is classified card by
+        # card instead of being sent to the CNN as one merged crop.
+        if merged_aspect_ratio >= 0.82:
+            return overlapping_boxes
+    if boxes:
+        return tuple(boxes)
+    return overlapping_boxes
 
 
 def infer_visible_hand_count(

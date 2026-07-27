@@ -45,6 +45,7 @@ class ObservableGameState:
     trick_leader: PlayerSeat | None = None
     consecutive_passes: int = 0
     played_cards: tuple[str, ...] = ()
+    hidden_played_count: int = 0
     history: tuple[ObservedAction, ...] = ()
     processed_events: tuple[tuple[str, str], ...] = ()
     last_sequence_no: int = 0
@@ -60,6 +61,8 @@ class ObservableGameState:
             raise ValueError("state_confidence must be between 0 and 1")
         if self.consecutive_passes not in {0, 1}:
             raise ValueError("consecutive_passes must be 0 or 1 in a valid active trick")
+        if self.hidden_played_count < 0:
+            raise ValueError("hidden_played_count cannot be negative")
         if self.trick_target and self.trick_leader is None:
             raise ValueError("trick_leader is required when trick_target is not pass")
         if not self.trick_target and self.consecutive_passes:
@@ -91,7 +94,12 @@ class ObservableGameState:
             Counter(self.trick_target.cards) <= Counter(self.played_cards)
         ):
             raise ValueError("trick_target must already be included in played_cards")
-        if sum(remaining.values()) + len(self.played_cards) > len(FULL_DECK):
+        if (
+            sum(remaining.values())
+            + len(self.played_cards)
+            + self.hidden_played_count
+            > len(FULL_DECK)
+        ):
             raise ValueError("remaining cards plus played cards exceed the 54-card deck")
         if not self.trick_target and self.trick_leader is not None:
             raise ValueError("trick_leader must be empty when there is no trick target")
@@ -107,6 +115,7 @@ class ObservableGameState:
         turn_order: Iterable[PlayerSeat | str] = DEFAULT_TURN_ORDER,
         remaining_cards: Mapping[PlayerSeat | str, int] | None = None,
         played_cards: str | Iterable[str] | None = None,
+        hidden_played_count: int = 0,
         last_play: str | Iterable[str] | None = None,
         last_player: PlayerSeat | str | None = None,
         consecutive_passes: int = 0,
@@ -122,7 +131,11 @@ class ObservableGameState:
         landlord_seat = PlayerSeat(landlord)
         remaining = _normalize_remaining(hand_set, landlord_seat, remaining_cards)
         warnings: list[str] = []
-        accounted = sum(dict(remaining).values()) + len(known_played)
+        accounted = (
+            sum(dict(remaining).values())
+            + len(known_played)
+            + hidden_played_count
+        )
         if accounted != len(FULL_DECK):
             warnings.append(
                 f"incomplete deck accounting: remaining+played={accounted}, expected={len(FULL_DECK)}"
@@ -146,6 +159,7 @@ class ObservableGameState:
             trick_leader=PlayerSeat(last_player) if last_player is not None else None,
             consecutive_passes=consecutive_passes,
             played_cards=known_played,
+            hidden_played_count=hidden_played_count,
             state_confidence=state_confidence,
             warnings=tuple(warnings),
         )
@@ -179,7 +193,8 @@ class ObservableGameState:
             and self.winner is None
             and self.current_actor is PlayerSeat.SELF
             and self.state_confidence >= 0.70
-            and len(self.unknown_cards) == opponent_count
+            and len(self.unknown_cards)
+            == opponent_count + self.hidden_played_count
             and self._turn_is_consistent()
         )
 
@@ -223,6 +238,7 @@ class ObservableGameState:
             "trick_leader": self.trick_leader.value if self.trick_leader else None,
             "consecutive_passes": self.consecutive_passes,
             "played_cards": list(self.played_cards),
+            "hidden_played_count": self.hidden_played_count,
             "unknown_card_count": len(self.unknown_cards),
             "state_confidence": self.state_confidence,
             "decision_ready": self.decision_ready,

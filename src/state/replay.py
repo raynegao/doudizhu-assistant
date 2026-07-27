@@ -64,6 +64,7 @@ def load_event_replay(
             for seat, count in remaining_payload.items()
         },
         played_cards=start.get("played_cards", ()),
+        hidden_played_count=int(start.get("hidden_played_count", 0)),
         last_play=start.get("last_play", ()),
         last_player=start.get("last_player"),
         consecutive_passes=int(start.get("consecutive_passes", 0)),

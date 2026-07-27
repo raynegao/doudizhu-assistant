@@ -4,9 +4,11 @@ from pathlib import Path
 
 from PIL import Image, ImageDraw
 
+from src.pipeline.live_layout import LiveLayoutConfig
 from src.state.events import PlayerSeat
 from src.vision.scene_recognizer import (
     RemainingTextMatch,
+    SceneRecognizer,
     SeatRole,
     TemplateMatcher,
     _classify_role_badge,
@@ -104,6 +106,25 @@ def test_segment_card_boxes_finds_overlapped_cards() -> None:
     assert len(boxes) == 4
     assert abs(boxes[0][0] - 20) <= 2
     assert [box[0] for box in boxes[1:]] == [85, 150, 215]
+
+
+def test_segment_card_boxes_splits_tight_pair_in_single_white_region() -> None:
+    image = Image.new("RGB", (780, 420), (45, 75, 145))
+    draw = ImageDraw.Draw(image)
+    for left in (14, 88):
+        draw.rounded_rectangle(
+            (left, 91, left + 168, 332),
+            radius=8,
+            fill="white",
+            outline=(75, 75, 75),
+            width=2,
+        )
+
+    boxes = segment_card_boxes(image)
+
+    assert len(boxes) == 2
+    assert abs(boxes[0][0] - 14) <= 2
+    assert abs(boxes[1][0] - 88) <= 2
 
 
 def test_segment_card_boxes_ignores_separate_button_below_landlord_card() -> None:
@@ -250,6 +271,29 @@ def test_rank_glyph_signature_is_scale_stable_and_rank_specific() -> None:
 
     assert _glyph_similarity(small_six, large_six) >= 0.75
     assert _glyph_similarity(small_six, large_eight) < 0.70
+
+
+def test_scene_recognizer_preloads_real_rank_glyph_templates(
+    tmp_path: Path,
+) -> None:
+    template_dir = tmp_path / "rank" / "6"
+    template_dir.mkdir(parents=True)
+    _synthetic_rank_card(1.0, rank="6").save(template_dir / "sample.png")
+    recognizer = SceneRecognizer(
+        LiveLayoutConfig(templates_dir=tmp_path),
+        predictor=lambda _: (),
+        remaining_reader=lambda _: {},
+    )
+
+    match = recognizer._match_rank_reference(  # noqa: SLF001
+        _synthetic_rank_card(1.2, rank="6"),
+        minimum_similarity=0.68,
+        minimum_margin=0.05,
+    )
+
+    assert match is not None
+    assert match[0] == "6"
+    assert match[1] >= 0.9
 
 
 def test_native_text_count_overrides_unverified_whole_roi_template() -> None:

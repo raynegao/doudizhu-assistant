@@ -615,3 +615,226 @@ def test_visual_tracker_refuses_opening_when_verified_count_conflicts() -> None:
 
     assert update.mode is VisualTrackerMode.WAITING_FOR_ROUND
     assert update.state is None
+
+
+def test_visual_tracker_manual_scan_rebuilds_midgame_with_unknown_history() -> None:
+    tracker = VisualEventTracker(stability_frames=3)
+    visible_hand = REAL_LANDLORD_HAND[:16]
+
+    update = tracker.scan_current_scene(_scene(
+        frame_id=20,
+        visible_hand=visible_hand,
+        left_signal=VisualSignal.PLAY,
+        left_cards=("4",),
+        left_remaining=7,
+        right_remaining=12,
+        self_turn=True,
+    ))
+
+    assert update.initialized is True
+    assert update.mode is VisualTrackerMode.TRACKING
+    assert update.state is not None
+    assert update.state.current_actor is PlayerSeat.SELF
+    assert update.state.trick_leader is PlayerSeat.LEFT
+    assert update.state.trick_target.cards == ("4",)
+    assert update.state.hidden_played_count == 18
+    assert update.state.decision_ready is True
+    assert "中途近似模型" in update.message
+    assert "historical_played_cards_unknown=18" in update.state.warnings
+
+
+def test_visual_tracker_auto_scans_stable_midgame_on_self_turn() -> None:
+    tracker = VisualEventTracker(
+        stability_frames=3,
+        initial_stability_frames=2,
+    )
+    scene = _scene(
+        frame_id=30,
+        visible_hand=REAL_LANDLORD_HAND[:16],
+        left_signal=VisualSignal.PLAY,
+        left_cards=("4",),
+        left_remaining=7,
+        right_remaining=12,
+        self_turn=True,
+    )
+
+    stabilizing = tracker.update(scene)
+    initialized = tracker.update(replace(
+        scene,
+        frame_id=31,
+        timestamp=31.0,
+    ))
+
+    assert stabilizing.state is None
+    assert "正在自动扫描当前牌局 1/2" in stabilizing.message
+    assert initialized.initialized is True
+    assert initialized.mode is VisualTrackerMode.TRACKING
+    assert initialized.state is not None
+    assert initialized.state.round_id.startswith("auto-scan-")
+    assert initialized.state.current_actor is PlayerSeat.SELF
+    assert initialized.state.trick_target.cards == ("4",)
+    assert "automatic_current_game_scan" in initialized.state.warnings
+
+
+def test_visual_tracker_auto_recovers_after_window_loss() -> None:
+    tracker = VisualEventTracker(
+        stability_frames=2,
+        initial_stability_frames=2,
+        round_id_factory=lambda _: "round-before-window-loss",
+    )
+    tracker.update(_scene(frame_id=1))
+    tracker.update(_scene(frame_id=2))
+    tracker.handle_window_unavailable("斗地主窗口已最小化")
+    recovered_scene = _scene(
+        frame_id=3,
+        visible_hand=LANDLORD_HAND[1:],
+        left_signal=VisualSignal.PLAY,
+        left_cards=("8",),
+        left_remaining=16,
+        right_remaining=17,
+        self_turn=True,
+    )
+
+    stabilizing = tracker.update(recovered_scene)
+    recovered = tracker.update(replace(
+        recovered_scene,
+        frame_id=4,
+        timestamp=4.0,
+    ))
+
+    assert stabilizing.mode is VisualTrackerMode.UNCERTAIN
+    assert stabilizing.state is not None
+    assert stabilizing.state.decision_ready is False
+    assert recovered.initialized is True
+    assert recovered.mode is VisualTrackerMode.TRACKING
+    assert recovered.state is not None
+    assert recovered.state.round_id.startswith("auto-scan-")
+    assert recovered.state.trick_target.cards == ("8",)
+    assert recovered.state.decision_ready is True
+
+
+def test_auto_scanned_midgame_continues_through_full_trick_cycle() -> None:
+    tracker = VisualEventTracker(
+        stability_frames=2,
+        initial_stability_frames=2,
+    )
+    starting_hand = REAL_LANDLORD_HAND[:16]
+    scan_scene = _scene(
+        frame_id=40,
+        visible_hand=starting_hand,
+        left_signal=VisualSignal.PLAY,
+        left_cards=("4",),
+        left_remaining=7,
+        right_remaining=12,
+        self_turn=True,
+    )
+    tracker.update(scan_scene)
+    initialized = tracker.update(replace(
+        scan_scene,
+        frame_id=41,
+        timestamp=41.0,
+    ))
+    assert initialized.initialized is True
+
+    right_play_scene = _scene(
+        frame_id=42,
+        visible_hand=starting_hand,
+        right_signal=VisualSignal.PLAY,
+        right_cards=("5",),
+        right_remaining=11,
+        left_signal=VisualSignal.PLAY,
+        left_cards=("4",),
+        left_remaining=7,
+        self_turn=False,
+    )
+    self_pass = tracker.update(right_play_scene)
+    tracker.update(replace(
+        right_play_scene,
+        frame_id=43,
+        timestamp=43.0,
+    ))
+    right_play = tracker.update(replace(
+        right_play_scene,
+        frame_id=44,
+        timestamp=44.0,
+    ))
+
+    assert self_pass.event is not None and self_pass.event.is_pass
+    assert self_pass.event.actor is PlayerSeat.SELF
+    assert right_play.event is not None
+    assert right_play.event.actor is PlayerSeat.RIGHT
+    assert right_play.event.cards.cards == ("5",)
+
+    left_pass = tracker.update(_scene(
+        frame_id=45,
+        visible_hand=starting_hand,
+        right_signal=VisualSignal.PLAY,
+        right_cards=("5",),
+        right_remaining=11,
+        left_remaining=7,
+        self_turn=True,
+    ))
+    assert left_pass.event is not None and left_pass.event.is_pass
+    assert left_pass.event.actor is PlayerSeat.LEFT
+    assert left_pass.state is not None
+    assert left_pass.state.current_actor is PlayerSeat.SELF
+    assert left_pass.state.trick_target.cards == ("5",)
+
+    after_single_cards = list(starting_hand)
+    after_single_cards.remove("6")
+    after_single = tuple(after_single_cards)
+    self_play_scene = _scene(
+        frame_id=46,
+        visible_hand=after_single,
+        right_remaining=11,
+        left_remaining=7,
+        self_turn=False,
+    )
+    tracker.update(self_play_scene)
+    self_play = tracker.update(replace(
+        self_play_scene,
+        frame_id=47,
+        timestamp=47.0,
+    ))
+    assert self_play.event is not None
+    assert self_play.event.actor is PlayerSeat.SELF
+    assert self_play.event.cards.cards == ("6",)
+
+    right_pass = tracker.update(_scene(
+        frame_id=48,
+        visible_hand=after_single,
+        right_remaining=11,
+        left_remaining=7,
+        self_turn=True,
+    ))
+    left_pass = tracker.update(_scene(
+        frame_id=49,
+        visible_hand=after_single,
+        right_remaining=11,
+        left_remaining=7,
+        self_turn=True,
+    ))
+
+    assert right_pass.event is not None and right_pass.event.is_pass
+    assert right_pass.event.actor is PlayerSeat.RIGHT
+    assert left_pass.event is not None and left_pass.event.is_pass
+    assert left_pass.event.actor is PlayerSeat.LEFT
+    assert left_pass.state is not None
+    assert left_pass.state.revision == 6
+    assert left_pass.state.current_actor is PlayerSeat.SELF
+    assert not left_pass.state.trick_target
+    assert left_pass.state.decision_ready is True
+
+
+def test_visual_tracker_manual_scan_requires_self_turn() -> None:
+    tracker = VisualEventTracker(stability_frames=3)
+
+    update = tracker.scan_current_scene(_scene(
+        frame_id=21,
+        visible_hand=REAL_LANDLORD_HAND,
+        self_turn=False,
+    ))
+
+    assert update.initialized is False
+    assert update.state is None
+    assert "轮到自己" in update.message

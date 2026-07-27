@@ -51,6 +51,20 @@ class LiveOverlayViewModel:
                 ),
             )
         state = snapshot.state
+        if snapshot.current_scan_pending:
+            return cls(
+                status=(
+                    "正在扫描当前牌局，等待牌面与余牌数稳定…\n"
+                    f"{snapshot.tracker_update.message}"
+                ),
+                roles="正在重新识别地主与当前行动者",
+                remaining="余牌：扫描中…",
+                trick="当前牌：扫描中…",
+                best="推荐：正在重新建模…",
+                top_k=(),
+                confidence=f"场面置信度：{snapshot.scene.confidence:.1%}",
+                warnings="\n".join(snapshot.scene.warnings[:4]),
+            )
         if state is None:
             return cls(
                 status=snapshot.tracker_update.message,
@@ -129,8 +143,9 @@ class LiveAssistantOverlay:
         *,
         runtime_errors: "queue.Queue[str] | None" = None,
         on_close: Callable[[], None] | None = None,
+        on_scan: Callable[[], None] | None = None,
         health_check: Callable[[], str | None] | None = None,
-        geometry: str = "250x430+0+70",
+        geometry: str = "260x480+0+70",
     ) -> None:
         import tkinter as tk
 
@@ -139,6 +154,7 @@ class LiveAssistantOverlay:
         self.runtime_errors = runtime_errors
         self._runtime_error: str | None = None
         self.on_close = on_close
+        self.on_scan = on_scan
         self.health_check = health_check
         self.root = tk.Tk()
         self.root.title("斗地主助手")
@@ -147,6 +163,8 @@ class LiveAssistantOverlay:
         self.root.configure(bg="#101828")
         self.root.protocol("WM_DELETE_WINDOW", self.close)
         self._closed = False
+        self._last_frame_id = 0
+        self._scan_after_frame_id: int | None = None
 
         self.status = tk.StringVar(value="正在启动…")
         self.roles = tk.StringVar(value="等待地主/加倍完成")
@@ -162,6 +180,24 @@ class LiveAssistantOverlay:
             font=("PingFang SC", 15, "bold"),
             foreground="#fdb022",
         )
+        self.scan_button = tk.Button(
+            self.root,
+            text="扫描当前牌局",
+            command=self._request_scan,
+            background="#175cd3",
+            foreground="#101828",
+            activebackground="#1570ef",
+            activeforeground="#101828",
+            disabledforeground="#667085",
+            relief="flat",
+            borderwidth=0,
+            font=("PingFang SC", 12, "bold"),
+            padx=10,
+            pady=7,
+            cursor="pointinghand",
+            state="normal" if on_scan is not None else "disabled",
+        )
+        self.scan_button.pack(fill="x", padx=10, pady=(2, 5))
         self._variable_label(self.status, foreground="#98a2b3", wraplength=230)
         self._variable_label(self.roles)
         self._variable_label(self.remaining)
@@ -224,8 +260,35 @@ class LiveAssistantOverlay:
             except queue.Empty:
                 break
         if latest is not None:
+            self._last_frame_id = max(self._last_frame_id, latest.frame_id)
             self.present(LiveOverlayViewModel.from_snapshot(latest))
+            if (
+                self._scan_after_frame_id is not None
+                and latest.frame_id > self._scan_after_frame_id
+                and not latest.current_scan_pending
+            ):
+                self._finish_scan_request()
         self.root.after(80, self._poll)
+
+    def _request_scan(self) -> None:
+        if self.on_scan is None or self._scan_after_frame_id is not None:
+            return
+        self._scan_after_frame_id = self._last_frame_id
+        self.scan_button.configure(text="扫描中…", state="disabled")
+        self.status.set("正在扫描当前牌局，请保持斗地主窗口可见…")
+        self.best.set("推荐：正在重新建模…")
+        try:
+            self.on_scan()
+        except Exception as exc:  # noqa: BLE001
+            self.warnings.set(f"扫描请求失败：{exc}")
+            self._finish_scan_request()
+
+    def _finish_scan_request(self) -> None:
+        self._scan_after_frame_id = None
+        self.scan_button.configure(
+            text="扫描当前牌局",
+            state="normal" if self.on_scan is not None else "disabled",
+        )
 
     def present(self, view: LiveOverlayViewModel) -> None:
         self.status.set(view.status)

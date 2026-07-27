@@ -68,9 +68,12 @@ class UniformOpponentModel:
         opponents = [seat for seat in state.turn_order if seat is not PlayerSeat.SELF]
         required = sum(state.remaining_for(seat) for seat in opponents)
         available = len(state.unknown_cards)
-        if available != required:
+        expected = required + state.hidden_played_count
+        if available != expected:
             raise OpponentModelError(
-                f"unknown card count mismatch: available={available}, opponent_remaining={required}"
+                "unknown card count mismatch: "
+                f"available={available}, opponent_remaining={required}, "
+                f"hidden_played={state.hidden_played_count}"
             )
 
     def sample(self, state: ObservableGameState, rng: random.Random) -> OpponentDeal:
@@ -86,8 +89,12 @@ class UniformOpponentModel:
             cards = CardSet(sort_cards(pool[offset : offset + count]))
             hands.append((seat, cards))
             offset += count
-        if offset != len(pool):
-            raise OpponentModelError("opponent deal did not consume the full unknown card pool")
+        leftover = len(pool) - offset
+        if leftover != state.hidden_played_count:
+            raise OpponentModelError(
+                "opponent deal left an unexpected hidden-history pool: "
+                f"leftover={leftover}, expected={state.hidden_played_count}"
+            )
         return OpponentDeal(tuple(hands))
 
     def sample_many(
@@ -160,6 +167,11 @@ class UniformOpponentModel:
             bomb_probability=tuple(bomb_probabilities),
             rocket_probability=tuple(rocket_probabilities),
             can_beat_probability=tuple(beat_probabilities),
+            model_version=(
+                "uniform-remaining-hidden-history-v2"
+                if state.hidden_played_count
+                else self.model_version
+            ),
         )
 
 

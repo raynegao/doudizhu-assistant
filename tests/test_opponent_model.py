@@ -72,3 +72,40 @@ def test_uniform_opponent_model_rejects_finished_state() -> None:
     assert state.phase is RoundPhase.FINISHED
     with pytest.raises(OpponentModelError, match="not decision-ready"):
         UniformOpponentModel().sample_many(state, count=1, seed=1)
+
+
+def test_uniform_opponent_model_supports_unknown_midgame_history() -> None:
+    state = ObservableGameState.from_inputs(
+        "2 2 2 A K Q J J 9 9 8 7 6 6 5 5",
+        round_id="manual-scan",
+        landlord=PlayerSeat.SELF,
+        current_actor=PlayerSeat.SELF,
+        remaining_cards={
+            PlayerSeat.SELF: 16,
+            PlayerSeat.RIGHT: 12,
+            PlayerSeat.LEFT: 7,
+        },
+        played_cards="4",
+        hidden_played_count=18,
+        last_play="4",
+        last_player=PlayerSeat.LEFT,
+    )
+    model = UniformOpponentModel()
+
+    deal = model.sample(state, random.Random(7))
+    dealt = Counter((
+        *deal.hand_for(PlayerSeat.RIGHT).cards,
+        *deal.hand_for(PlayerSeat.LEFT).cards,
+    ))
+    unseen = Counter(state.unknown_cards.cards)
+    estimate = model.summarize(
+        state,
+        model.sample_many(state, count=3, seed=7),
+    )
+
+    assert state.decision_ready is True
+    assert len(deal.hand_for(PlayerSeat.RIGHT)) == 12
+    assert len(deal.hand_for(PlayerSeat.LEFT)) == 7
+    assert not (dealt - unseen)
+    assert sum((unseen - dealt).values()) == 18
+    assert estimate.model_version == "uniform-remaining-hidden-history-v2"

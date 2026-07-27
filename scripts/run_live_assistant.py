@@ -28,7 +28,7 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--no-ui", action="store_true")
     parser.add_argument("--max-frames", type=int)
     parser.add_argument("--no-clear", action="store_true")
-    parser.add_argument("--overlay-geometry", default="250x430+0+70")
+    parser.add_argument("--overlay-geometry", default="260x480+0+70")
     return parser
 
 
@@ -36,6 +36,7 @@ def _produce_live_snapshots(
     config_path: Path,
     max_frames: int | None,
     snapshots: Any,
+    commands: Any,
     stopped: Any,
     runtime_session_id: str,
 ) -> None:
@@ -52,9 +53,19 @@ def _produce_live_snapshots(
         resume_session_id=runtime_session_id,
     )
     try:
-        for snapshot in runtime.run_loop(max_frames=max_frames):
-            if stopped.is_set():
-                break
+        produced = 0
+        while (
+            not stopped.is_set()
+            and (max_frames is None or produced < max_frames)
+        ):
+            while True:
+                try:
+                    command = commands.get_nowait()
+                except queue.Empty:
+                    break
+                if command == "scan_current":
+                    runtime.request_current_scan()
+            snapshot = runtime.run_once()
             while True:
                 try:
                     snapshots.put_nowait(snapshot)
@@ -64,6 +75,12 @@ def _produce_live_snapshots(
                         snapshots.get_nowait()
                     except queue.Empty:
                         pass
+            produced += 1
+            if (
+                not stopped.is_set()
+                and (max_frames is None or produced < max_frames)
+            ):
+                time.sleep(config.interval_seconds)
     except BaseException:  # noqa: BLE001
         traceback.print_exc()
         raise
@@ -82,6 +99,7 @@ class _RuntimeProcessController:
         self.config_path = config_path
         self.max_frames = max_frames
         self.snapshots = self.context.Queue(maxsize=2)
+        self.commands = self.context.Queue(maxsize=4)
         self.stopped = self.context.Event()
         self.runtime_session_id = uuid.uuid4().hex
         self.process: Any | None = None
@@ -95,6 +113,7 @@ class _RuntimeProcessController:
                 self.config_path,
                 self.max_frames,
                 self.snapshots,
+                self.commands,
                 self.stopped,
                 self.runtime_session_id,
             ),
@@ -142,6 +161,19 @@ class _RuntimeProcessController:
         self.start()
         return None
 
+    def request_current_scan(self) -> None:
+        if self.stopped.is_set():
+            return
+        try:
+            self.commands.put_nowait("scan_current")
+        except queue.Full:
+            try:
+                self.commands.get_nowait()
+            except queue.Empty:
+                pass
+            self.commands.put_nowait("scan_current")
+        print("[live-assistant] current-game scan requested", flush=True)
+
     def stop(self) -> None:
         if self.stopped.is_set():
             return
@@ -183,6 +215,7 @@ def main(argv: list[str] | None = None) -> int:
     overlay = LiveAssistantOverlay(
         controller.snapshots,
         on_close=controller.stop,
+        on_scan=controller.request_current_scan,
         health_check=controller.ensure_running,
         geometry=args.overlay_geometry,
     )

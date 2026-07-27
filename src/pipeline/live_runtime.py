@@ -41,6 +41,7 @@ class WindowCapture(Protocol):
 
 DecisionFn = Callable[[ObservableGameState, MonteCarloSettings], Phase4DecisionResult]
 _ROUND_RESUME_MAX_AGE_SECONDS = 30 * 60
+_CURRENT_SCAN_MAX_ATTEMPTS = 8
 
 
 @dataclass(frozen=True)
@@ -79,6 +80,7 @@ class LiveRuntimeSnapshot:
     decision_pending: bool
     capture_latency_ms: float
     total_latency_ms: float
+    current_scan_pending: bool = False
     window_status: WindowCaptureStatus = WindowCaptureStatus.AVAILABLE
     window_message: str = ""
 
@@ -98,6 +100,7 @@ class LiveRuntimeSnapshot:
             "window_message": self.window_message,
             "tracker_mode": self.tracker_update.mode.value,
             "decision_pending": self.decision_pending,
+            "current_scan_pending": self.current_scan_pending,
             "capture_latency_ms": round(self.capture_latency_ms, 3),
             "total_latency_ms": round(self.total_latency_ms, 3),
             "round_id": self.state.round_id if self.state else None,
@@ -155,6 +158,13 @@ class LiveGameRuntime:
         self._logged_decisions: set[tuple[str, int]] = set()
         self._last_error_frame: tuple[str | None, int] | None = None
         self._last_window_status: WindowCaptureStatus | None = None
+        self._current_scan_attempts_remaining = 0
+
+    def request_current_scan(self) -> None:
+        """Retry available frames until the current scene can be rebuilt."""
+
+        self._current_scan_attempts_remaining = _CURRENT_SCAN_MAX_ATTEMPTS
+        self._decision = None
 
     def run_once(self, frame_id: int | None = None) -> LiveRuntimeSnapshot:
         current_frame_id = self._allocate_frame_id(frame_id)
@@ -184,7 +194,28 @@ class LiveGameRuntime:
         scene = self.recognizer.observe(frame)
         _write_jsonl(self.config.log_file, scene.to_log_payload())
 
-        update = self.tracker.update(scene)
+        manual_scan = self._current_scan_attempts_remaining > 0
+        if manual_scan:
+            update = self.tracker.scan_current_scene(scene)
+            if update.initialized:
+                self._current_scan_attempts_remaining = 0
+                self._decision = None
+            else:
+                self._current_scan_attempts_remaining -= 1
+            _write_jsonl(
+                self.config.log_file,
+                {
+                    "event": "manual_current_scan",
+                    "frame_id": current_frame_id,
+                    "success": update.initialized,
+                    "retrying": self._current_scan_attempts_remaining > 0,
+                    "attempts_remaining": self._current_scan_attempts_remaining,
+                    "message": update.message,
+                    "warnings": list(update.warnings),
+                },
+            )
+        else:
+            update = self.tracker.update(scene)
         self._persist_round_context(frame, update)
         if update.event is not None:
             _write_jsonl(self.config.log_file, update.event.to_log_payload())
@@ -192,17 +223,24 @@ class LiveGameRuntime:
         self._handle_uncertain_frame(frame, update)
 
         state = update.state
-        self._poll_decision(state)
-        self._schedule_decision(state)
-        decision = self._decision_for_state(state)
+        scan_pending = self._current_scan_attempts_remaining > 0
+        if scan_pending:
+            decision = None
+            decision_pending = False
+        else:
+            self._poll_decision(state)
+            self._schedule_decision(state)
+            decision = self._decision_for_state(state)
+            decision_pending = self._decision_is_pending_for(state)
         snapshot = LiveRuntimeSnapshot(
             frame_id=current_frame_id,
             scene=scene,
             tracker_update=update,
             decision=decision,
-            decision_pending=self._decision_is_pending_for(state),
+            decision_pending=decision_pending,
             capture_latency_ms=capture_latency_ms,
             total_latency_ms=(time.perf_counter() - started) * 1000,
+            current_scan_pending=scan_pending,
         )
         _write_jsonl(self.config.log_file, snapshot.to_log_payload())
         return snapshot
@@ -249,6 +287,7 @@ class LiveGameRuntime:
             decision_pending=False,
             capture_latency_ms=(time.perf_counter() - started) * 1000,
             total_latency_ms=(time.perf_counter() - started) * 1000,
+            current_scan_pending=self._current_scan_attempts_remaining > 0,
             window_status=status,
             window_message=message,
         )
@@ -537,6 +576,7 @@ def _state_from_checkpoint(payload: object) -> ObservableGameState:
         ),
         consecutive_passes=int(payload.get("consecutive_passes", 0)),
         played_cards=parse_cards(payload.get("played_cards", ())),
+        hidden_played_count=int(payload.get("hidden_played_count", 0)),
         last_sequence_no=int(payload.get("last_sequence_no", revision)),
         state_confidence=float(payload.get("state_confidence", 1.0)),
         warnings=tuple(str(item) for item in payload.get("warnings", ())),

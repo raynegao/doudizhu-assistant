@@ -7,7 +7,7 @@ from typing import Callable, Sequence
 
 from src.logic.action_validation import validate_observed_action
 from src.logic.rules import Play, PlayType
-from src.state.cards import CardSet
+from src.state.cards import FULL_DECK, CardSet
 from src.state.events import ObservedAction, PlayerSeat, RoundPhase
 from src.state.game_tracker import GameStateTracker, StateUpdateStatus
 from src.state.observable_state import ObservableGameState
@@ -113,6 +113,7 @@ class VisualEventTracker:
             else None
         )
         self._initial_stable = _StableValue()
+        self._auto_scan_stable = _StableValue()
         self._role_stable = _StableValue()
         self._seat_stable = {seat: _StableValue() for seat in PlayerSeat}
         self._armed = {seat: False for seat in PlayerSeat}
@@ -166,6 +167,37 @@ class VisualEventTracker:
         else:
             self._initial_stable.update(("not_initial",))
 
+        if self._tracker is None or self.mode is VisualTrackerMode.UNCERTAIN:
+            auto_payload, auto_error = _current_scan_payload(
+                scene,
+                confidence_threshold=self.confidence_threshold,
+                scan_source="automatic",
+            )
+            if auto_payload is not None:
+                stable_count = self._auto_scan_stable.update(
+                    auto_payload.fingerprint
+                )
+                if stable_count >= self.initial_stability_frames:
+                    return self._initialize_current_scan(
+                        scene,
+                        auto_payload,
+                        automatic=True,
+                    )
+                return VisualTrackerUpdate(
+                    mode=self.mode,
+                    message=(
+                        "已识别到自己回合，正在自动扫描当前牌局 "
+                        f"{stable_count}/{self.initial_stability_frames}"
+                    ),
+                    state=self.state,
+                    warnings=tuple(
+                        dict.fromkeys(
+                            (*scene.warnings, *auto_payload.warnings)
+                        )
+                    ),
+                )
+            self._auto_scan_stable.update(("not_scannable", auto_error))
+
         if self._tracker is None:
             return VisualTrackerUpdate(
                 mode=VisualTrackerMode.WAITING_FOR_ROUND,
@@ -179,7 +211,10 @@ class VisualEventTracker:
         if self.mode is VisualTrackerMode.UNCERTAIN:
             return VisualTrackerUpdate(
                 mode=self.mode,
-                message="当前牌局已不确定；为避免伪胜率，等待下一局完整初始化",
+                message=(
+                    "当前牌局已不确定；为避免伪胜率已暂停，"
+                    "将在下次自己回合自动重新扫描"
+                ),
                 state=self.state,
                 warnings=(self._uncertain_reason or "uncertain",),
             )
@@ -345,6 +380,102 @@ class VisualEventTracker:
         )
         return self._apply_event(scene, observation, event)
 
+    def scan_current_scene(
+        self,
+        scene: SceneObservation,
+    ) -> VisualTrackerUpdate:
+        """Build a safe approximate state from a user-requested current scan."""
+
+        payload, error = _current_scan_payload(
+            scene,
+            confidence_threshold=self.confidence_threshold,
+            scan_source="manual",
+        )
+        if payload is None:
+            reason = f"扫描当前牌局失败：{error}"
+            return VisualTrackerUpdate(
+                mode=self.mode,
+                message=reason,
+                state=self.state,
+                warnings=(reason,),
+            )
+        return self._initialize_current_scan(
+            scene,
+            payload,
+            automatic=False,
+        )
+
+    def _initialize_current_scan(
+        self,
+        scene: SceneObservation,
+        payload: "_CurrentScanPayload",
+        *,
+        automatic: bool,
+    ) -> VisualTrackerUpdate:
+        prefix = "auto-scan" if automatic else "scan"
+        round_id = f"{prefix}-{int(scene.timestamp * 1000)}"
+        try:
+            state = ObservableGameState.from_inputs(
+                payload.hand,
+                round_id=round_id,
+                landlord=payload.landlord,
+                current_actor=PlayerSeat.SELF,
+                remaining_cards=payload.remaining,
+                played_cards=payload.trick_target,
+                hidden_played_count=payload.hidden_played_count,
+                last_play=payload.trick_target,
+                last_player=payload.trick_leader,
+                consecutive_passes=payload.consecutive_passes,
+                state_confidence=payload.confidence,
+            )
+        except ValueError as exc:
+            reason = f"扫描当前牌局失败：{exc}"
+            return VisualTrackerUpdate(
+                mode=self.mode,
+                message=reason,
+                state=self.state,
+                warnings=(reason,),
+            )
+        state = replace(
+            state,
+            warnings=tuple(
+                dict.fromkeys((*state.warnings, *payload.warnings))
+            ),
+        )
+        self._tracker = GameStateTracker(
+            state,
+            validator=validate_observed_action,
+            confidence_threshold=self.confidence_threshold,
+        )
+        self.mode = VisualTrackerMode.TRACKING
+        self._uncertain_reason = None
+        self._initial_stable = _StableValue()
+        self._auto_scan_stable = _StableValue()
+        self._role_stable = _StableValue()
+        self._seat_stable = {seat: _StableValue() for seat in PlayerSeat}
+        self._armed = {
+            seat: scene.seat(seat).signal is VisualSignal.NEUTRAL
+            for seat in PlayerSeat
+        }
+        trick = (
+            " ".join(payload.trick_target)
+            if payload.trick_target
+            else "自由出牌"
+        )
+        scope = (
+            "中途近似模型"
+            if payload.hidden_played_count
+            else "完整当前场面"
+        )
+        action = "已自动扫描" if automatic else "已扫描"
+        return VisualTrackerUpdate(
+            mode=self.mode,
+            message=f"{action}当前牌局（{scope}），待压：{trick}",
+            state=state,
+            initialized=True,
+            warnings=payload.warnings,
+        )
+
     def _apply_event(
         self,
         scene: SceneObservation,
@@ -500,6 +631,30 @@ class _InitialStatePayload:
             self.hand,
             tuple((seat.value, self.remaining[seat]) for seat in PlayerSeat),
             self.opening_cards,
+        )
+
+
+@dataclass(frozen=True)
+class _CurrentScanPayload:
+    landlord: PlayerSeat
+    hand: tuple[str, ...]
+    remaining: dict[PlayerSeat, int]
+    trick_target: tuple[str, ...]
+    trick_leader: PlayerSeat | None
+    consecutive_passes: int
+    hidden_played_count: int
+    confidence: float
+    warnings: tuple[str, ...]
+
+    @property
+    def fingerprint(self) -> tuple[object, ...]:
+        return (
+            self.landlord.value,
+            self.hand,
+            tuple((seat.value, self.remaining[seat]) for seat in PlayerSeat),
+            self.trick_target,
+            self.trick_leader.value if self.trick_leader is not None else None,
+            self.consecutive_passes,
         )
 
 
@@ -660,6 +815,150 @@ def _observed_landlord(
     if len(landlords) != 1 or len(farmers) != 2:
         return None
     return landlords[0]
+
+
+def _current_scan_payload(
+    scene: SceneObservation,
+    *,
+    confidence_threshold: float,
+    scan_source: str = "manual",
+) -> tuple[_CurrentScanPayload | None, str]:
+    if (
+        scene.self_turn is not True
+        or scene.self_turn_confidence < confidence_threshold
+    ):
+        return None, "请在轮到自己、出牌按钮已经显示时再扫描"
+
+    landlord = _observed_landlord(
+        scene,
+        confidence_threshold=confidence_threshold,
+    )
+    if landlord is None:
+        return None, "未稳定识别到唯一地主和两名农民"
+
+    hand = tuple(card.rank for card in scene.self_hand)
+    maximum_hand = 20 if landlord is PlayerSeat.SELF else 17
+    if not hand or len(hand) > maximum_hand:
+        return None, (
+            f"自己的手牌张数无效：识别={len(hand)}，"
+            f"角色上限={maximum_hand}"
+        )
+    try:
+        hand_set = scene.self_hand_set
+    except ValueError as exc:
+        return None, f"自己的手牌不符合物理牌组：{exc}"
+    if len(hand_set) != len(hand):
+        return None, "自己的手牌存在重复识别"
+    hand_confidence, hand_warnings = _stable_hand_confidence(
+        scene.self_hand,
+        confidence_threshold=confidence_threshold,
+    )
+    if hand_confidence < confidence_threshold:
+        return None, (
+            "自己的手牌置信度不足："
+            f"{hand_confidence:.3f} < {confidence_threshold:.3f}"
+        )
+
+    remaining = {PlayerSeat.SELF: len(hand)}
+    confidence_values = [
+        hand_confidence,
+        scene.self_turn_confidence,
+        *(
+            observation.role_confidence
+            for observation in scene.seats
+        ),
+    ]
+    for seat in (PlayerSeat.RIGHT, PlayerSeat.LEFT):
+        observation = scene.seat(seat)
+        if (
+            observation.remaining_count is None
+            or not observation.remaining_verified
+            or observation.remaining_confidence < confidence_threshold
+        ):
+            return None, f"{seat.value} 余牌数尚未稳定确认"
+        maximum = 20 if seat is landlord else 17
+        if not 0 < observation.remaining_count <= maximum:
+            return None, (
+                f"{seat.value} 余牌数无效："
+                f"{observation.remaining_count}"
+            )
+        remaining[seat] = observation.remaining_count
+        confidence_values.append(observation.remaining_confidence)
+
+    played_total = len(FULL_DECK) - sum(remaining.values())
+    if played_total < 0:
+        return None, "三家余牌合计超过 54 张"
+
+    left = scene.seat(PlayerSeat.LEFT)
+    right = scene.seat(PlayerSeat.RIGHT)
+    trick_target: tuple[str, ...] = ()
+    trick_leader: PlayerSeat | None = None
+    consecutive_passes = 0
+    inference_warnings: list[str] = []
+    if left.signal is VisualSignal.PLAY and left.cards:
+        trick_target = tuple(card.rank for card in left.cards)
+        trick_leader = PlayerSeat.LEFT
+        confidence_values.append(_action_confidence(left))
+    elif right.signal is VisualSignal.PLAY and right.cards:
+        trick_target = tuple(card.rank for card in right.cards)
+        trick_leader = PlayerSeat.RIGHT
+        consecutive_passes = 1
+        confidence_values.append(_action_confidence(right))
+        inference_warnings.append(
+            "manual_scan_inferred_left_pass_after_right_play"
+        )
+    else:
+        inference_warnings.append(
+            "manual_scan_assumed_free_lead_no_visible_opponent_play"
+        )
+
+    if trick_target:
+        try:
+            target_play = Play.parse(trick_target)
+            CardSet.parse((*hand, *trick_target))
+        except ValueError as exc:
+            return None, f"当前待压牌不符合物理牌组：{exc}"
+        if target_play.type is PlayType.INVALID:
+            return None, "当前待压牌型无法确认"
+        action_confidence = min(confidence_values[-1], 1.0)
+        if action_confidence < confidence_threshold:
+            return None, "当前待压牌置信度不足"
+
+    hidden_played_count = played_total - len(trick_target)
+    if hidden_played_count < 0:
+        return None, (
+            "场上牌张数超过由余牌变化推导的已出牌总数"
+        )
+
+    confidence = min(confidence_values)
+    if hidden_played_count:
+        confidence *= 0.95
+    if confidence < confidence_threshold:
+        return None, (
+            "当前场面综合置信度不足："
+            f"{confidence:.3f} < {confidence_threshold:.3f}"
+        )
+    warnings = [
+        *hand_warnings,
+        *inference_warnings,
+        f"{scan_source}_current_game_scan",
+    ]
+    if hidden_played_count:
+        warnings.extend((
+            f"historical_played_cards_unknown={hidden_played_count}",
+            "estimated_win_rate_uses_uniform_unknown_history",
+        ))
+    return _CurrentScanPayload(
+        landlord=landlord,
+        hand=hand,
+        remaining=remaining,
+        trick_target=trick_target,
+        trick_leader=trick_leader,
+        consecutive_passes=consecutive_passes,
+        hidden_played_count=hidden_played_count,
+        confidence=confidence,
+        warnings=tuple(dict.fromkeys(warnings)),
+    ), ""
 
 
 def _opening_state_payload(
