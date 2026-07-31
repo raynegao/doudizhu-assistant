@@ -7,13 +7,14 @@ import json
 import os
 import subprocess
 import tempfile
+import zlib
 from dataclasses import dataclass
 from enum import Enum
 from pathlib import Path
 from typing import Callable, Iterable, Mapping, Sequence
 
 import numpy as np
-from PIL import Image, ImageOps, ImageStat
+from PIL import Image, ImageOps
 import torch
 
 from src.capture.screen_geometry import CapturedWindow
@@ -190,7 +191,11 @@ class TemplateMatcher:
                     continue
                 label = path.parent.name if path.parent != directory else path.stem.split("__", 1)[0]
                 try:
-                    image = Image.open(path).convert("L")
+                    # Keep colour here. Template similarity converts to
+                    # grayscale itself, while feature readers such as the
+                    # yellow remaining-count segmenter need the original RGB
+                    # pixels.
+                    image = Image.open(path).convert("RGB")
                 except OSError:
                     continue
                 items.append((label, path, image.copy()))
@@ -223,10 +228,10 @@ class CvRemainingReader:
         template_images: Sequence[tuple[str, Image.Image]] = (),
     ) -> None:
         rank_references = _load_builtin_rank_references()
-        self._digit_references: dict[str, list[frozenset[int]]] = {
-            digit: list(rank_references.get(digit, ()))
-            for digit in "23456789"
-        }
+        self._digit_references = _load_builtin_remaining_references()
+        for digit in "23456789":
+            references = self._digit_references.setdefault(digit, [])
+            references.extend(rank_references.get(digit, ()))
         # Whole-counter templates are still useful, but only as sources of
         # individual glyph shapes.  This removes the seat background and card
         # stack that made whole-ROI template matching confuse 3 with 16.
@@ -247,6 +252,13 @@ class CvRemainingReader:
                 ):
                     continue
                 references.append(signature)
+        self._digit_reference_holes = {
+            digit: tuple(
+                (reference, _remaining_signature_hole_count(reference))
+                for reference in references
+            )
+            for digit, references in self._digit_references.items()
+        }
 
     def __call__(
         self,
@@ -295,16 +307,47 @@ class CvRemainingReader:
         prefix: Sequence[str],
     ) -> tuple[str | None, float]:
         signature = _remaining_glyph_signature(mask)
+        allowed_digits = set("0123456789")
+        if digit_count == 1:
+            allowed_digits.discard("0")
+        elif index == 0:
+            # The only two-digit values are 10..20.
+            allowed_digits = {"1", "2"}
+        elif prefix and prefix[0] == "2":
+            # Once the first glyph is 2 the value can only be 20.
+            allowed_digits = {"0"}
+        observed_holes = _remaining_signature_hole_count(signature)
+        topology_references = {
+            digit: tuple(
+                reference
+                for reference, hole_count in references
+                if hole_count == observed_holes
+            )
+            for digit, references in self._digit_reference_holes.items()
+            if digit in allowed_digits
+        }
+        has_topology_match = any(topology_references.values())
         scored = sorted(
             (
                 max(
                     _glyph_similarity(signature, reference)
-                    for reference in references
+                    for reference in (
+                        topology_references.get(digit, ())
+                        if has_topology_match
+                        else references
+                    )
                 ),
                 digit,
             )
             for digit, references in self._digit_references.items()
-            if references
+            if (
+                references
+                and digit in allowed_digits
+                and (
+                    not has_topology_match
+                    or topology_references.get(digit)
+                )
+            )
         )
         if scored:
             best_score, best_digit = scored[-1]
@@ -320,9 +363,9 @@ class CvRemainingReader:
         # either the complete value 1 or the leading digit of 10..19.
         if index == 0 and (digit_count == 1 or digit_count == 2):
             return "1", 0.86
-        # A second unmatched glyph after 1/2 can only be zero because the
-        # complete counter is constrained to 1..20.
-        if index == 1 and prefix and prefix[0] in {"1", "2"}:
+        # A second unmatched glyph after 2 can only be zero because the complete
+        # counter is constrained to 1..20.
+        if index == 1 and prefix and prefix[0] == "2":
             return "0", 0.80
         return None, scored[-1][0] if scored else 0.0
 
@@ -595,7 +638,12 @@ class SceneRecognizer:
 
         hand_image = self.config.crop(full_window_image, "self_hand")
         visible_count = infer_visible_hand_count(hand_image, maximum=20)
-        if visible_count not in {17, 20}:
+        # A round can be initialized from a safe mid-game self-turn scan, so
+        # its reference frame may contain any physically valid number of
+        # cards.  Restricting recovery to opening 17/20-card frames caused a
+        # recognition-worker restart after the first action to discard a valid
+        # checkpoint and rescan the table as a new approximate round.
+        if not 1 <= visible_count <= 20:
             return ()
         cards = self._observe_hand(
             hand_image,
@@ -622,13 +670,24 @@ class SceneRecognizer:
         play_crop = self.config.crop(image, f"{seat.value}_play")
         pass_crop = self.config.crop(image, f"{seat.value}_pass")
         pass_match = self.templates.classify("pass", pass_crop)
+        pass_notice_confidence = _classify_pass_notice(pass_crop)
         if (
-            pass_match.label == "pass"
-            and pass_match.confidence >= self.config.pass_threshold
+            pass_notice_confidence >= self.config.pass_threshold
+            or (
+                pass_match.label == "pass"
+                and pass_match.confidence >= self.config.pass_threshold
+            )
         ):
             signal = VisualSignal.PASS
             cards: tuple[VisualCard, ...] = ()
-            confidence = pass_match.confidence
+            confidence = max(
+                pass_notice_confidence,
+                (
+                    pass_match.confidence
+                    if pass_match.label == "pass"
+                    else 0.0
+                ),
+            )
         else:
             # The self action ROI overlaps the large control buttons in this
             # client and produces false card-like regions. Self plays are more
@@ -642,13 +701,20 @@ class SceneRecognizer:
             predictions = self.predictor(crops)
             observed_cards: list[VisualCard] = []
             for index, prediction in enumerate(predictions):
-                rank = prediction.rank
-                confidence = prediction.confidence
                 reference_match = self._match_rank_reference(
-                    play_crop.crop(boxes[index])
+                    play_crop.crop(boxes[index]),
+                    # Table cards are larger and can have a slightly different
+                    # antialiased glyph from the hand reference. A strong
+                    # runner-up margin still makes 0.70 overlap reliable; the
+                    # previous 0.78 floor missed a real red 10 and left the CNN
+                    # to call it K/7.
+                    minimum_similarity=0.70,
+                    minimum_margin=0.12,
                 )
-                if reference_match is not None:
-                    rank, confidence = reference_match
+                rank, confidence = _resolve_card_prediction(
+                    prediction,
+                    reference_match,
+                )
                 observed_cards.append(
                     VisualCard(
                         rank=rank,
@@ -680,7 +746,14 @@ class SceneRecognizer:
             remaining_count=remaining[0],
             role=role[0],
             confidence=confidence,
-            pass_confidence=pass_match.confidence,
+            pass_confidence=max(
+                pass_notice_confidence,
+                (
+                    pass_match.confidence
+                    if pass_match.label == "pass"
+                    else 0.0
+                ),
+            ),
             remaining_confidence=remaining[1],
             role_confidence=role[1],
             remaining_verified=remaining[2],
@@ -706,15 +779,15 @@ class SceneRecognizer:
         predictions = self.predictor(crops)
         observed: list[VisualCard] = []
         for index, prediction in enumerate(predictions):
-            rank = prediction.rank
-            confidence = prediction.confidence
             reference_match = self._match_rank_reference(
                 crops[index],
                 minimum_similarity=0.68,
                 minimum_margin=0.05,
             )
-            if reference_match is not None:
-                rank, confidence = reference_match
+            rank, confidence = _resolve_card_prediction(
+                prediction,
+                reference_match,
+            )
             observed.append(
                 VisualCard(
                     rank=rank,
@@ -812,13 +885,9 @@ def _template_similarity(image: Image.Image, template: Image.Image) -> float:
     target = ImageOps.autocontrast(image.convert("L"))
     reference = ImageOps.autocontrast(template.convert("L"))
     target = ImageOps.fit(target, reference.size, method=Image.Resampling.BILINEAR)
-    difference = ImageStat.Stat(
-        Image.frombytes(
-            "L",
-            reference.size,
-            bytes(abs(left - right) for left, right in zip(target.tobytes(), reference.tobytes())),
-        )
-    ).mean[0]
+    target_pixels = np.asarray(target, dtype=np.int16)
+    reference_pixels = np.asarray(reference, dtype=np.int16)
+    difference = float(np.abs(target_pixels - reference_pixels).mean())
     return max(0.0, min(1.0, 1.0 - difference / 255.0))
 
 
@@ -884,6 +953,45 @@ def _classify_role_badge(image: Image.Image) -> tuple[SeatRole, float]:
         confidence = min(0.999, 0.90 + white_ratio * 2.0)
         return SeatRole.FARMER, confidence
     return SeatRole.UNKNOWN, max(yellow_ratio, white_ratio)
+
+
+def _classify_pass_notice(image: Image.Image) -> float:
+    """Detect the client's white ``不出`` notice without a local template.
+
+    The glyphs sit in the upper third of each pass ROI. Face-up table cards can
+    overlap the lower half of the same ROI, so measuring the whole crop would
+    turn ordinary plays into false passes. The neutral table has no pale
+    foreground in this upper band; a conservative density gate therefore
+    transfers across both opponent seats and small window movements.
+    """
+
+    rgb = np.asarray(image.convert("RGB"), dtype=np.int16)
+    if rgb.size == 0:
+        return 0.0
+    height, width = rgb.shape[:2]
+    band_bottom = max(1, round(height * 0.36))
+    band = rgb[:band_bottom]
+    pale = (
+        (band.min(axis=2) > 120)
+        & (band.max(axis=2) > 190)
+        & ((band.max(axis=2) - band.min(axis=2)) < 80)
+    )
+    density = float(pale.mean())
+    if density < 0.025:
+        return 0.0
+
+    active_rows = int(
+        np.count_nonzero(pale.sum(axis=1) >= max(3, width * 0.015))
+    )
+    active_columns = int(
+        np.count_nonzero(pale.sum(axis=0) >= max(2, band_bottom * 0.08))
+    )
+    if (
+        active_rows < max(5, round(band_bottom * 0.12))
+        or active_columns < max(12, round(width * 0.08))
+    ):
+        return 0.0
+    return min(0.995, 0.82 + (density - 0.025) * 3.2)
 
 
 def _classify_turn_controls(
@@ -1016,6 +1124,14 @@ def _remaining_digit_masks(image: Image.Image) -> tuple[np.ndarray, ...]:
         glyph = region[top:bottom]
         if glyph.shape[0] < minimum_height:
             continue
+        # Animated decorations around the opponent avatar occasionally add a
+        # tall but only a few pixels wide yellow streak to this ROI.  Treating
+        # that streak as a third digit makes a stable value such as ``12``
+        # disappear for one frame.  Real counter glyphs keep a substantially
+        # wider bounding box, including the digit 1.
+        minimum_width = max(3, round(glyph.shape[0] * 0.25))
+        if glyph.shape[1] < minimum_width:
+            continue
         glyphs.append(glyph)
     return tuple(glyphs)
 
@@ -1045,6 +1161,47 @@ def _remaining_glyph_signature(mask: np.ndarray) -> frozenset[int]:
         int(index)
         for index in np.flatnonzero(pixels.reshape(-1) > 0)
     )
+
+
+def _remaining_signature_hole_count(signature: frozenset[int]) -> int:
+    """Count enclosed background regions in a normalized counter glyph."""
+
+    if not signature:
+        return 0
+    foreground = np.zeros((64, 64), dtype=bool)
+    for index in signature:
+        if 0 <= index < foreground.size:
+            foreground[index // 64, index % 64] = True
+    background = ~foreground
+    visited = np.zeros_like(background)
+    holes = 0
+    for start_y in range(64):
+        for start_x in range(64):
+            if not background[start_y, start_x] or visited[start_y, start_x]:
+                continue
+            stack = [(start_y, start_x)]
+            visited[start_y, start_x] = True
+            size = 0
+            touches_border = False
+            while stack:
+                y, x = stack.pop()
+                size += 1
+                if y in {0, 63} or x in {0, 63}:
+                    touches_border = True
+                for dy, dx in ((-1, 0), (1, 0), (0, -1), (0, 1)):
+                    next_y = y + dy
+                    next_x = x + dx
+                    if (
+                        0 <= next_y < 64
+                        and 0 <= next_x < 64
+                        and background[next_y, next_x]
+                        and not visited[next_y, next_x]
+                    ):
+                        visited[next_y, next_x] = True
+                        stack.append((next_y, next_x))
+            if not touches_border and size >= 4:
+                holes += 1
+    return holes
 
 
 def _minimum_card_confidence(cards: Sequence[VisualCard]) -> float:
@@ -1159,6 +1316,9 @@ _RANK_GLYPH_BYTE_COUNT = (_RANK_GLYPH_GRID_SIZE**2) // 8
 _BUILTIN_RANK_GLYPHS = (
     Path(__file__).with_name("assets") / "rank_glyph_signatures.json"
 )
+_BUILTIN_REMAINING_GLYPHS = (
+    Path(__file__).with_name("assets") / "remaining_glyph_signatures.json"
+)
 
 
 def _encode_glyph_signature(signature: frozenset[int]) -> str:
@@ -1214,6 +1374,46 @@ def _load_builtin_rank_references(
                 decoded.append(signature)
         if decoded:
             references[rank] = decoded
+    return references
+
+
+def _load_builtin_remaining_references(
+    path: Path = _BUILTIN_REMAINING_GLYPHS,
+) -> dict[str, list[frozenset[int]]]:
+    try:
+        payload = json.loads(path.read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError):
+        return {}
+    if (
+        payload.get("format") != "remaining-glyph-signatures-zlib-v1"
+        or payload.get("grid_size") != _RANK_GLYPH_GRID_SIZE
+        or not isinstance(payload.get("digits"), dict)
+    ):
+        return {}
+    references: dict[str, list[frozenset[int]]] = {}
+    for digit in "0123456789":
+        encoded_items = payload["digits"].get(digit, ())
+        if not isinstance(encoded_items, list):
+            continue
+        decoded: list[frozenset[int]] = []
+        for encoded in encoded_items[:12]:
+            if not isinstance(encoded, str):
+                continue
+            try:
+                compressed = base64.b64decode(
+                    encoded.encode("ascii"),
+                    validate=True,
+                )
+                raw = zlib.decompress(compressed)
+                signature = _decode_glyph_signature(
+                    base64.b64encode(raw).decode("ascii")
+                )
+            except (ValueError, binascii.Error, zlib.error):
+                continue
+            if signature:
+                decoded.append(signature)
+        if decoded:
+            references[digit] = decoded
     return references
 
 
@@ -1344,6 +1544,17 @@ def infer_visible_hand_count(
     # segmentation first scans the same large ROI twice and made each live
     # frame take multiple seconds.
     boxes = _segment_overlapping_card_boxes(image)
+    boxes = _regularize_overlapping_hand_boxes(boxes)
+    if len(boxes) == 2:
+        # A lone landlord card carries a diagonal red/yellow sash.  Its upper
+        # edge can be stronger than the card border and look like a second
+        # overlapped-card start.  The connected-component path already
+        # distinguishes one normal portrait card from a genuinely tight pair
+        # by the merged body's aspect ratio, so consult it for this ambiguous
+        # two-edge endgame case.
+        separated_boxes = segment_card_boxes(image)
+        if len(separated_boxes) == 1:
+            boxes = separated_boxes
     if not boxes:
         boxes = segment_card_boxes(image)
     count = len(boxes)
@@ -1433,6 +1644,61 @@ def _segment_overlapping_card_boxes(
     return tuple(boxes)
 
 
+def _regularize_overlapping_hand_boxes(
+    boxes: Sequence[tuple[int, int, int, int]],
+) -> tuple[tuple[int, int, int, int], ...]:
+    """Remove strong glyph edges that masquerade as overlapped card starts.
+
+    The local client lays the hand on an almost uniform horizontal grid.  A
+    vertical ``JOKER`` glyph can be stronger than a card border and therefore
+    introduce an extra start inside the first exposed card.  Map candidates to
+    their nearest grid slot and retain only the closest edge per slot.  This is
+    deliberately applied even when the raw count is below the configured
+    maximum: after one real card is played, ``19 cards + 1 glyph edge`` would
+    otherwise still look like a valid 20-card hand.
+    """
+
+    ordered = tuple(sorted(boxes, key=lambda box: box[0]))
+    if len(ordered) < 3:
+        return ordered
+    starts = np.asarray([box[0] for box in ordered], dtype=np.float64)
+    gaps = np.diff(starts)
+    positive_gaps = gaps[gaps >= 4.0]
+    if len(positive_gaps) < 2:
+        return ordered
+
+    # Genuine card steps occupy the upper half when one or two short glyph
+    # gaps are mixed in.  Using only that half avoids shrinking the estimated
+    # grid to the internal strokes of a Joker.
+    gap_midpoint = float(np.median(positive_gaps))
+    likely_card_gaps = positive_gaps[positive_gaps >= gap_midpoint]
+    typical_step = float(np.median(likely_card_gaps))
+    if typical_step < 8.0:
+        return ordered
+
+    origin = float(starts[0])
+    tolerance = max(4.0, typical_step * 0.42)
+    best_by_slot: dict[
+        int,
+        tuple[float, tuple[int, int, int, int]],
+    ] = {}
+    for box in ordered:
+        offset = float(box[0]) - origin
+        slot = max(0, int(round(offset / typical_step)))
+        distance = abs(offset - slot * typical_step)
+        if distance > tolerance:
+            continue
+        existing = best_by_slot.get(slot)
+        if existing is None or distance < existing[0]:
+            best_by_slot[slot] = (distance, box)
+
+    regularized = tuple(
+        value[1]
+        for _, value in sorted(best_by_slot.items())
+    )
+    return regularized or ordered
+
+
 def infer_overlapping_hand_boxes(
     image: Image.Image,
     count: int,
@@ -1451,7 +1717,13 @@ def infer_overlapping_hand_boxes(
         return ()
     left = min(run[0] for run in white_columns)
     right = max(run[1] for run in white_columns)
-    if right - left < width * 0.35:
+    # Full 17/20-card hands span most of the configured ROI, but this client
+    # centers and narrows the fan as cards are played. Requiring every hand to
+    # occupy 35% of the ROI made a real three-card endgame disappear entirely.
+    # Keep the wide-hand noise guard while scaling it down with the known
+    # visible count.
+    minimum_extent_ratio = min(0.35, max(0.04, 0.35 * count / 20.0))
+    if right - left < width * minimum_extent_ratio:
         return ()
     row_counts = white_mask[:, left:right].sum(axis=1)
     row_runs = _boolean_runs(
@@ -1486,13 +1758,26 @@ def infer_overlapping_hand_boxes(
     full_card_width = max(16, round(full_card_height * 0.72))
     crop_height = max(24, round(full_card_height * 0.535))
     crop_width = max(16, round(crop_height * 0.60))
-    if count == 1:
-        step = 0
+    detected = _regularize_overlapping_hand_boxes(
+        _segment_overlapping_card_boxes(
+            rgb,
+            white_mask=white_mask,
+        )
+    )
+    detected_starts = (
+        [box[0] for box in detected]
+        if len(detected) == count
+        else []
+    )
+    if detected_starts:
+        starts = detected_starts
+    elif count == 1:
+        starts = [left]
     else:
         step = max(1, int((right - left - full_card_width) / (count - 1)))
+        starts = [left + index * step for index in range(count)]
     boxes = []
-    for index in range(count):
-        x = left + index * step
+    for x in starts:
         box = (
             max(0, min(x, width - crop_width)),
             start_y,
@@ -1546,6 +1831,33 @@ def _integer_groups(
 def _card_rank_crop(card: Image.Image) -> Image.Image:
     width, height = card.size
     return card.crop((0, 0, width, max(1, round(height * 0.68))))
+
+
+def _resolve_card_prediction(
+    prediction: CardPrediction,
+    reference_match: tuple[str, float] | None,
+    *,
+    confident_joker_threshold: float = 0.90,
+) -> tuple[str, float]:
+    """Fuse CNN and glyph references without turning a Joker into a rank.
+
+    Vertical Joker artwork contains a prominent letter ``J``.  The generic
+    glyph matcher therefore occasionally reports an excellent normal-J match
+    even though the full-card CNN confidently sees a Joker.  Preserve a
+    confident CNN Joker against a non-Joker reference; all other predictions
+    continue to benefit from the real-window reference correction.
+    """
+
+    if reference_match is None:
+        return prediction.rank, prediction.confidence
+    reference_rank, reference_confidence = reference_match
+    if (
+        prediction.rank in {"SJ", "BJ"}
+        and prediction.confidence >= confident_joker_threshold
+        and reference_rank not in {"SJ", "BJ"}
+    ):
+        return prediction.rank, prediction.confidence
+    return reference_rank, reference_confidence
 
 
 __all__ = [

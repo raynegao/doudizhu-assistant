@@ -22,6 +22,7 @@ from src.logic.monte_carlo import (
     Phase4DecisionResult,
     recommend_phase4,
 )
+from src.logic.rules import Play, legal_actions
 from src.pipeline.live_layout import LiveLayoutConfig
 from src.state.cards import CardSet, parse_cards
 from src.state.events import PlayerSeat, RoundPhase
@@ -42,6 +43,10 @@ class WindowCapture(Protocol):
 DecisionFn = Callable[[ObservableGameState, MonteCarloSettings], Phase4DecisionResult]
 _ROUND_RESUME_MAX_AGE_SECONDS = 30 * 60
 _CURRENT_SCAN_MAX_ATTEMPTS = 8
+_UNAVAILABLE_LOG_HEARTBEAT_FRAMES = 20
+_AVAILABLE_LOG_HEARTBEAT_FRAMES = 20
+_TRANSIENT_CAPTURE_ERROR_LIMIT = 1
+_MAX_LIVE_LOG_BYTES = 64 * 1024 * 1024
 
 
 @dataclass(frozen=True)
@@ -83,6 +88,7 @@ class LiveRuntimeSnapshot:
     current_scan_pending: bool = False
     window_status: WindowCaptureStatus = WindowCaptureStatus.AVAILABLE
     window_message: str = ""
+    decision_block_reason: str = ""
 
     @property
     def state(self) -> ObservableGameState | None:
@@ -101,6 +107,7 @@ class LiveRuntimeSnapshot:
             "tracker_mode": self.tracker_update.mode.value,
             "decision_pending": self.decision_pending,
             "current_scan_pending": self.current_scan_pending,
+            "decision_block_reason": self.decision_block_reason,
             "capture_latency_ms": round(self.capture_latency_ms, 3),
             "total_latency_ms": round(self.total_latency_ms, 3),
             "round_id": self.state.round_id if self.state else None,
@@ -129,6 +136,7 @@ class LiveGameRuntime:
     ) -> None:
         self.config = config
         self.resume_session_id = resume_session_id
+        _rotate_jsonl_log(config.log_file)
         self.frame_source = frame_source or MacWindowCapture(config.app_name)
         self.recognizer = recognizer or SceneRecognizer(config)
         if tracker is not None:
@@ -156,9 +164,13 @@ class LiveGameRuntime:
         self._decision_revision: tuple[str, int] | None = None
         self._decision: LiveDecisionRecord | None = None
         self._logged_decisions: set[tuple[str, int]] = set()
-        self._last_error_frame: tuple[str | None, int] | None = None
+        self._last_error_signature: tuple[str | None, str] | None = None
         self._last_window_status: WindowCaptureStatus | None = None
+        self._last_scene_log_signature: tuple[object, ...] | None = None
+        self._last_update_log_signature: tuple[object, ...] | None = None
+        self._last_snapshot_log_signature: tuple[object, ...] | None = None
         self._current_scan_attempts_remaining = 0
+        self._consecutive_capture_errors = 0
 
     def request_current_scan(self) -> None:
         """Retry available frames until the current scene can be rebuilt."""
@@ -186,13 +198,20 @@ class LiveGameRuntime:
                 message=f"斗地主窗口当前无法识别：{exc}",
             )
         capture_latency_ms = (time.perf_counter() - started) * 1000
-        self._log_window_transition(
+        self._consecutive_capture_errors = 0
+        status_changed = self._log_window_transition(
             WindowCaptureStatus.AVAILABLE,
             "已连接斗地主窗口，正在识别",
             frame_id=current_frame_id,
         )
         scene = self.recognizer.observe(frame)
-        _write_jsonl(self.config.log_file, scene.to_log_payload())
+        if self._should_log_available(
+            "scene",
+            _scene_log_signature(scene),
+            frame_id=current_frame_id,
+            force=status_changed,
+        ):
+            _write_jsonl(self.config.log_file, scene.to_log_payload())
 
         manual_scan = self._current_scan_attempts_remaining > 0
         if manual_scan:
@@ -218,13 +237,62 @@ class LiveGameRuntime:
             update = self.tracker.update(scene)
         self._persist_round_context(frame, update)
         if update.event is not None:
-            _write_jsonl(self.config.log_file, update.event.to_log_payload())
-        _write_jsonl(self.config.log_file, update.to_log_payload())
+            event_payload = update.event.to_log_payload()
+            event_payload["round_id"] = (
+                update.state.round_id if update.state is not None else None
+            )
+            event_payload["frame_id"] = current_frame_id
+            _write_jsonl(self.config.log_file, event_payload)
+        if (
+            update.state is not None
+            and update.state.phase is RoundPhase.FINISHED
+            and update.state.winner is not None
+        ):
+            _write_jsonl(
+                self.config.log_file,
+                {
+                    "event": "round_result_detected",
+                    "round_id": update.state.round_id,
+                    "state_revision": update.state.revision,
+                    "winner": update.state.winner.value,
+                    "outcome": _self_outcome(update.state),
+                    "source": (
+                        update.event.source
+                        if update.event is not None
+                        else "state_invariant"
+                    ),
+                    "frame_id": current_frame_id,
+                },
+            )
+        force_update_log = bool(
+            status_changed
+            or manual_scan
+            or update.initialized
+            or update.event is not None
+        )
+        if self._should_log_available(
+            "update",
+            _update_log_signature(update),
+            frame_id=current_frame_id,
+            force=force_update_log,
+        ):
+            update_payload = update.to_log_payload()
+            update_payload["frame_id"] = current_frame_id
+            _write_jsonl(self.config.log_file, update_payload)
         self._handle_uncertain_frame(frame, update)
 
         state = update.state
         scan_pending = self._current_scan_attempts_remaining > 0
+        decision_block_reason = _decision_scene_block_reason(scene, state)
         if scan_pending:
+            decision = None
+            decision_pending = False
+        elif decision_block_reason:
+            # A completed result is only safe to display while the live hand
+            # still agrees with the revision that produced it.  This final
+            # guard prevents a stale or mis-modelled state from recommending
+            # cards that are not visible in the player's current hand.
+            self._poll_decision(None)
             decision = None
             decision_pending = False
         else:
@@ -241,9 +309,34 @@ class LiveGameRuntime:
             capture_latency_ms=capture_latency_ms,
             total_latency_ms=(time.perf_counter() - started) * 1000,
             current_scan_pending=scan_pending,
+            decision_block_reason=decision_block_reason,
         )
-        _write_jsonl(self.config.log_file, snapshot.to_log_payload())
+        if self._should_log_available(
+            "snapshot",
+            _snapshot_log_signature(snapshot),
+            frame_id=current_frame_id,
+            force=force_update_log,
+        ):
+            _write_jsonl(self.config.log_file, snapshot.to_log_payload())
         return snapshot
+
+    def _should_log_available(
+        self,
+        stream: str,
+        signature: tuple[object, ...],
+        *,
+        frame_id: int,
+        force: bool = False,
+    ) -> bool:
+        attribute = f"_last_{stream}_log_signature"
+        previous = getattr(self, attribute)
+        changed = previous != signature
+        setattr(self, attribute, signature)
+        return bool(
+            force
+            or changed
+            or frame_id % _AVAILABLE_LOG_HEARTBEAT_FRAMES == 0
+        )
 
     def _window_unavailable_snapshot(
         self,
@@ -253,9 +346,43 @@ class LiveGameRuntime:
         status: WindowCaptureStatus,
         message: str,
     ) -> LiveRuntimeSnapshot:
-        self._log_window_transition(status, message, frame_id=frame_id)
+        if status is WindowCaptureStatus.CAPTURE_ERROR:
+            self._consecutive_capture_errors += 1
+        else:
+            self._consecutive_capture_errors = 0
+        status_changed = self._log_window_transition(
+            status,
+            message,
+            frame_id=frame_id,
+        )
         handler = getattr(self.tracker, "handle_window_unavailable", None)
-        if callable(handler):
+        tracker_state = getattr(self.tracker, "state", None)
+        tracker_mode = getattr(
+            self.tracker,
+            "mode",
+            VisualTrackerMode.WAITING_FOR_ROUND,
+        )
+        transient_capture_failure = bool(
+            status is WindowCaptureStatus.CAPTURE_ERROR
+            and self._consecutive_capture_errors
+            <= _TRANSIENT_CAPTURE_ERROR_LIMIT
+            and tracker_state is not None
+            and tracker_mode is VisualTrackerMode.TRACKING
+        )
+        if transient_capture_failure:
+            update = VisualTrackerUpdate(
+                mode=VisualTrackerMode.TRACKING,
+                message=(
+                    "WindowServer 单帧捕获失败，已暂停本帧推荐并保留牌局状态；"
+                    "下一帧将自动重试"
+                ),
+                state=tracker_state,
+                warnings=(
+                    message,
+                    "transient_capture_failure_preserved_state",
+                ),
+            )
+        elif callable(handler):
             update = handler(message)
         else:
             update = VisualTrackerUpdate(
@@ -291,7 +418,16 @@ class LiveGameRuntime:
             window_status=status,
             window_message=message,
         )
-        _write_jsonl(self.config.log_file, snapshot.to_log_payload())
+        if (
+            status_changed
+            or (
+                status is WindowCaptureStatus.CAPTURE_ERROR
+                and self._consecutive_capture_errors
+                == _TRANSIENT_CAPTURE_ERROR_LIMIT + 1
+            )
+            or frame_id % _UNAVAILABLE_LOG_HEARTBEAT_FRAMES == 0
+        ):
+            _write_jsonl(self.config.log_file, snapshot.to_log_payload())
         return snapshot
 
     def _log_window_transition(
@@ -300,9 +436,9 @@ class LiveGameRuntime:
         message: str,
         *,
         frame_id: int,
-    ) -> None:
+    ) -> bool:
         if status is self._last_window_status:
-            return
+            return False
         self._last_window_status = status
         _write_jsonl(
             self.config.log_file,
@@ -314,6 +450,7 @@ class LiveGameRuntime:
                 "timestamp": time.time(),
             },
         )
+        return True
 
     def run_loop(
         self,
@@ -414,6 +551,22 @@ class LiveGameRuntime:
             )
             self._decision_revision = None
             return
+        assert state is not None
+        validation_error = _decision_validation_error(record, state)
+        if validation_error is not None:
+            _write_jsonl(
+                self.config.log_file,
+                {
+                    "event": "live_decision_rejected",
+                    "round_id": record.round_id,
+                    "state_revision": record.state_revision,
+                    "error": validation_error,
+                },
+            )
+            self._decision = None
+            self._logged_decisions.add(record_key)
+            self._decision_revision = None
+            return
         self._decision = record
         self._logged_decisions.add(record_key)
         self._decision_revision = record_key
@@ -451,10 +604,12 @@ class LiveGameRuntime:
         update: VisualTrackerUpdate,
     ) -> None:
         if update.mode is not VisualTrackerMode.UNCERTAIN:
+            self._last_error_signature = None
             return
         round_id = update.state.round_id if update.state else None
-        key = (round_id, frame.frame_id)
-        if self._last_error_frame == key:
+        reason = update.warnings[0] if update.warnings else update.message
+        signature = (round_id, reason)
+        if self._last_error_signature == signature:
             return
         self.config.error_frames_dir.mkdir(parents=True, exist_ok=True)
         safe_round_id = (round_id or "uninitialized").replace("/", "_")
@@ -462,7 +617,7 @@ class LiveGameRuntime:
             f"{safe_round_id}-frame-{frame.frame_id:06d}.png"
         )
         frame.image.save(path)
-        self._last_error_frame = key
+        self._last_error_signature = signature
 
     def _persist_round_context(
         self,
@@ -622,6 +777,154 @@ def _decision_allowed(state: ObservableGameState | None) -> bool:
     )
 
 
+def _self_outcome(state: ObservableGameState) -> str:
+    winner = state.winner
+    if winner is None:
+        return "unknown"
+    if state.landlord is PlayerSeat.SELF:
+        return "victory" if winner is PlayerSeat.SELF else "defeat"
+    return "victory" if winner is not state.landlord else "defeat"
+
+
+def _decision_validation_error(
+    record: LiveDecisionRecord,
+    state: ObservableGameState,
+) -> str | None:
+    """Reject recommendations that are not legal for the exact live revision."""
+
+    previous = Play.parse(state.trick_target.cards)
+    legal = set(legal_actions(state.self_hand, previous))
+    rankings = record.result.rankings
+    if not rankings:
+        return "decision returned no ranked actions"
+    if record.result.action not in legal:
+        return (
+            "recommended action is not legal for the tracked hand: "
+            f"{record.result.action}"
+        )
+    if rankings[0].action != record.result.action:
+        return "recommended action does not match Top-1"
+    illegal_ranked = [
+        evaluation.action
+        for evaluation in rankings
+        if evaluation.action not in legal
+    ]
+    if illegal_ranked:
+        return (
+            "Top-K contains actions that are not legal for the tracked hand: "
+            + ", ".join(str(action) for action in illegal_ranked)
+        )
+    return None
+
+
+def _scene_log_signature(scene: SceneObservation) -> tuple[object, ...]:
+    return (
+        tuple(card.rank for card in scene.self_hand),
+        tuple(
+            (
+                seat.seat.value,
+                seat.signal.value,
+                tuple(card.rank for card in seat.cards),
+                seat.remaining_count,
+                seat.role.value if seat.role is not None else None,
+            )
+            for seat in scene.seats
+        ),
+        scene.self_turn,
+        scene.warnings,
+    )
+
+
+def _state_log_signature(
+    state: ObservableGameState | None,
+) -> tuple[object, ...] | None:
+    if state is None:
+        return None
+    return (
+        state.round_id,
+        state.revision,
+        state.phase.value,
+        state.landlord.value,
+        state.current_actor.value,
+        state.self_hand.cards,
+        tuple(
+            (seat.value, count)
+            for seat, count in state.remaining_cards
+        ),
+        state.trick_target.cards,
+        state.trick_leader.value if state.trick_leader is not None else None,
+        state.consecutive_passes,
+        state.hidden_played_count,
+        state.warnings,
+    )
+
+
+def _update_log_signature(
+    update: VisualTrackerUpdate,
+) -> tuple[object, ...]:
+    return (
+        update.mode.value,
+        update.message,
+        update.initialized,
+        (
+            update.event.event_id,
+            update.event.sequence_no,
+            update.event.actor.value,
+            update.event.cards.cards,
+            update.event.source,
+        )
+        if update.event is not None
+        else None,
+        _state_log_signature(update.state),
+        update.warnings,
+    )
+
+
+def _snapshot_log_signature(
+    snapshot: LiveRuntimeSnapshot,
+) -> tuple[object, ...]:
+    decision = snapshot.decision
+    return (
+        snapshot.window_status.value,
+        snapshot.window_message,
+        snapshot.tracker_update.mode.value,
+        snapshot.decision_pending,
+        snapshot.current_scan_pending,
+        snapshot.decision_block_reason,
+        (
+            decision.round_id,
+            decision.state_revision,
+            decision.result.action,
+        )
+        if decision is not None
+        else None,
+        _state_log_signature(snapshot.state),
+    )
+
+
+def _decision_scene_block_reason(
+    scene: SceneObservation,
+    state: ObservableGameState | None,
+) -> str:
+    """Require the latest live hand to support every displayed recommendation."""
+
+    if (
+        state is None
+        or state.phase is not RoundPhase.PLAYING
+        or state.current_actor is not PlayerSeat.SELF
+    ):
+        return ""
+    if not scene.self_hand:
+        return "当前手牌画面尚未稳定，已暂停推荐"
+    try:
+        observed_hand = scene.self_hand_set
+    except ValueError:
+        return "当前手牌识别不符合物理牌组，已暂停推荐"
+    if observed_hand != state.self_hand:
+        return "当前手牌画面与牌局模型不一致，已暂停推荐并等待校准"
+    return ""
+
+
 def _revision_seed(state: ObservableGameState) -> int:
     payload = f"{state.round_id}:{state.revision}".encode("utf-8")
     value = 2166136261
@@ -632,9 +935,36 @@ def _revision_seed(state: ObservableGameState) -> int:
 
 
 def _write_jsonl(path: Path, payload: dict[str, object]) -> None:
+    _rotate_jsonl_log(path)
     path.parent.mkdir(parents=True, exist_ok=True)
     with path.open("a", encoding="utf-8") as file:
         file.write(json.dumps(payload, ensure_ascii=False) + "\n")
+
+
+def _rotate_jsonl_log(
+    path: Path,
+    *,
+    max_bytes: int = _MAX_LIVE_LOG_BYTES,
+    timestamp: float | None = None,
+) -> Path | None:
+    """Archive an oversized live log without deleting historical evidence."""
+
+    if max_bytes <= 0:
+        raise ValueError("max_bytes must be positive")
+    try:
+        if path.stat().st_size < max_bytes:
+            return None
+    except FileNotFoundError:
+        return None
+    value = time.time() if timestamp is None else timestamp
+    stamp = time.strftime("%Y%m%d-%H%M%S", time.localtime(value))
+    archive = path.with_name(f"{path.name}.{stamp}")
+    suffix = 1
+    while archive.exists():
+        archive = path.with_name(f"{path.name}.{stamp}.{suffix}")
+        suffix += 1
+    path.replace(archive)
+    return archive
 
 
 def format_live_snapshot(snapshot: LiveRuntimeSnapshot) -> str:
@@ -673,7 +1003,9 @@ def format_live_snapshot(snapshot: LiveRuntimeSnapshot) -> str:
             + (" ".join(state.trick_target.cards) if state.trick_target else "自由出牌")
         ),
     ])
-    if snapshot.decision_pending:
+    if snapshot.decision_block_reason:
+        lines.append(snapshot.decision_block_reason)
+    elif snapshot.decision_pending:
         lines.append("胜率计算中…")
     elif snapshot.decision is None:
         lines.append("当前不输出推荐")

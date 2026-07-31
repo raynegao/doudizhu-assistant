@@ -2,11 +2,14 @@ from __future__ import annotations
 
 from pathlib import Path
 
+import numpy as np
 from PIL import Image, ImageDraw
+import src.vision.scene_recognizer as scene_recognizer_module
 
 from src.pipeline.live_layout import LiveLayoutConfig
 from src.state.cards import RANKS
 from src.state.events import PlayerSeat
+from src.vision.card_classifier import CardPrediction
 from src.vision.scene_recognizer import (
     CvRemainingReader,
     RemainingTextMatch,
@@ -19,7 +22,12 @@ from src.vision.scene_recognizer import (
     _encode_glyph_signature,
     _glyph_similarity,
     _load_builtin_rank_references,
+    _load_builtin_remaining_references,
     _rank_glyph_signature,
+    _regularize_overlapping_hand_boxes,
+    _remaining_glyph_signature,
+    _remaining_signature_hole_count,
+    _resolve_card_prediction,
     _resolve_roles_from_hand_count,
     _resolve_remaining,
     infer_visible_hand_count,
@@ -186,6 +194,76 @@ def test_infer_overlapping_hand_boxes_uses_visible_white_extent() -> None:
     assert all(box[3] <= image.height for box in boxes)
 
 
+def test_infer_overlapping_hand_boxes_accepts_centered_short_hand() -> None:
+    image = Image.new("RGB", (900, 260), (30, 60, 130))
+    draw = ImageDraw.Draw(image)
+    starts = (330, 390, 450)
+    for left in starts:
+        draw.rounded_rectangle(
+            (left, 10, left + 150, 240),
+            radius=6,
+            fill="white",
+            outline=(90, 90, 90),
+            width=2,
+        )
+
+    assert infer_visible_hand_count(image, maximum=20) == 3
+    boxes = infer_overlapping_hand_boxes(image, 3)
+
+    assert len(boxes) == 3
+    assert all(
+        abs(box[0] - expected) <= 3
+        for box, expected in zip(boxes, starts)
+    )
+
+
+def test_infer_overlapping_hand_boxes_accepts_one_and_two_card_endgames() -> None:
+    for starts in ((375,), (345, 415)):
+        image = Image.new("RGB", (900, 260), (30, 60, 130))
+        draw = ImageDraw.Draw(image)
+        for left in starts:
+            draw.rounded_rectangle(
+                (left, 10, left + 150, 240),
+                radius=6,
+                fill="white",
+                outline=(90, 90, 90),
+                width=2,
+            )
+
+        assert infer_visible_hand_count(image, maximum=20) == len(starts)
+        boxes = infer_overlapping_hand_boxes(image, len(starts))
+
+        assert len(boxes) == len(starts)
+        assert all(
+            abs(box[0] - expected) <= 3
+            for box, expected in zip(boxes, starts)
+        )
+
+
+def test_visible_count_rejects_two_internal_edges_inside_one_card(
+    monkeypatch,
+) -> None:
+    image = Image.new("RGB", (900, 420), (30, 60, 130))
+    ImageDraw.Draw(image).rounded_rectangle(
+        (310, 10, 590, 405),
+        radius=8,
+        fill="white",
+        outline=(80, 80, 80),
+        width=2,
+    )
+    false_edges = (
+        (310, 10, 460, 277),
+        (364, 10, 514, 277),
+    )
+    monkeypatch.setattr(
+        scene_recognizer_module,
+        "_segment_overlapping_card_boxes",
+        lambda *_args, **_kwargs: false_edges,
+    )
+
+    assert infer_visible_hand_count(image, maximum=20) == 1
+
+
 def test_infer_overlapping_hand_boxes_keeps_card_tops_above_notice() -> None:
     image = Image.new("RGB", (900, 260), (30, 60, 130))
     draw = ImageDraw.Draw(image)
@@ -209,6 +287,59 @@ def test_infer_overlapping_hand_boxes_keeps_card_tops_above_notice() -> None:
     assert all(box[3] > 100 for box in boxes)
 
 
+def test_pass_notice_classifier_uses_upper_text_band_not_lower_card_body() -> None:
+    neutral = Image.new("RGB", (330, 184), (45, 75, 145))
+    notice = neutral.copy()
+    draw = ImageDraw.Draw(notice)
+    for left in (35, 55, 95, 120, 155, 180):
+        draw.rectangle((left, 35, left + 12, 62), fill=(240, 240, 230))
+    lower_card = neutral.copy()
+    ImageDraw.Draw(lower_card).rounded_rectangle(
+        (80, 88, 250, 183),
+        radius=8,
+        fill="white",
+    )
+
+    assert scene_recognizer_module._classify_pass_notice(neutral) == 0.0
+    assert scene_recognizer_module._classify_pass_notice(notice) >= 0.82
+    assert scene_recognizer_module._classify_pass_notice(lower_card) == 0.0
+
+
+def test_structural_pass_confidence_is_used_by_seat_observation(
+    tmp_path: Path,
+) -> None:
+    config = LiveLayoutConfig(templates_dir=tmp_path)
+    image = Image.new("RGB", (1000, 600), (45, 75, 145))
+    left, top, right, bottom = config.roi("right_pass").to_pixel_box(image.size)
+    draw = ImageDraw.Draw(image)
+    for offset in (15, 30, 48, 66, 86, 104):
+        draw.rectangle(
+            (
+                left + offset,
+                top + 12,
+                left + offset + 8,
+                top + 27,
+            ),
+            fill=(240, 240, 230),
+        )
+    recognizer = SceneRecognizer(
+        config,
+        predictor=lambda _: (),
+        remaining_reader=lambda _: {},
+    )
+
+    observation = recognizer._observe_seat(  # noqa: SLF001
+        image,
+        PlayerSeat.RIGHT,
+        role=(SeatRole.FARMER, 0.99),
+        remaining=(17, 0.99, True),
+    )
+
+    assert observation.signal.value == "pass"
+    assert observation.confidence >= config.pass_threshold
+    assert observation.pass_confidence >= config.pass_threshold
+
+
 def test_infer_visible_hand_count_reads_overlapping_card_edges() -> None:
     image = Image.new("RGB", (900, 260), (30, 60, 130))
     draw = ImageDraw.Draw(image)
@@ -223,6 +354,102 @@ def test_infer_visible_hand_count_reads_overlapping_card_edges() -> None:
         )
 
     assert infer_visible_hand_count(image, maximum=17) == 14
+
+
+def test_hand_grid_removes_joker_glyph_edge_before_and_after_play() -> None:
+    def boxes(starts: list[int]) -> tuple[tuple[int, int, int, int], ...]:
+        return tuple((start, 10, start + 126, 220) for start in starts)
+
+    initial_card_starts = [0, *range(102, 2040, 102)]
+    after_play_card_starts = [0, *range(107, 2033, 107)]
+
+    initial = _regularize_overlapping_hand_boxes(
+        boxes([0, 26, *initial_card_starts[1:]])
+    )
+    after_play = _regularize_overlapping_hand_boxes(
+        boxes([0, 27, *after_play_card_starts[1:]])
+    )
+
+    assert len(initial) == 20
+    assert [box[0] for box in initial] == initial_card_starts
+    assert len(after_play) == 19
+    assert [box[0] for box in after_play] == after_play_card_starts
+
+
+def test_confident_cnn_joker_is_not_overridden_by_normal_j_reference() -> None:
+    prediction = CardPrediction(
+        rank="BJ",
+        confidence=0.999,
+        probabilities={"BJ": 0.999},
+    )
+
+    assert _resolve_card_prediction(
+        prediction,
+        ("J", 0.997),
+    ) == ("BJ", 0.999)
+
+
+def test_low_confidence_joker_can_still_be_corrected_by_reference() -> None:
+    prediction = CardPrediction(
+        rank="BJ",
+        confidence=0.62,
+        probabilities={"BJ": 0.62},
+    )
+
+    assert _resolve_card_prediction(
+        prediction,
+        ("J", 0.98),
+    ) == ("J", 0.98)
+
+
+def test_rank_reference_still_corrects_non_joker_prediction() -> None:
+    prediction = CardPrediction(
+        rank="Q",
+        confidence=0.71,
+        probabilities={"Q": 0.71},
+    )
+
+    assert _resolve_card_prediction(
+        prediction,
+        ("K", 0.97),
+    ) == ("K", 0.97)
+
+
+def test_seed_hand_references_accepts_safe_midgame_scan(
+    monkeypatch,
+) -> None:
+    ranks = ("BJ", "2", "A", "K", "K", "K", "J", "9", "5")
+    monkeypatch.setattr(
+        scene_recognizer_module,
+        "infer_visible_hand_count",
+        lambda _image, maximum: len(ranks),
+    )
+    monkeypatch.setattr(
+        scene_recognizer_module,
+        "infer_overlapping_hand_boxes",
+        lambda _image, count: tuple(
+            (index * 10, 0, index * 10 + 9, 20)
+            for index in range(count)
+        ),
+    )
+    recognizer = SceneRecognizer(
+        LiveLayoutConfig(),
+        predictor=lambda crops: tuple(
+            CardPrediction(
+                rank=rank,
+                confidence=0.99,
+                probabilities={rank: 0.99},
+            )
+            for rank, _crop in zip(ranks, crops, strict=True)
+        ),
+        remaining_reader=lambda _: {},
+    )
+
+    cards = recognizer.seed_hand_references(
+        Image.new("RGB", (1000, 600), "navy")
+    )
+
+    assert tuple(card.rank for card in cards) == ranks
 
 
 def test_twenty_visible_cards_override_misleading_role_templates() -> None:
@@ -350,37 +577,67 @@ def test_native_text_count_overrides_unverified_whole_roi_template() -> None:
     assert verified is True
 
 
-def test_cv_remaining_reader_segments_real_counter_templates() -> None:
-    templates = (
-        Path(__file__).parents[1]
-        / "data"
-        / "live_game"
-        / "templates"
-    )
-    matcher = TemplateMatcher(templates)
-    reader = CvRemainingReader(
-        template_images=matcher.template_images("remaining"),
+def _render_counter(value: str) -> Image.Image:
+    remaining = _load_builtin_remaining_references()
+    ranks = _load_builtin_rank_references()
+    image = Image.new("RGB", (180, 100), (43, 73, 145))
+    left = 15
+    for digit in value:
+        signature = (remaining.get(digit) or ranks[digit])[0]
+        for index in signature:
+            y, x = divmod(index, 64)
+            image.putpixel((left + x, 18 + y), (245, 180, 50))
+        left += 70
+    return image
+
+
+def test_cv_remaining_reader_uses_bundled_digits_without_local_templates() -> None:
+    references = _load_builtin_remaining_references()
+    reader = CvRemainingReader(template_images=())
+
+    assert set(references) == {"0", "1", "2"}
+    for expected in (1, 9, 10, 12, 16, 17, 20):
+        match = reader.read(_render_counter(str(expected)))
+        assert match.count == expected
+        assert match.confidence >= 0.80
+
+
+def test_cv_remaining_reader_ignores_thin_animated_yellow_streak() -> None:
+    reader = CvRemainingReader(template_images=())
+    image = _render_counter("12")
+    draw = ImageDraw.Draw(image)
+    draw.rectangle((2, 20, 5, 53), fill=(245, 180, 50))
+
+    match = reader.read(image)
+
+    assert match.count == 12
+    assert match.confidence >= 0.80
+
+
+def test_remaining_digit_topology_distinguishes_five_from_six() -> None:
+    open_five = Image.new("L", (32, 48), 0)
+    five_draw = ImageDraw.Draw(open_five)
+    five_draw.line((5, 5, 25, 5), fill=255, width=4)
+    five_draw.line((5, 5, 5, 25), fill=255, width=4)
+    five_draw.line((5, 25, 24, 25), fill=255, width=4)
+    five_draw.line((24, 25, 24, 42), fill=255, width=4)
+    five_draw.line((5, 42, 24, 42), fill=255, width=4)
+    closed_six = open_five.copy()
+    ImageDraw.Draw(closed_six).line(
+        (5, 25, 5, 42),
+        fill=255,
+        width=4,
     )
 
-    with Image.open(
-        templates
-        / "remaining"
-        / "16"
-        / "left_remaining-1784789776534.png"
-    ) as left_image:
-        left_match = reader.read(left_image)
-    with Image.open(
-        templates
-        / "remaining"
-        / "17"
-        / "right_remaining-1784789777204.png"
-    ) as right_image:
-        right_match = reader.read(right_image)
+    five_signature = _remaining_glyph_signature(
+        np.asarray(open_five, dtype=np.uint8) > 0
+    )
+    six_signature = _remaining_glyph_signature(
+        np.asarray(closed_six, dtype=np.uint8) > 0
+    )
 
-    assert left_match.count == 16
-    assert right_match.count == 17
-    assert left_match.confidence >= 0.80
-    assert right_match.confidence >= 0.80
+    assert _remaining_signature_hole_count(five_signature) == 0
+    assert _remaining_signature_hole_count(six_signature) == 1
 
 
 def test_similar_whole_roi_template_is_not_verified_without_text() -> None:

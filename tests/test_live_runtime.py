@@ -14,17 +14,21 @@ from src.capture.screen_geometry import (
     WindowCaptureStatus,
 )
 from src.logic.monte_carlo import MonteCarloSettings, recommend_phase4
+from src.logic.rules import Play
 from src.pipeline.calibration import WindowInfo
 from src.pipeline.live_layout import LiveLayoutConfig
 from src.pipeline.live_runtime import (
     LiveGameRuntime,
+    _rotate_jsonl_log,
     _round_seed_path,
     _round_state_path,
     _write_round_checkpoint,
 )
-from src.state.events import PlayerSeat
+from src.state.cards import CardSet
+from src.state.events import ObservedAction, PlayerSeat, RoundPhase
+from src.state.observable_state import ObservableGameState
 from src.tracking.visual_events import VisualTrackerMode, VisualTrackerUpdate
-from src.ui.live_overlay import LiveOverlayViewModel
+from src.ui.live_overlay import LiveOverlayViewModel, _advance_frame_cursor
 from src.vision.scene_recognizer import (
     SceneObservation,
     SeatObservation,
@@ -74,6 +78,29 @@ class _UnavailableThenFrameSource:
         return _FrameSource().capture(frame_id)
 
 
+class _AlwaysUnavailableFrameSource:
+    def capture(self, frame_id: int) -> CapturedWindow:
+        raise WindowAvailabilityError(
+            WindowCaptureStatus.NOT_OPEN,
+            "未检测到“斗地主”窗口，请打开斗地主",
+        )
+
+
+class _FrameCaptureErrorFrameSource:
+    def __init__(self, failures: int = 1) -> None:
+        self.failures = failures
+        self.calls = 0
+
+    def capture(self, frame_id: int) -> CapturedWindow:
+        self.calls += 1
+        if 2 <= self.calls <= self.failures + 1:
+            raise WindowAvailabilityError(
+                WindowCaptureStatus.CAPTURE_ERROR,
+                "window-level capture failed",
+            )
+        return _FrameSource().capture(frame_id)
+
+
 class _Recognizer:
     def observe(self, frame: CapturedWindow) -> SceneObservation:
         return SceneObservation(
@@ -85,6 +112,25 @@ class _Recognizer:
             self_turn=True,
             self_turn_confidence=1.0,
             confidence=1.0,
+        )
+
+
+class _HandRecognizer(_Recognizer):
+    def __init__(self, hand: tuple[str, ...]) -> None:
+        self.hand = hand
+
+    def observe(self, frame: CapturedWindow) -> SceneObservation:
+        scene = super().observe(frame)
+        return replace(
+            scene,
+            self_hand=tuple(
+                VisualCard(
+                    rank=rank,
+                    confidence=0.99,
+                    box=(0, 0, 10, 20),
+                )
+                for rank in self.hand
+            ),
         )
 
 
@@ -180,6 +226,55 @@ class _Tracker:
         )
 
 
+class _AvailabilityAwareTracker(_Tracker):
+    def __init__(self, state) -> None:
+        super().__init__(state)
+        self.mode = VisualTrackerMode.TRACKING
+        self.unavailable_calls = 0
+
+    def handle_window_unavailable(self, reason: str) -> VisualTrackerUpdate:
+        self.unavailable_calls += 1
+        self.mode = VisualTrackerMode.UNCERTAIN
+        return VisualTrackerUpdate(
+            mode=self.mode,
+            message=reason,
+            state=self.state,
+            warnings=(reason,),
+        )
+
+
+class _EventTracker(_Tracker):
+    def update(self, scene: SceneObservation) -> VisualTrackerUpdate:
+        return VisualTrackerUpdate(
+            mode=VisualTrackerMode.TRACKING,
+            message="self 出牌：3",
+            state=self.state,
+            event=ObservedAction(
+                event_id=f"{self.state.round_id}:1:self",
+                sequence_no=1,
+                actor=PlayerSeat.SELF,
+                cards=CardSet(("3",)),
+                source="test",
+            ),
+        )
+
+
+class _FinishedEventTracker(_Tracker):
+    def update(self, scene: SceneObservation) -> VisualTrackerUpdate:
+        return VisualTrackerUpdate(
+            mode=VisualTrackerMode.FINISHED,
+            message="self 出完最后一手：J；检测到胜利",
+            state=self.state,
+            event=ObservedAction(
+                event_id=f"{self.state.round_id}:1:self",
+                sequence_no=1,
+                actor=PlayerSeat.SELF,
+                cards=CardSet(("J",)),
+                source="live_hand_diff",
+            ),
+        )
+
+
 def test_live_runtime_schedules_and_logs_revision_scoped_decision(
     tmp_path: Path,
     phase4_ready_state,
@@ -201,7 +296,7 @@ def test_live_runtime_schedules_and_logs_revision_scoped_decision(
     runtime = LiveGameRuntime(
         config,
         frame_source=_FrameSource(),
-        recognizer=_Recognizer(),
+        recognizer=_HandRecognizer(phase4_ready_state.self_hand.cards),
         tracker=_Tracker(phase4_ready_state),
         decision_fn=decision,
         sleeper=lambda _: None,
@@ -233,6 +328,178 @@ def test_live_runtime_schedules_and_logs_revision_scoped_decision(
     assert "scene_observation" in events
     assert "state_update" in events
     assert "live_decision" in events
+
+
+def test_live_runtime_blocks_bad_hand_recommendation_then_recovers(
+    tmp_path: Path,
+    phase4_ready_state,
+) -> None:
+    config = LiveLayoutConfig(
+        log_file=tmp_path / "live.jsonl",
+        error_frames_dir=tmp_path / "errors",
+        simulations=2,
+        max_depth=4,
+        time_budget_ms=0,
+        min_rollouts_per_action=1,
+        top_k=1,
+        max_candidates=2,
+    )
+    mismatched_hand = list(phase4_ready_state.self_hand.cards)
+    mismatched_hand[0] = "BJ"
+    decision_calls = 0
+
+    def decision(state, settings: MonteCarloSettings):
+        nonlocal decision_calls
+        decision_calls += 1
+        return recommend_phase4(state, settings)
+
+    recognizer = _HandRecognizer(tuple(mismatched_hand))
+    runtime = LiveGameRuntime(
+        config,
+        frame_source=_FrameSource(),
+        recognizer=recognizer,
+        tracker=_Tracker(phase4_ready_state),
+        decision_fn=decision,
+        sleeper=lambda _: None,
+    )
+    try:
+        blocked_snapshots = [runtime.run_once() for _ in range(4)]
+        assert decision_calls == 0
+        assert all(
+            snapshot.decision is None
+            for snapshot in blocked_snapshots
+        )
+        recognizer.hand = phase4_ready_state.self_hand.cards
+        recovered = runtime.run_once()
+        for _ in range(20):
+            if recovered.decision is not None:
+                break
+            time.sleep(0.01)
+            recovered = runtime.run_once()
+        recognizer.hand = tuple(mismatched_hand)
+        stale_hidden = runtime.run_once()
+    finally:
+        runtime.close()
+
+    assert all(
+        "手牌画面与牌局模型不一致" in snapshot.decision_block_reason
+        for snapshot in blocked_snapshots
+    )
+    view = LiveOverlayViewModel.from_snapshot(blocked_snapshots[-1])
+    assert "已暂停" in view.best
+    assert "手牌画面与牌局模型不一致" in view.best
+    assert decision_calls == 1
+    assert recovered.decision_block_reason == ""
+    assert recovered.decision is not None
+    assert stale_hidden.decision is None
+    assert "手牌画面与牌局模型不一致" in stale_hidden.decision_block_reason
+    rows = [
+        json.loads(line)
+        for line in config.log_file.read_text(encoding="utf-8").splitlines()
+    ]
+    assert any(
+        "手牌画面与牌局模型不一致"
+        in row.get("decision_block_reason", "")
+        for row in rows
+        if row["event"] == "live_runtime_snapshot"
+    )
+
+
+def test_live_runtime_rejects_impossible_decision_action(
+    tmp_path: Path,
+    phase4_ready_state,
+) -> None:
+    config = LiveLayoutConfig(
+        log_file=tmp_path / "live.jsonl",
+        error_frames_dir=tmp_path / "errors",
+        simulations=2,
+        max_depth=4,
+        time_budget_ms=0,
+        min_rollouts_per_action=1,
+        top_k=1,
+        max_candidates=2,
+    )
+
+    def invalid_decision(state, settings: MonteCarloSettings):
+        valid = recommend_phase4(state, settings)
+        return replace(valid, action=Play.parse(("BJ",)))
+
+    runtime = LiveGameRuntime(
+        config,
+        frame_source=_FrameSource(),
+        recognizer=_HandRecognizer(phase4_ready_state.self_hand.cards),
+        tracker=_Tracker(phase4_ready_state),
+        decision_fn=invalid_decision,
+        sleeper=lambda _: None,
+    )
+    events: list[dict[str, object]] = []
+    snapshots = []
+    try:
+        for _ in range(20):
+            snapshots.append(runtime.run_once())
+            events = [
+                json.loads(line)
+                for line in config.log_file.read_text(
+                    encoding="utf-8"
+                ).splitlines()
+            ]
+            if any(
+                event["event"] == "live_decision_rejected"
+                for event in events
+            ):
+                break
+            time.sleep(0.01)
+    finally:
+        runtime.close()
+
+    assert all(snapshot.decision is None for snapshot in snapshots)
+    rejected = [
+        event
+        for event in events
+        if event["event"] == "live_decision_rejected"
+    ]
+    assert len(rejected) == 1
+    assert "not legal" in str(rejected[0]["error"])
+
+
+def test_live_runtime_logs_observed_action_without_crashing(
+    tmp_path: Path,
+    phase4_ready_state,
+) -> None:
+    config = LiveLayoutConfig(
+        log_file=tmp_path / "live.jsonl",
+        error_frames_dir=tmp_path / "errors",
+    )
+    runtime = LiveGameRuntime(
+        config,
+        frame_source=_FrameSource(),
+        recognizer=_Recognizer(),
+        tracker=_EventTracker(phase4_ready_state),
+        sleeper=lambda _: None,
+    )
+    try:
+        snapshot = runtime.run_once()
+    finally:
+        runtime.close()
+
+    assert snapshot.tracker_update.event is not None
+    rows = [
+        json.loads(line)
+        for line in config.log_file.read_text(encoding="utf-8").splitlines()
+    ]
+    assert [row["event"] for row in rows].count("play_observed") == 1
+    observed_action = next(
+        row for row in rows
+        if row["event"] == "play_observed"
+    )
+    assert observed_action["round_id"] == phase4_ready_state.round_id
+    assert observed_action["frame_id"] == 1
+    state_updates = [
+        row for row in rows
+        if row["event"] == "state_update"
+    ]
+    assert state_updates[0]["frame_id"] == 1
+    assert state_updates[0]["observed_action"]["cards"] == ["3"]
 
 
 def test_live_runtime_waits_for_window_and_recovers(tmp_path: Path) -> None:
@@ -276,6 +543,155 @@ def test_live_runtime_waits_for_window_and_recovers(tmp_path: Path) -> None:
     assert transitions == ["not_open", "available"]
 
 
+def test_live_runtime_preserves_round_across_one_capture_error(
+    tmp_path: Path,
+    phase4_ready_state,
+) -> None:
+    config = LiveLayoutConfig(
+        log_file=tmp_path / "live.jsonl",
+        error_frames_dir=tmp_path / "errors",
+    )
+    tracker = _AvailabilityAwareTracker(phase4_ready_state)
+    runtime = LiveGameRuntime(
+        config,
+        frame_source=_FrameCaptureErrorFrameSource(failures=1),
+        recognizer=_HandRecognizer(phase4_ready_state.self_hand.cards),
+        tracker=tracker,
+        sleeper=lambda _: None,
+    )
+    try:
+        before = runtime.run_once()
+        failed = runtime.run_once()
+        recovered = runtime.run_once()
+    finally:
+        runtime.close()
+
+    assert before.state is not None
+    assert failed.window_status is WindowCaptureStatus.CAPTURE_ERROR
+    assert failed.decision is None
+    assert failed.state is phase4_ready_state
+    assert failed.tracker_update.mode is VisualTrackerMode.TRACKING
+    assert "保留牌局状态" in failed.tracker_update.message
+    assert tracker.unavailable_calls == 0
+    assert recovered.window_status is WindowCaptureStatus.AVAILABLE
+    assert recovered.state is phase4_ready_state
+    assert recovered.state.round_id == before.state.round_id
+    assert recovered.state.revision == before.state.revision
+
+
+def test_live_runtime_marks_round_uncertain_after_repeated_capture_errors(
+    tmp_path: Path,
+    phase4_ready_state,
+) -> None:
+    config = LiveLayoutConfig(
+        log_file=tmp_path / "live.jsonl",
+        error_frames_dir=tmp_path / "errors",
+    )
+    tracker = _AvailabilityAwareTracker(phase4_ready_state)
+    runtime = LiveGameRuntime(
+        config,
+        frame_source=_FrameCaptureErrorFrameSource(failures=2),
+        recognizer=_HandRecognizer(phase4_ready_state.self_hand.cards),
+        tracker=tracker,
+        sleeper=lambda _: None,
+    )
+    try:
+        runtime.run_once()
+        transient = runtime.run_once()
+        uncertain = runtime.run_once()
+    finally:
+        runtime.close()
+
+    assert transient.tracker_update.mode is VisualTrackerMode.TRACKING
+    assert uncertain.tracker_update.mode is VisualTrackerMode.UNCERTAIN
+    assert tracker.unavailable_calls == 1
+
+
+def test_live_runtime_throttles_repeated_unavailable_snapshots(
+    tmp_path: Path,
+) -> None:
+    config = LiveLayoutConfig(
+        log_file=tmp_path / "live.jsonl",
+        error_frames_dir=tmp_path / "errors",
+    )
+    runtime = LiveGameRuntime(
+        config,
+        frame_source=_AlwaysUnavailableFrameSource(),
+        recognizer=_Recognizer(),
+        tracker=_Tracker(None),
+        sleeper=lambda _: None,
+    )
+    try:
+        for frame_id in range(1, 22):
+            runtime.run_once(frame_id)
+    finally:
+        runtime.close()
+
+    rows = [
+        json.loads(line)
+        for line in config.log_file.read_text(encoding="utf-8").splitlines()
+    ]
+    snapshots = [
+        row for row in rows
+        if row["event"] == "live_runtime_snapshot"
+    ]
+    assert [row["frame_id"] for row in snapshots] == [1, 20]
+
+
+def test_live_runtime_throttles_repeated_available_telemetry(
+    tmp_path: Path,
+) -> None:
+    config = LiveLayoutConfig(
+        log_file=tmp_path / "live.jsonl",
+        error_frames_dir=tmp_path / "errors",
+    )
+    runtime = LiveGameRuntime(
+        config,
+        frame_source=_FrameSource(),
+        recognizer=_Recognizer(),
+        tracker=_Tracker(None),
+        sleeper=lambda _: None,
+    )
+    try:
+        for frame_id in range(1, 22):
+            runtime.run_once(frame_id)
+    finally:
+        runtime.close()
+
+    rows = [
+        json.loads(line)
+        for line in config.log_file.read_text(encoding="utf-8").splitlines()
+    ]
+    for event in (
+        "scene_observation",
+        "state_update",
+        "live_runtime_snapshot",
+    ):
+        assert [
+            row["frame_id"]
+            for row in rows
+            if row["event"] == event
+        ] == [1, 20]
+
+
+def test_live_runtime_archives_oversized_log_without_deleting_it(
+    tmp_path: Path,
+) -> None:
+    path = tmp_path / "live.jsonl"
+    path.write_text("historical evidence\n", encoding="utf-8")
+
+    archive = _rotate_jsonl_log(
+        path,
+        max_bytes=4,
+        timestamp=1_785_000_000.0,
+    )
+
+    assert archive is not None
+    assert archive.exists()
+    assert archive.read_text(encoding="utf-8") == "historical evidence\n"
+    assert not path.exists()
+
+
 def test_live_overlay_exposes_background_runtime_error() -> None:
     view = LiveOverlayViewModel.from_runtime_error(
         "ScreenGeometryError: capture failed"
@@ -284,6 +700,12 @@ def test_live_overlay_exposes_background_runtime_error() -> None:
     assert view.status == "识别线程异常停止"
     assert "已暂停" in view.best
     assert "capture failed" in view.warnings
+
+
+def test_live_overlay_frame_cursor_resets_after_worker_restart() -> None:
+    assert _advance_frame_cursor(420, 421) == (421, False)
+    assert _advance_frame_cursor(421, 1) == (1, True)
+    assert _advance_frame_cursor(1, 2) == (2, False)
 
 
 def test_live_runtime_bootstraps_after_switching_to_post_bidding_table(
@@ -402,6 +824,100 @@ def test_live_runtime_rejects_checkpoint_from_previous_ui_session(
     assert restored is None
 
 
+def test_live_runtime_clears_checkpoint_when_round_finishes(
+    tmp_path: Path,
+) -> None:
+    config = LiveLayoutConfig(
+        log_file=tmp_path / "live.jsonl",
+        error_frames_dir=tmp_path / "errors",
+    )
+    finished_state = ObservableGameState.from_inputs(
+        (),
+        round_id="finished-round",
+        landlord=PlayerSeat.SELF,
+        remaining_cards={
+            PlayerSeat.SELF: 0,
+            PlayerSeat.RIGHT: 17,
+            PlayerSeat.LEFT: 17,
+        },
+        hidden_played_count=20,
+    )
+    state_path = _round_state_path(config)
+    seed_path = _round_seed_path(config)
+    state_path.parent.mkdir(parents=True, exist_ok=True)
+    seed_path.parent.mkdir(parents=True, exist_ok=True)
+    state_path.write_text("{}\n", encoding="utf-8")
+    Image.new("RGB", (200, 100), "navy").save(seed_path)
+    runtime = LiveGameRuntime(
+        config,
+        frame_source=_FrameSource(),
+        recognizer=_Recognizer(),
+        tracker=_Tracker(finished_state),
+        sleeper=lambda _: None,
+    )
+    try:
+        runtime._persist_round_context(  # noqa: SLF001
+            _FrameSource().capture(1),
+            VisualTrackerUpdate(
+                mode=VisualTrackerMode.FINISHED,
+                message="本局已结束",
+                state=finished_state,
+            ),
+        )
+    finally:
+        runtime.close()
+
+    assert not state_path.exists()
+    assert not seed_path.exists()
+
+
+def test_live_runtime_logs_victory_and_overlay_displays_result(
+    tmp_path: Path,
+) -> None:
+    config = LiveLayoutConfig(
+        log_file=tmp_path / "live.jsonl",
+        error_frames_dir=tmp_path / "errors",
+    )
+    finished_state = ObservableGameState.from_inputs(
+        (),
+        round_id="victory-round",
+        landlord=PlayerSeat.SELF,
+        remaining_cards={
+            PlayerSeat.SELF: 0,
+            PlayerSeat.RIGHT: 11,
+            PlayerSeat.LEFT: 10,
+        },
+        hidden_played_count=33,
+    )
+    runtime = LiveGameRuntime(
+        config,
+        frame_source=_FrameSource(),
+        recognizer=_Recognizer(),
+        tracker=_FinishedEventTracker(finished_state),
+        sleeper=lambda _: None,
+    )
+    try:
+        snapshot = runtime.run_once()
+    finally:
+        runtime.close()
+
+    rows = [
+        json.loads(line)
+        for line in config.log_file.read_text(encoding="utf-8").splitlines()
+    ]
+    result = next(
+        row for row in rows
+        if row["event"] == "round_result_detected"
+    )
+    assert result["round_id"] == "victory-round"
+    assert result["winner"] == "self"
+    assert result["outcome"] == "victory"
+    assert result["source"] == "live_hand_diff"
+    view = LiveOverlayViewModel.from_snapshot(snapshot)
+    assert view.best == "结果：胜利"
+    assert "断点已自动清除" in view.warnings
+
+
 def test_live_runtime_manual_scan_initializes_without_stability_wait(
     tmp_path: Path,
 ) -> None:
@@ -483,3 +999,58 @@ def test_live_runtime_manual_scan_retries_transient_ocr_failures(
         if json.loads(line)["event"] == "manual_current_scan"
     ]
     assert [event["retrying"] for event in events] == [True, True, False]
+
+
+def test_live_runtime_saves_one_error_frame_per_uncertain_episode(
+    tmp_path: Path,
+    phase4_ready_state,
+) -> None:
+    config = LiveLayoutConfig(
+        log_file=tmp_path / "live.jsonl",
+        error_frames_dir=tmp_path / "errors",
+    )
+    runtime = LiveGameRuntime(
+        config,
+        frame_source=_FrameSource(),
+        recognizer=_Recognizer(),
+        tracker=_Tracker(phase4_ready_state),
+        sleeper=lambda _: None,
+    )
+    uncertain_state = replace(
+        phase4_ready_state,
+        phase=RoundPhase.UNCERTAIN,
+    )
+    uncertain = VisualTrackerUpdate(
+        mode=VisualTrackerMode.UNCERTAIN,
+        message="same recognition failure",
+        state=uncertain_state,
+        warnings=("same recognition failure",),
+    )
+    recovered = VisualTrackerUpdate(
+        mode=VisualTrackerMode.TRACKING,
+        message="recovered",
+        state=phase4_ready_state,
+    )
+    try:
+        runtime._handle_uncertain_frame(  # noqa: SLF001
+            _FrameSource().capture(1),
+            uncertain,
+        )
+        runtime._handle_uncertain_frame(  # noqa: SLF001
+            _FrameSource().capture(2),
+            uncertain,
+        )
+        assert len(tuple(config.error_frames_dir.glob("*.png"))) == 1
+
+        runtime._handle_uncertain_frame(  # noqa: SLF001
+            _FrameSource().capture(3),
+            recovered,
+        )
+        runtime._handle_uncertain_frame(  # noqa: SLF001
+            _FrameSource().capture(4),
+            uncertain,
+        )
+    finally:
+        runtime.close()
+
+    assert len(tuple(config.error_frames_dir.glob("*.png"))) == 2

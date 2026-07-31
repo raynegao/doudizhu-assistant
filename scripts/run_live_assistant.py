@@ -3,6 +3,7 @@ from __future__ import annotations
 import argparse
 import multiprocessing
 import queue
+import signal
 import time
 import traceback
 import uuid
@@ -164,6 +165,12 @@ class _RuntimeProcessController:
     def request_current_scan(self) -> None:
         if self.stopped.is_set():
             return
+        process = self.process
+        if process is None or not process.is_alive():
+            if process is not None:
+                process.join(timeout=0)
+            self.failure_times.clear()
+            self.start()
         try:
             self.commands.put_nowait("scan_current")
         except queue.Full:
@@ -179,13 +186,33 @@ class _RuntimeProcessController:
             return
         self.stopped.set()
         process = self.process
-        if process is None:
-            return
-        process.join(timeout=3.0)
-        if process.is_alive():
-            process.terminate()
-            process.join(timeout=2.0)
+        if process is not None:
+            process.join(timeout=3.0)
+            if process.is_alive():
+                process.terminate()
+                process.join(timeout=2.0)
+        for channel in (self.snapshots, self.commands):
+            try:
+                channel.close()
+                channel.join_thread()
+            except (OSError, ValueError):
+                pass
         print("[live-assistant] stopped", flush=True)
+
+
+def _make_gui_shutdown_handler(
+    overlay: Any,
+    controller: _RuntimeProcessController,
+) -> Any:
+    """Route process signals through the normal Tk/controller cleanup path."""
+
+    def handle_signal(_signum: int, _frame: Any) -> None:
+        try:
+            overlay.root.after_idle(overlay.close)
+        except Exception:  # noqa: BLE001
+            controller.stop()
+
+    return handle_signal
 
 
 def main(argv: list[str] | None = None) -> int:
@@ -219,6 +246,9 @@ def main(argv: list[str] | None = None) -> int:
         health_check=controller.ensure_running,
         geometry=args.overlay_geometry,
     )
+    shutdown_handler = _make_gui_shutdown_handler(overlay, controller)
+    signal.signal(signal.SIGTERM, shutdown_handler)
+    signal.signal(signal.SIGINT, shutdown_handler)
     try:
         overlay.run()
     finally:

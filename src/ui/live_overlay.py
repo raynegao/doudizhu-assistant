@@ -6,7 +6,7 @@ from typing import Any, Callable
 
 from src.capture.screen_geometry import WindowCaptureStatus
 from src.pipeline.live_runtime import LiveRuntimeSnapshot
-from src.state.events import PlayerSeat
+from src.state.events import PlayerSeat, RoundPhase
 
 
 @dataclass(frozen=True)
@@ -77,8 +77,46 @@ class LiveOverlayViewModel:
                 warnings="\n".join(snapshot.scene.warnings[:4]),
             )
         remaining = state.remaining_by_player
+        if state.phase is RoundPhase.FINISHED:
+            winner = state.winner
+            victory = bool(
+                winner is not None
+                and (
+                    (
+                        state.landlord is PlayerSeat.SELF
+                        and winner is PlayerSeat.SELF
+                    )
+                    or (
+                        state.landlord is not PlayerSeat.SELF
+                        and winner is not state.landlord
+                    )
+                )
+            )
+            return cls(
+                status=(
+                    f"R{state.revision} · F{snapshot.frame_id} · "
+                    f"{snapshot.tracker_update.message}"
+                ),
+                roles=(
+                    f"地主：{state.landlord.value}  "
+                    f"胜者：{winner.value if winner is not None else '--'}"
+                ),
+                remaining=(
+                    f"余牌 我{remaining[PlayerSeat.SELF]} "
+                    f"右{remaining[PlayerSeat.RIGHT]} "
+                    f"左{remaining[PlayerSeat.LEFT]}"
+                ),
+                trick="本局已结束",
+                best=("结果：胜利" if victory else "结果：失败"),
+                top_k=(),
+                confidence=f"状态置信度：{state.state_confidence:.1%}",
+                warnings="牌局断点已自动清除，等待下一局",
+            )
         scope = "个人" if state.landlord is PlayerSeat.SELF else "农民团队"
-        if not state.decision_ready:
+        if snapshot.decision_block_reason:
+            best = f"推荐：已暂停\n{snapshot.decision_block_reason}"
+            top_k = ()
+        elif not state.decision_ready:
             best = "推荐：状态未确认，已暂停"
             top_k = ()
         elif snapshot.decision_pending:
@@ -132,6 +170,13 @@ class LiveOverlayViewModel:
             ),
             warnings="\n".join(state.warnings[:4]),
         )
+
+
+def _advance_frame_cursor(previous: int, incoming: int) -> tuple[int, bool]:
+    """Track worker-local frame ids and expose recognition process restarts."""
+
+    restarted = incoming < previous
+    return (incoming if restarted else max(previous, incoming), restarted)
 
 
 class LiveAssistantOverlay:
@@ -260,7 +305,15 @@ class LiveAssistantOverlay:
             except queue.Empty:
                 break
         if latest is not None:
-            self._last_frame_id = max(self._last_frame_id, latest.frame_id)
+            self._last_frame_id, worker_restarted = _advance_frame_cursor(
+                self._last_frame_id,
+                latest.frame_id,
+            )
+            if worker_restarted and self._scan_after_frame_id is not None:
+                # Recognition workers restart their local frame counter at 1.
+                # A scan request tied to the previous counter can otherwise
+                # leave the button disabled for hundreds of frames.
+                self._finish_scan_request()
             self.present(LiveOverlayViewModel.from_snapshot(latest))
             if (
                 self._scan_after_frame_id is not None
@@ -273,6 +326,9 @@ class LiveAssistantOverlay:
     def _request_scan(self) -> None:
         if self.on_scan is None or self._scan_after_frame_id is not None:
             return
+        # The same button is the explicit recovery path after the background
+        # worker exceeded its automatic restart budget.
+        self._runtime_error = None
         self._scan_after_frame_id = self._last_frame_id
         self.scan_button.configure(text="扫描中…", state="disabled")
         self.status.set("正在扫描当前牌局，请保持斗地主窗口可见…")
