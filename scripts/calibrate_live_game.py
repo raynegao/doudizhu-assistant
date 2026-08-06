@@ -4,7 +4,7 @@ import argparse
 from pathlib import Path
 
 from src.capture.screen_geometry import MacWindowCapture
-from src.pipeline.live_layout import (
+from src.config.live_layout import (
     LiveLayoutConfig,
     load_live_layout,
     render_layout_preview,
@@ -42,7 +42,7 @@ def main(argv: list[str] | None = None) -> int:
     if config.app_name != args.app_name:
         payload = config.to_payload()
         payload["app_name"] = args.app_name
-        from src.pipeline.live_layout import live_layout_from_dict
+        from src.config.live_layout import live_layout_from_dict
 
         config = live_layout_from_dict(payload)
     frame = MacWindowCapture(args.app_name).capture(frame_id=1)

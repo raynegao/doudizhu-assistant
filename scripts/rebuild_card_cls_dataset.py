@@ -9,9 +9,13 @@ from pathlib import Path
 
 from PIL import Image
 
-from scripts.generate_card_cls_dataset import RANKS, augment_image, load_seed_images, parse_image_size
+from scripts.generate_card_cls_dataset import (
+    RANKS,
+    augment_image,
+    load_seed_images,
+    parse_image_size,
+)
 from src.vision.card_classifier import DEFAULT_IMAGE_SIZE
-
 
 TEMPLATE_SPLITS: tuple[str, ...] = ("train", "val")
 REAL_SPLITS: tuple[str, ...] = ("train", "val", "test")

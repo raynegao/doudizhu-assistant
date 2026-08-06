@@ -5,12 +5,10 @@ import csv
 import json
 from pathlib import Path
 
-import torch
 from torch.utils.data import DataLoader
 
 from scripts.train_card_cnn import CardImageDataset
-from src.vision.card_classifier import CARD_CLASSES, load_checkpoint, select_device
-
+from src.vision.card_classifier import load_checkpoint, select_device
 
 FOCUS_PAIRS: tuple[set[str], ...] = (
     {"SJ", "BJ"},

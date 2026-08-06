@@ -7,17 +7,16 @@ arbitrary paths from a request and never controls a game client.
 from __future__ import annotations
 
 import argparse
-from html import escape
 import json
+from collections.abc import Callable, Iterable
+from html import escape
 from pathlib import Path
-from typing import Callable, Iterable
 from urllib.parse import parse_qs
 from wsgiref.simple_server import make_server
 
 from src.logic.action_validation import validate_observed_action
 from src.logic.monte_carlo import MonteCarloSettings, recommend_phase4
 from src.state.replay import load_event_replay
-
 
 DEFAULT_SCENARIOS = {
     path.stem: path for path in sorted(Path("examples/phase5").glob("*.jsonl"))

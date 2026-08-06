@@ -8,72 +8,29 @@
 
 ## 2. 当前结构评审
 
-当前仓库已经完成 Phase 1 规则引擎 MVP、Phase 2 本地 CNN 牌面识别 replay、Phase 3/3.5 实时识别与稳定化、Phase 4 显式牌局状态/蒙特卡洛决策、Phase 5 工程展示，以及 Phase 6 完整场面感知代码闭环：
+当前仓库已经完成 Phase 1 规则引擎 MVP、Phase 2 本地 CNN 牌面识别 replay、Phase 3/3.5 实时识别与稳定化、Phase 4 显式牌局状态/蒙特卡洛决策、Phase 5 工程展示，以及 Phase 6 完整场面感知和离线验收工具闭环：
 
 ```text
-configs/
-  app.example.yaml
-docs/
-  ARCHITECTURE.md
-  EVALUATION.md
-  PORTFOLIO.md
-  SHOWCASE.md
-tests/
-  test_card_classifier.py
-  test_card_dataset_scripts.py
-  test_cards.py
-  test_decision_cli.py
-  test_phase2_replay.py
-  test_phase3_runtime.py
-  test_game_tracker.py
-  test_opponent_model.py
-  test_phase4_decision.py
-  test_phase4_cli.py
-  test_event_replay.py
-  test_phase5_showcase.py
-  test_rules.py
-scripts/
-  calibrate_phase3_roi.py
-  crop_hand_roi_cards.py
-  predict_card_crops.py
-  run_phase4_decision.py
-  run_phase5_showcase.py
-  run_phase3_runtime.py
-  replay_phase2.py
-  train_card_cnn.py
 src/
-  capture/
-  config/
-  logic/
-    action_validation.py
-    decision.py
-    monte_carlo.py
-    opponent_model.py
-    rules.py
-  pipeline/
-    calibration.py
-    runtime.py
-    stabilizer.py
-  reporting/
-    showcase.py
-  state/
-    cards.py
-    events.py
-    game_tracker.py
-    game_state.py
-    observable_state.py
-    replay.py
-  tracking/
-  ui/
-    cli.py
-  vision/
-    card_classifier.py
+  capture/      # WindowServer/Retina 截图、录制回放输入
+  config/       # 通用配置和不依赖 pipeline 的 LiveLayoutConfig
+  vision/       # CNN、场面/角色/余牌/牌点视觉观测
+  tracking/     # 多帧门控和视觉事件
+  state/        # 牌局事件、reducer、守恒和未知信息
+  logic/        # 规则、对手抽样、蒙特卡洛和置信区间
+  pipeline/     # Phase 3/6 实时编排和兼容入口
+  ui/           # CLI、Web、终端和只读 Tk overlay
+  reporting/    # Showcase、日志诊断和 Phase 6 聚合验收
+scripts/        # 标定、训练、录制、replay、评测、诊断和验收 CLI
+tests/          # 单元、集成、回放、生命周期和证据链测试
+docs/           # 架构、展示、Live 使用与验收规范
+configs/        # 可提交示例；真实本地配置保持忽略
 README.md
-pytest.ini
+pyproject.toml
 requirements-dev.txt
 ```
 
-整体模块方向合理，已经把采集、视觉、跟踪、状态、决策和 UI 分成不同包。Phase 6 使用 Retina-aware 窗口帧和归一化 ROI 生成 `SceneObservation`，由 `VisualEventTracker` 产生既有 `ObservedAction`，再由 `LiveGameRuntime` 异步计算胜率并推送只读置顶窗。当前缺口转为真实完整对局数据和独立 replay 指标，而不是代码接口缺失。
+整体模块方向合理，已经把采集、视觉、跟踪、状态、决策、报告和 UI 分成不同包。Phase 6 使用 Retina-aware 窗口帧和归一化 ROI 生成 `SceneObservation`，由 `VisualEventTracker` 产生 `ObservedAction`，再由 `LiveGameRuntime` 异步计算胜率并推送只读置顶窗。`vision` 已不再反向依赖 `pipeline`；共享 Live 布局配置位于 `src/config/live_layout.py`。当前缺口是 5–10 局真实完整对局与独立牌面 holdout，而不是离线接口或验收脚本缺失。
 
 ## 3. 推荐分层
 
@@ -228,7 +185,7 @@ Phase 1 最小日志字段：
 
 目标：把截图、识别、状态、决策、展示串成可刷新系统。
 
-状态：第一版已实现。当前支持 Mac 固定 ROI 截屏、内存切牌、CNN 推理、`GameStateSnapshot` 构造、合法动作/推荐、终端实时面板和 JSONL 日志。第一版未包含的窗口定位和跨帧稳定识别已在 Phase 3.5 补齐；复杂 GUI、蒙特卡洛胜率估计和自动操作仍未实现。
+状态：第一版已实现。当前支持 Mac 固定 ROI 截屏、内存切牌、CNN 推理、`GameStateSnapshot` 构造、合法动作/推荐、终端实时面板和 JSONL 日志。窗口定位和跨帧稳定识别由 Phase 3.5 补齐，蒙特卡洛和只读 overlay 由 Phase 4/6 补齐；自动操作始终不在范围内。
 
 核心内容：
 
@@ -279,7 +236,7 @@ Phase 4 数据流：
   -> 三人 rollout -> ActionEvaluation -> Top-K 推荐/理由/风险 -> JSONL
 ```
 
-边界：当前实时视觉没有对手出牌 ROI、过牌信号和剩余张数 OCR，因此不能自动生成完整事件流。Phase 4 的概率模型是固定 seed 的均匀剩余牌基线，不等同于精确对手牌预测；未确认的低置信度事件会把状态标记为 `uncertain` 并阻断推荐，信息不足的确定性回退不输出伪胜率。
+边界：Phase 4 是纯结构化状态与决策层，不直接读取实时视觉；Phase 6 负责生成对手出牌、过牌和余牌事件。概率模型仍是固定 seed 的均匀未知牌基线，不等同于精确对手牌预测；现输出抽样标准误、95% 置信区间和 Top 候选区间重叠警告。未确认事件会把状态标记为 `uncertain` 并阻断推荐。
 
 ### Phase 5：工程化展示
 
@@ -316,13 +273,18 @@ macOS WindowServer window capture + Retina geometry -> LiveLayoutConfig ROIs -> 
 - Tk UI 与截图/Vision 识别分进程运行，隔离 macOS CoreFoundation 辅助进程；识别进程异常退出可在原小窗内自动拉起。
 - 未建模或窗口中断后，跟踪器会在自己回合的场面连续稳定 2 帧时自动重建；自己回合优先按黄色出牌控件的结构信号判断，整块 turn 模板只作回退。左右余牌通过黄色字形分割和归一化轮廓匹配直接读取；Tk UI 的“扫描当前牌局”通过进程间命令队列提供强制重扫，并在最多 8 个可用帧内吸收短暂遮挡或动画帧。手牌用随代码分发的匿名二值牌点特征和本地真实模板修正 CNN，紧密重叠场面牌按垂直边缘逐张切分。中盘缺失的历史牌点只计入 `hidden_played_count`，决策采样时把这部分作为未知历史弃牌池，不伪造具体牌点。
 - 手牌分割以最早的牌顶白色行锚定，并复用本局牌点参考，避免游戏提示横幅把牌身切成多段后误读牌底。
-- Window ID 在正常帧之间复用，白色区域和牌边缘改用 NumPy 批量计算；真实经典窗口单帧采集加识别通常约 0.6–0.9 秒。
+- 正常帧优先由持久化 ScreenCaptureKit 窗口流提供，Window ID 截图保留为回退；白色区域和牌边缘使用 NumPy 批量计算。当前 Mac 热态采集约 9.8 ms、完整识别中位数约 128 ms，真实循环约 6.19 FPS。
+- 正式录制将 10 FPS RGB 帧流写入 `libx264rgb` 无损 Matroska 分段，manifest 逐帧保存 segment/index、时间戳和像素哈希；完整性、replay 与盲标顺序解码，不把整局展开进内存。中断恢复创建新 segment，旧 PNG 开发 session 保持兼容。
 - 短暂过牌提示被漏采时，仅在后续行动者的出牌和余牌减少能够严格证明事件顺序时补记 pass，不凭空猜测牌面。
 - 视觉事件必须连续稳定并符合当前行动者、合法牌型和余牌变化。
 - 任何漏事件、低置信度或牌数冲突都切换为 `uncertain`，不继续输出伪胜率。
 - 推荐按估计团队胜率排序，策略分只作为解释字段。
 - UI 只消费运行快照，不承载截图、状态更新或决策主循环。
 - 不自动点击；均匀未知牌模型仍属于可解释概率基线。
+- 推荐概率同时输出样本标准误和 95% 置信区间；候选区间重叠时明确提示排序不稳定。
+- 真实录制带不可变配置快照和 session/frame/ROI SHA256，中断安全收尾后显式 finalize；replay 绑定 manifest、配置、模型、模板和事件日志，评测再绑定人工标注；聚合门禁拒绝跨 session 重复帧、资产替换和过期报告。
+- 不确定错误帧按原因去重、冷却并限制每局/每次运行配额，避免单故障生成数百张重复图片。
+- GUI PID 文件由所属进程原子写入和清理；识别进程、队列及进程句柄在退出和重启时显式释放。
 
 ## 6. 逐层模块职责
 
@@ -384,7 +346,7 @@ macOS WindowServer window capture + Retina geometry -> LiveLayoutConfig ROIs -> 
 
 职责：把已完成的离线决策结果汇总为可追溯证据，不改变状态或算法输出。
 
-当前实现：Phase 5A 使用纯 Python 生成 JSON、Markdown 和自包含 HTML，记录环境、固定 seed、决策指纹、Top-K、延迟和风险字段；输出默认位于被忽略的 `runs/`。
+当前实现：Phase 5A 使用纯 Python 生成 JSON、Markdown 和自包含 HTML；Phase 6 增加流式 Live 日志诊断和跨 session 聚合验收，核对指标、状态守恒、报告输入 SHA256、独立帧和牌面 holdout。输出默认位于被忽略的 `runs/`。
 
 ### `src/config/`
 
@@ -392,19 +354,19 @@ macOS WindowServer window capture + Retina geometry -> LiveLayoutConfig ROIs -> 
 
 合理性：已有 Pydantic 配置是好的开始。
 
-当前实现已用 `LoggingConfig.json_output` 消除 Pydantic 属性遮蔽，并通过 alias 兼容配置文件中的 `json` 字段。`ConfigManager` 仍要求 `Path`，README/示例需保持一致。
+当前实现已用 `LoggingConfig.json_output` 消除 Pydantic 属性遮蔽，并通过 alias 兼容配置文件中的 `json` 字段。`LiveLayoutConfig` 位于本层，供 vision/pipeline/scripts 共同使用；`src/pipeline/live_layout.py` 只保留兼容 re-export，避免 `vision -> pipeline` 反向依赖。
 
 建议：随着项目扩展，配置应拆分为 `CaptureConfig`、`VisionConfig`、`TrackingConfig`、`StateConfig`、`DecisionConfig`、`RuntimeConfig`、`UIConfig`、`AgentConfig`、`LoggingConfig`。
 
 ## 7. 建议新增模块
 
-### `src/pipeline/` 或 `src/runtime/`
+### `src/pipeline/`
 
-这是后续实时系统最应该补的模块。
+该模块已经落地，是 Phase 3/6 的实时编排层。
 
 职责：串联截图、推理、跟踪、状态更新、决策和 UI 推送；管理异步队列、线程池、背压、FPS 和错误恢复。
 
-当前 Phase 3/3.5 已新增 `src/pipeline/runtime.py`、`calibration.py` 和 `stabilizer.py`，职责收敛为固定 ROI 截屏、窗口标定、内存切牌、CNN 分类、跨帧投票、规则推荐、终端事件和 JSONL 日志。后续再逐步扩展到对局事件跟踪、异步队列和 GUI 推送。
+当前包含 Phase 3 的 `runtime.py` 和 Phase 6 的 `live_runtime.py`，负责固定/窗口截图、视觉观测、跨帧事件、状态 reducer、异步决策、断点和 UI 快照。配置与纯视觉细节不能回流进该层形成循环依赖。
 
 建议数据流：
 
@@ -491,19 +453,18 @@ ExplanationEvent
 
 短期优先级：
 
-1. 保持 Phase 1 的 `GameState -> 合法动作 -> 基础推荐 -> CLI 输出 -> JSONL 日志` 闭环稳定。
-2. 保持 Phase 2 的固定 ROI、CNN 识别、replay 和评估脚本可复现。
-3. 进入 Phase 3 前，先定义实时 `Frame`、`CardObservation`、状态刷新事件和 JSONL 日志字段。
-4. 继续补充真实截图 fixture，验证当前 100% 小样本准确率的泛化边界。
-5. `ruff`、`mypy` 或 `pyright` 放到后续工程化阶段。
+1. 保持 `make quality` 的 Ruff、Mypy、Pytest 和分支覆盖率门禁通过。
+2. 录制 5–10 局彼此独立的完整对局，逐局标注动作、余牌和终局。
+3. 运行 replay 评测和 `make phase6-acceptance`，只用指纹校验通过的报告发布指标。
+4. 用未参与模板修正的真实牌面 holdout 验证分类泛化，要求其模型 SHA256 与 replay 一致，再按错误类别决定是否调整 CNN。
+5. 使用 `make live-diagnostics` 定位高频不确定原因和 P95 延迟，按证据修正而非继续堆规则。
 
 中期优先级：
 
-1. 建立合成数据和少量真实截图标注流程。
-2. 先训练小 CNN 牌面分类器并导出 ONNX；YOLOv8n 或 YOLOv11n 检测器只作为后续扩展路线。
-3. 建立视觉指标：mAP、precision、recall、分类 Top-1/Top-3、端到端牌面准确率。
-4. 建立实时指标：平均延迟、P95 延迟、FPS、掉帧率。
-5. 建立日志回放工具，让 Demo 可复现。
+1. 若独立数据暴露固定 ROI/规则切牌瓶颈，再比较小 CNN、ONNX 和可选 YOLO 路线。
+2. 根据完整对局证据改进 pass-aware 对手分布或策略模型，并保持不确定性可解释。
+3. 对真实窗口延迟、掉帧和整局成功率建立稳定回归数据集。
+4. 通过带 SHA256 的 Release artifact 发布可复现模型，而不是提交权重到 Git。
 
 长期优先级：
 
@@ -535,9 +496,9 @@ ExplanationEvent
 
 ### GUI
 
-- 快速 Demo：CLI/TUI + WebSocket JSON
-- 作品集展示：FastAPI + React/Vite
-- 桌面 overlay：后续再考虑 PySide6、Qt 或系统级透明窗口
+- 当前实时入口：只读 Tk 置顶窗，截图/Vision 在独立子进程中。
+- 离线展示：CLI、最小只读 Web/API 和自包含 Showcase。
+- 不把 React/PySide 或自动操作作为真实验收前的优先事项。
 
 ### Docker
 

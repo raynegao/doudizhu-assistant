@@ -26,7 +26,7 @@ python -m scripts.calibrate_live_game \
 - `data/live_game/calibration/live_layout_preview.png`：窗口 ROI 叠加图。
 - `data/live_game/calibration/live_layout_contact_sheet.png`：各 ROI 预览。
 
-采集使用 WindowServer Window ID 和窗口级 `screencapture`，不会把覆盖在牌桌上的 Codex/终端窗口误截进来。Retina 比例直接由窗口逻辑尺寸和窗口图像尺寸计算，不会为了获取比例额外截取整个桌面。先检查预览是否准确覆盖手牌、三家出牌区、左右余牌、三家角色和自己的出牌按钮。窗口移动无需重写归一化 ROI；窗口布局或缩放样式改变时需要重新标定。
+采集优先使用 `native/macos_window_stream.swift` 提供的 ScreenCaptureKit 持久化窗口流；源码按哈希在本地忽略目录编译缓存，不提交二进制。它不会把覆盖在牌桌上的 Codex/终端窗口误截进来，也不再为每帧启动 `screencapture`。Swift 不可用或流异常时自动回退到 WindowServer Window ID 截图。Retina 比例直接由窗口逻辑尺寸和窗口图像尺寸计算，不会为了获取比例额外截取整个桌面。先检查预览是否准确覆盖手牌、三家出牌区、左右余牌、三家角色和自己的出牌按钮。窗口移动无需重写归一化 ROI；窗口布局或缩放样式改变时需要重新标定。
 
 ## 2. 建立真实界面模板
 
@@ -83,11 +83,16 @@ python -m scripts.export_rank_glyph_signatures \
 ```bash
 python -m scripts.record_live_game \
   --config configs/live_game.local.json \
-  --session game-001 \
-  --frames 800
+  --session acceptance-001 \
+  --evidence-split acceptance \
+  --until-interrupt
 ```
 
-输出完整窗口、每个 ROI 和 `manifest.jsonl`。建议录制 5–10 局，按完整 session 划分模板/微调数据和 replay holdout，不能把同一局拆到两侧。
+对局结束后按 `Ctrl-C`，录制器会关闭并封印当前无损视频 segment，把已落盘帧数和中断状态原子写回。确认这一局完整后执行 `make live-finalize SESSION=acceptance-001`。输出还包含不可变 `config.snapshot.json`；正式局保存无损 Matroska 容器 SHA256、逐帧完整 RGB 像素 SHA256，以及可从解码帧无损重算的 ROI 像素 SHA256。这样既保留 10 FPS 快速动作，又不会用逐帧 PNG 写满磁盘；完整性检查和 replay 都会顺序解码并复算。同名 session 默认拒绝静默追加，中断后只能在配置和证据分区未变化时显式使用 `--resume`，恢复时创建新 segment 而不修改旧容器。
+
+默认未写 `--evidence-split` 的录制属于 `development`，可用于模板调整、模型微调和排错，但不会进入正式聚合。正式 `acceptance` session 会在录制时封印实现、模型和模板 SHA256；录制后只要改过其中任何一项，该局就自动失效，必须重新录制。建议在代码冻结后一次性录制 5–10 局，不能把同一局拆到开发集和验收集。
+
+正式局必须先盲标再 replay。运行 `make live-annotate-prepare SESSION=acceptance-001` 生成只含原始帧的 contact sheet，人工填写 `expected-events.jsonl` 与 `expected-scenes.jsonl` 后，运行 `make live-annotate-seal SESSION=acceptance-001` 封存。封存完成前禁止生成或查看 replay 预测；已有 replay 输出时工具会拒绝封存，正式 replay 也会拒绝未封存的标注。
 
 从录制帧中提取并标注场上出牌：
 
@@ -105,13 +110,12 @@ python -m scripts.label_live_play \
 
 ```bash
 python -m scripts.replay_live_game \
-  --config configs/live_game.local.json \
   --manifest data/live_game/recordings/game-005/manifest.jsonl \
   --output-dir runs/live-replay/game-005 \
   --quiet
 ```
 
-将人工确认的动作保存为 `expected-events.jsonl`，格式与 `play_observed` / `pass_observed` 一致；可选的 `expected-scenes.jsonl` 每行保存 `frame_id` 和三家 `remaining`。生成验收报告：
+将人工确认的动作保存为 `expected-events.jsonl`，格式与 `play_observed` / `pass_observed` 一致；`expected-scenes.jsonl` 要为每个预期动作至少选一帧稳定画面，保存 `frame_id` 和三家 `remaining`。生成验收报告：
 
 ```bash
 python -m scripts.evaluate_live_replay \
@@ -119,8 +123,11 @@ python -m scripts.evaluate_live_replay \
   --expected-events data/live_game/recordings/game-005/expected-events.jsonl \
   --expected-scenes data/live_game/recordings/game-005/expected-scenes.jsonl \
   --output runs/live-replay/game-005/evaluation.json \
+  --require-complete-round \
   --require-thresholds
 ```
+
+replay 默认使用录制时的配置快照并生成 `replay.json`，其中包含 manifest、配置、模型、模板和事件日志指纹；已有输出默认拒绝覆盖。全部 session 完成后运行 `make phase6-acceptance`。聚合审计会逐帧核对完整图/ROI，检查独立 session、跨 session 泄漏、replay/标注指纹、动作/牌点/余牌指标、54 张守恒、终局结果、整局成功率和真实窗口牌面 holdout。完整说明见 [`docs/PHASE6_ACCEPTANCE.md`](PHASE6_ACCEPTANCE.md)。
 
 ## 4. 运行助手
 
@@ -197,9 +204,9 @@ Makefile 会优先使用项目 `.venv/bin/python`，无需手动激活虚拟环�
 - 当前 trick 中，若对手余牌未减少且界面已明确回到自己的回合，状态机会按行动顺序补记“不出”；
 - 两名对手连续不出后清空当前 trick，当前行动者回到最后出牌者；若是自己，立即触发自由出牌 Top-3 计算。
 
-低置信度、漏事件或冲突会暂停推荐；不可恢复的持续冲突才切换到 `uncertain`。同一轮相同故障只保存一张错误帧到 `data/live_game/errors/`，避免不确定状态持续刷盘；下次稳定识别到自己回合时会自动重建，也可按“扫描当前牌局”立即请求重扫。活动跟踪状态若与桌面稳定漂移，会在不增加任何一家的余牌、当前手牌仍是已跟踪手牌子集，并且手牌或至少一家余牌确实减少的前提下自动重建；仅有场上旧牌残留不会反向污染正确状态。日志默认写入 `logs/live_assistant.jsonl`，包含 `scene_observation`、`play/pass_observed`、`state_update`、`live_decision` 和运行延迟；每条动作额外带 `round_id` 与来源 `frame_id`。等待窗口和稳定跟踪期间只记录内容变化与每 20 帧心跳，动作、重扫和新决策仍立即记录。文件达到 64 MiB 后自动带时间戳归档并保留历史。主界面收到 `SIGTERM`/`SIGINT` 时也会走正常关闭路径，停止识别子进程并回收多进程队列；识别子进程重启导致帧号回到 1 时，GUI 会同步重置扫描游标，避免按钮被旧帧号长期锁住。
+低置信度、漏事件或冲突会暂停推荐；不可恢复的持续冲突才切换到 `uncertain`。错误帧按“round + 稳定故障类型”跨短暂恢复继续去重，默认同类冷却 60 秒、每局最多 4 张、每次运行最多 25 张；文件名永不覆盖，保存记录写入 JSONL。下次稳定识别到自己回合时会自动重建，也可按“扫描当前牌局”立即请求重扫。活动跟踪状态若与桌面稳定漂移，会在不增加任何一家的余牌、当前手牌仍是已跟踪手牌子集，并且手牌或至少一家余牌确实减少的前提下自动重建；仅有场上旧牌残留不会反向污染正确状态。日志默认写入 `logs/live_assistant.jsonl`，包含 `scene_observation`、`play/pass_observed`、`state_update`、`live_decision` 和运行延迟；每条动作额外带 `round_id` 与来源 `frame_id`。等待窗口和稳定跟踪期间只记录内容变化与每 20 帧心跳，动作、重扫和新决策仍立即记录。文件达到 64 MiB 后自动带时间戳归档并保留历史。`make live-diagnostics` 可生成错误类型与延迟汇总。主界面收到 `SIGTERM`/`SIGINT` 时也会走正常关闭路径，停止识别子进程、关闭已结束进程句柄并回收多进程队列；PID 文件由主进程原子写入，只由所属进程删除，启动器会清理失效或 PID 复用的旧记录。
 
-默认决策预算为 1.5 秒、至少 32 组 sampled worlds、Top-3，并按估计团队胜率优先排序。
+默认决策预算为 1.5 秒、至少 32 组 sampled worlds、Top-3，并按估计团队胜率优先排序。每个候选同时输出样本均值的标准误和 95% 置信区间；前两名区间重叠时记录 `top_action_confidence_intervals_overlap`，避免把接近的有限样本结果描述成确定差距。
 
 ## 6. 真实验收
 
@@ -212,3 +219,5 @@ Makefile 会优先使用项目 `.venv/bin/python`，无需手动激活虚拟环�
 - 无法确认的事件必须暂停推荐。
 
 在完成真实数据评测前，只能声明 Phase 6 代码闭环和自动化测试通过，不能宣传上述真实指标已经达到。
+
+正式聚合口径和一键审计命令以 [`docs/PHASE6_ACCEPTANCE.md`](PHASE6_ACCEPTANCE.md) 为准。

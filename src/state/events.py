@@ -1,9 +1,9 @@
 from __future__ import annotations
 
+import math
+from collections.abc import Mapping
 from dataclasses import dataclass
 from enum import Enum
-import math
-from typing import Mapping
 
 from .cards import CardSet
 
@@ -45,7 +45,7 @@ class ObservedAction:
             raise ValueError("confidence must be a finite value between 0 and 1")
 
     @classmethod
-    def from_payload(cls, payload: Mapping[str, object]) -> "ObservedAction":
+    def from_payload(cls, payload: Mapping[str, object]) -> ObservedAction:
         try:
             event_type = str(payload.get("event", "play_observed"))
             if event_type not in {"play_observed", "pass_observed"}:
@@ -66,10 +66,10 @@ class ObservedAction:
                 raise ValueError("pass_observed cannot contain cards")
             return cls(
                 event_id=event_id,
-                sequence_no=int(payload["sequence_no"]),
+                sequence_no=int(str(payload["sequence_no"])),
                 actor=PlayerSeat(actor),
                 cards=cards,
-                confidence=float(payload.get("confidence", 1.0)),
+                confidence=float(str(payload.get("confidence", 1.0))),
                 source=str(payload.get("source", "manual")),
             )
         except (KeyError, TypeError, ValueError) as exc:

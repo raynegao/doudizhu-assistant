@@ -2,15 +2,14 @@ from __future__ import annotations
 
 import argparse
 import json
-from pathlib import Path
 import sys
+from pathlib import Path
 
 from src.reporting.showcase import (
     ShowcaseSettings,
     build_showcase_report,
     write_showcase_artifacts,
 )
-
 
 DEFAULT_EVENT_FILES = tuple(sorted(Path("examples/phase5").glob("*.jsonl")))
 

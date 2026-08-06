@@ -1,9 +1,9 @@
 from __future__ import annotations
 
 import json
-from pathlib import Path
 import subprocess
 import sys
+from pathlib import Path
 
 
 def test_phase4_cli_replays_events_and_writes_jsonl(tmp_path: Path) -> None:

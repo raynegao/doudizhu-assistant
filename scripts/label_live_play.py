@@ -8,7 +8,7 @@ from pathlib import Path
 
 from PIL import Image
 
-from src.pipeline.live_layout import load_live_layout
+from src.config.live_layout import load_live_layout
 from src.state.cards import normalize_rank, validate_card_counts
 from src.vision.scene_recognizer import segment_card_boxes
 
@@ -59,7 +59,7 @@ def main(argv: list[str] | None = None) -> int:
     output_dir.mkdir(parents=True, exist_ok=True)
     manifest_path = output_dir / "manifest.jsonl"
     with manifest_path.open("w", encoding="utf-8") as manifest:
-        for index, (box, label) in enumerate(zip(boxes, labels)):
+        for index, (box, label) in enumerate(zip(boxes, labels, strict=True)):
             card = play_crop.crop(box)
             rank_height = max(1, round(card.height * 0.68))
             card = card.crop((0, 0, card.width, rank_height))

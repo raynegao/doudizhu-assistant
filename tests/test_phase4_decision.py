@@ -14,8 +14,7 @@ from src.logic.monte_carlo import (
 )
 from src.logic.opponent_model import OpponentDeal, UniformOpponentModel
 from src.logic.rules import Play, legal_actions
-from src.state.cards import FULL_DECK
-from src.state.cards import CardSet
+from src.state.cards import FULL_DECK, CardSet
 from src.state.events import PlayerSeat
 from src.state.observable_state import ObservableGameState
 

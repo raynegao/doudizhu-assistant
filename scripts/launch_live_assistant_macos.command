@@ -104,10 +104,15 @@ assistant_is_running() {
   local existing_command
   existing_pid="$(<"$PID_PATH")"
   if [[ "$existing_pid" != <-> ]] || ! kill -0 "$existing_pid" 2>/dev/null; then
+    /bin/rm -f "$PID_PATH" 2>/dev/null
     return 1
   fi
   existing_command="$(ps -p "$existing_pid" -o command= 2>/dev/null)"
-  [[ "$existing_command" == *"scripts.run_live_assistant --config configs/live_game.local.json"* ]]
+  if [[ "$existing_command" == *"scripts.run_live_assistant --config configs/live_game.local.json"* ]]; then
+    return 0
+  fi
+  /bin/rm -f "$PID_PATH" 2>/dev/null
+  return 1
 }
 
 acquire_launch_lock() {
@@ -184,6 +189,7 @@ print ""
 
 /usr/bin/nohup "$PYTHON_PATH" -m scripts.run_live_assistant \
   --config configs/live_game.local.json \
+  --pid-file "$PID_PATH" \
   >> "$LOG_PATH" 2>&1 </dev/null &
 assistant_pid=$!
 disown "$assistant_pid" 2>/dev/null || true
@@ -195,8 +201,6 @@ if ! kill -0 "$assistant_pid" >/dev/null 2>&1; then
   show_error_and_wait "助手进程未能保持运行"
   exit 1
 fi
-print "$assistant_pid" > "$PID_PATH"
-
 /usr/bin/osascript -e \
   'display notification "实时识别小窗已经启动" with title "斗地主助手"'
 exit 0

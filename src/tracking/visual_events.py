@@ -1,12 +1,12 @@
 from __future__ import annotations
 
-from collections import Counter
+from collections import Counter, deque
+from collections.abc import Callable, Sequence
 from dataclasses import dataclass, replace
 from enum import Enum
-from typing import Callable, Sequence
 
 from src.logic.action_validation import validate_observed_action
-from src.logic.rules import Play, PlayType
+from src.logic.rules import Play, PlayType, legal_actions
 from src.state.cards import FULL_DECK, CardSet
 from src.state.events import ObservedAction, PlayerSeat, RoundPhase
 from src.state.game_tracker import GameStateTracker, StateUpdateStatus
@@ -118,6 +118,10 @@ class VisualEventTracker:
         self._role_stable = _StableValue()
         self._seat_stable = {seat: _StableValue() for seat in PlayerSeat}
         self._armed = {seat: False for seat in PlayerSeat}
+        self._recent_scenes: deque[SceneObservation] = deque(maxlen=6)
+        self._actor_entry_frame_id: int | None = None
+        self._self_actor_entry_hand_count: int | None = None
+        self._self_actor_entry_frame_id: int | None = None
         self._uncertain_reason: str | None = None
 
     @property
@@ -282,23 +286,132 @@ class VisualEventTracker:
                 warnings=(reason,),
             )
 
+        self._recent_scenes.append(scene)
         expected = state.current_actor
-        observation = scene.seat(expected)
-        fingerprint = _seat_fingerprint(
-            observation,
-            self_hand=scene.self_hand if expected is PlayerSeat.SELF else (),
-            self_turn=scene.self_turn if expected is PlayerSeat.SELF else None,
+        current_observation = scene.seat(expected)
+        buffered_evidence = _buffered_play_evidence(
+            state,
+            expected,
+            self._recent_scenes,
+            confidence_threshold=self.confidence_threshold,
+            min_frame_id=self._actor_entry_frame_id,
         )
-        stable_count = self._seat_stable[expected].update(fingerprint)
-        hand_change = (
-            _self_hand_change(
+        buffered_pass_scene = _buffered_pass_evidence(
+            state,
+            expected,
+            self._recent_scenes,
+            confidence_threshold=self.confidence_threshold,
+            min_frame_id=self._actor_entry_frame_id,
+        )
+        observation = (
+            buffered_evidence[1]
+            if buffered_evidence is not None
+            else (
+                buffered_pass_scene.seat(expected)
+                if buffered_pass_scene is not None
+                else current_observation
+            )
+        )
+        buffered_observation = (
+            buffered_evidence is not None
+            or buffered_pass_scene is not None
+        ) and (
+            observation is not current_observation
+        )
+        stable_counts = {
+            seat: self._seat_stable[seat].update(_seat_fingerprint(
+                scene.seat(seat),
+                self_hand=(
+                    scene.self_hand if seat is PlayerSeat.SELF else ()
+                ),
+                self_turn=(
+                    scene.self_turn if seat is PlayerSeat.SELF else None
+                ),
+            ))
+            for seat in PlayerSeat
+        }
+        stable_count = stable_counts[expected]
+        hand_change_scene = scene
+        hand_change = None
+        if expected is PlayerSeat.SELF:
+            hand_change = _self_hand_change(
                 state,
                 scene,
                 confidence_threshold=self.confidence_threshold,
             )
-            if expected is PlayerSeat.SELF
-            else None
-        )
+            for candidate_scene in self._recent_scenes:
+                if (
+                    self._self_actor_entry_frame_id is not None
+                    and candidate_scene.frame_id
+                    < self._self_actor_entry_frame_id
+                ):
+                    continue
+                candidate_change = _self_hand_change(
+                    state,
+                    candidate_scene,
+                    confidence_threshold=self.confidence_threshold,
+                )
+                if (
+                    candidate_change is not None
+                    and candidate_change.error is None
+                ):
+                    hand_change_scene = candidate_scene
+                    hand_change = candidate_change
+                    break
+        if (
+            expected is PlayerSeat.SELF
+            and hand_change is not None
+            and self._self_actor_entry_hand_count is not None
+        ):
+            successor = (
+                state.trick_leader
+                if state.consecutive_passes == 1
+                else state.next_player(PlayerSeat.SELF)
+            )
+            assert successor is not None
+            successor_observation = scene.seat(successor)
+            target = (
+                Play.parse(state.trick_target.cards)
+                if state.trick_target
+                else None
+            )
+            forced_pass = bool(
+                target is not None
+                and not legal_actions(
+                    state.self_hand,
+                    target,
+                    include_pass=False,
+                )
+            )
+            if (
+                state.consecutive_passes == 0
+                and self._armed[successor]
+                and successor_observation.signal is VisualSignal.PASS
+                and successor_observation.pass_confidence
+                >= self.confidence_threshold
+                and successor_observation.remaining_verified
+                and successor_observation.remaining_count
+                == state.remaining_for(successor)
+                and (
+                    forced_pass
+                    or (
+                        self._self_actor_entry_hand_count
+                        < len(state.self_hand)
+                        and self._self_actor_entry_hand_count
+                        == len(scene.self_hand)
+                    )
+                )
+                and not (
+                    hand_change.error is None
+                    and len(hand_change_scene.self_hand)
+                    < self._self_actor_entry_hand_count
+                )
+            ):
+                # The apparent hand decrease already existed before self
+                # became current, while the next seat has since crossed from
+                # neutral to an explicit pass.  This is an under-segmented
+                # hand crop followed by a real self pass, not a self play.
+                hand_change = None
 
         # A genuine self-hand difference is a normal event and must get the
         # first opportunity to advance the reducer. The generic drift recovery
@@ -311,7 +424,27 @@ class VisualEventTracker:
 
         if expected is PlayerSeat.SELF:
             if hand_change is not None:
-                required = min(2, self.stability_frames)
+                successor = state.next_player(PlayerSeat.SELF)
+                successor_play_proves_action = _remaining_proves_play(
+                    state,
+                    hand_change_scene.seat(successor),
+                    confidence_threshold=self.confidence_threshold,
+                )
+                required = (
+                    1
+                    if (
+                        hand_change.error is None
+                        and (
+                            (
+                                hand_change_scene.self_turn is False
+                                and hand_change_scene.self_turn_confidence
+                                >= self.confidence_threshold
+                            )
+                            or successor_play_proves_action
+                        )
+                    )
+                    else min(2, self.stability_frames)
+                )
                 if stable_count < required:
                     if (
                         scene.self_turn is True
@@ -397,6 +530,26 @@ class VisualEventTracker:
                     event,
                 )
 
+        pass_successor = (
+            state.trick_leader
+            if state.consecutive_passes == 1
+            else state.next_player(expected)
+        )
+        assert pass_successor is not None
+        buffered_successor_play = _buffered_play_evidence(
+            state,
+            pass_successor,
+            self._recent_scenes,
+            confidence_threshold=self.confidence_threshold,
+            min_frame_id=self._actor_entry_frame_id,
+        )
+        buffered_successor_pass = _buffered_pass_evidence(
+            state,
+            pass_successor,
+            self._recent_scenes,
+            confidence_threshold=self.confidence_threshold,
+            min_frame_id=self._actor_entry_frame_id,
+        )
         if _can_infer_pass(
             state,
             scene,
@@ -404,6 +557,9 @@ class VisualEventTracker:
             confidence_threshold=self.confidence_threshold,
             stable_count=stable_count,
             stability_frames=self.stability_frames,
+            successor_action_armed=self._armed.get(pass_successor, False),
+            buffered_successor_play=buffered_successor_play is not None,
+            buffered_successor_pass=buffered_successor_pass is not None,
         ):
             event = ObservedAction(
                 event_id=(
@@ -416,7 +572,17 @@ class VisualEventTracker:
                 confidence=_inferred_pass_confidence(scene, observation),
                 source="live_turn_inferred_pass",
             )
-            return self._apply_event(scene, observation, event)
+            transition_evidence = (
+                buffered_successor_play[0]
+                if buffered_successor_play is not None
+                else buffered_successor_pass
+            )
+            return self._apply_event(
+                scene,
+                observation,
+                event,
+                actor_transition_scene=transition_evidence,
+            )
 
         if (
             expected is PlayerSeat.SELF
@@ -438,7 +604,11 @@ class VisualEventTracker:
             confidence_threshold=self.confidence_threshold,
         )
         if corroborated_confidence is not None:
-            if stable_count < self.stability_frames:
+            # A verified counter drop equal to the visible card count is an
+            # independent second signal.  Waiting for three identical frames
+            # here loses normal one-second table animations and makes the
+            # reducer observe the following action under the wrong actor.
+            if stable_count < 1:
                 return VisualTrackerUpdate(
                     mode=self.mode,
                     message=(
@@ -463,9 +633,22 @@ class VisualEventTracker:
                 actor=expected,
                 cards=cards,
                 confidence=corroborated_confidence,
-                source="live_visual_remaining_correlated",
+                source=(
+                    "live_visual_remaining_correlated_buffered"
+                    if buffered_observation
+                    else "live_visual_remaining_correlated"
+                ),
             )
-            return self._apply_event(scene, observation, event)
+            return self._apply_event(
+                scene,
+                observation,
+                event,
+                actor_transition_scene=(
+                    buffered_evidence[0]
+                    if buffered_evidence is not None
+                    else None
+                ),
+            )
 
         if observation.signal is VisualSignal.NEUTRAL:
             self._armed[expected] = True
@@ -520,12 +703,26 @@ class VisualEventTracker:
                 message=f"忽略 {expected.value} 的旧场面提示，等待空白到动作的新变化",
                 state=state,
             )
-        if stable_count < self.stability_frames:
+        required_stability = _action_stability_frames(
+            state,
+            observation,
+            armed=self._armed[expected],
+            default=self.stability_frames,
+        )
+        if (
+            buffered_pass_scene is not None
+            and observation.signal is VisualSignal.PASS
+        ):
+            # A neutral -> explicit pass edge plus an unchanged verified
+            # counter is already two independent observations.  The notice
+            # commonly survives for only one recorded frame.
+            required_stability = 1
+        if stable_count < required_stability:
             return VisualTrackerUpdate(
                 mode=self.mode,
                 message=(
                     f"稳定 {expected.value} 动作 "
-                    f"{stable_count}/{self.stability_frames}"
+                    f"{stable_count}/{required_stability}"
                 ),
                 state=state,
             )
@@ -543,9 +740,22 @@ class VisualEventTracker:
             actor=expected,
             cards=cards,
             confidence=confidence,
-            source="live_visual",
+            source=(
+                "live_visual_buffered"
+                if buffered_observation
+                else "live_visual"
+            ),
         )
-        return self._apply_event(scene, observation, event)
+        return self._apply_event(
+            scene,
+            observation,
+            event,
+            actor_transition_scene=(
+                buffered_evidence[0]
+                if buffered_evidence is not None
+                else None
+            ),
+        )
 
     def scan_current_scene(
         self,
@@ -575,7 +785,7 @@ class VisualEventTracker:
     def _initialize_current_scan(
         self,
         scene: SceneObservation,
-        payload: "_CurrentScanPayload",
+        payload: _CurrentScanPayload,
         *,
         automatic: bool,
     ) -> VisualTrackerUpdate:
@@ -625,6 +835,10 @@ class VisualEventTracker:
             seat: scene.seat(seat).signal is VisualSignal.NEUTRAL
             for seat in PlayerSeat
         }
+        self._recent_scenes = deque((scene,), maxlen=6)
+        self._actor_entry_frame_id = scene.frame_id
+        self._self_actor_entry_hand_count = len(scene.self_hand)
+        self._self_actor_entry_frame_id = scene.frame_id
         trick = (
             " ".join(payload.trick_target)
             if payload.trick_target
@@ -727,6 +941,8 @@ class VisualEventTracker:
         scene: SceneObservation,
         observation: SeatObservation,
         event: ObservedAction,
+        *,
+        actor_transition_scene: SceneObservation | None = None,
     ) -> VisualTrackerUpdate:
         assert self._tracker is not None
         state = self._tracker.state
@@ -745,6 +961,18 @@ class VisualEventTracker:
         self._armed[expected] = False
         self._active_scan_stable = _StableValue()
         next_actor = result.state.current_actor
+        transition_scene = actor_transition_scene or scene
+        self._actor_entry_frame_id = transition_scene.frame_id
+        self._self_actor_entry_hand_count = (
+            len(transition_scene.self_hand)
+            if next_actor is PlayerSeat.SELF
+            else None
+        )
+        self._self_actor_entry_frame_id = (
+            transition_scene.frame_id
+            if next_actor is PlayerSeat.SELF
+            else None
+        )
         if scene.seat(next_actor).signal is VisualSignal.NEUTRAL:
             self._armed[next_actor] = True
         if result.state.phase is RoundPhase.FINISHED:
@@ -794,11 +1022,15 @@ class VisualEventTracker:
         self._role_stable = _StableValue()
         self._seat_stable = {seat: _StableValue() for seat in PlayerSeat}
         self._armed = {seat: False for seat in PlayerSeat}
+        self._recent_scenes = deque(maxlen=6)
+        self._actor_entry_frame_id = None
+        self._self_actor_entry_hand_count = None
+        self._self_actor_entry_frame_id = None
 
     def _initialize(
         self,
         scene: SceneObservation,
-        initial: "_InitialStatePayload",
+        initial: _InitialStatePayload,
     ) -> VisualTrackerUpdate:
         round_id = self.round_id_factory(scene)
         try:
@@ -852,6 +1084,18 @@ class VisualEventTracker:
             seat: scene.seat(seat).signal is VisualSignal.NEUTRAL
             for seat in PlayerSeat
         }
+        self._recent_scenes = deque((scene,), maxlen=6)
+        self._actor_entry_frame_id = scene.frame_id
+        self._self_actor_entry_hand_count = (
+            len(scene.self_hand)
+            if state.current_actor is PlayerSeat.SELF
+            else None
+        )
+        self._self_actor_entry_frame_id = (
+            scene.frame_id
+            if state.current_actor is PlayerSeat.SELF
+            else None
+        )
         return VisualTrackerUpdate(
             mode=self.mode,
             message=_initialization_message(initial, state),
@@ -1553,28 +1797,38 @@ def _self_hand_change(
     observed_cards = tuple(card.rank for card in scene.self_hand)
     observed = Counter(observed_cards)
     previous = Counter(state.self_hand.cards)
-    unexpected = observed - previous
     confidence, _ = _stable_hand_confidence(
         scene.self_hand,
         confidence_threshold=confidence_threshold,
     )
-    if unexpected:
+    removed_count = len(state.self_hand) - len(scene.self_hand)
+    successor = state.next_player(PlayerSeat.SELF)
+    successor_play_proves_action = _remaining_proves_play(
+        state,
+        scene.seat(successor),
+        confidence_threshold=confidence_threshold,
+    )
+    inferred = _infer_self_play_from_legal_actions(
+        state,
+        observed_cards,
+        removed_count=removed_count,
+        max_corrections=(3 if successor_play_proves_action else 1),
+    )
+    if inferred is None:
+        unexpected = observed - previous
+        detail = (
+            " ".join(sorted(unexpected.elements()))
+            if unexpected
+            else "no unique legal hand-difference interpretation"
+        )
         return _SelfHandChange(
             cards=None,
             confidence=confidence,
             error=(
                 "self hand change contains ranks outside the tracked hand: "
-                + " ".join(sorted(unexpected.elements()))
+                + detail
             ),
         )
-    removed = previous - observed
-    cards = CardSet.parse(
-        card
-        for rank, count in removed.items()
-        for card in [rank] * count
-    )
-    if not cards:
-        return None
     if confidence < confidence_threshold:
         return _SelfHandChange(
             cards=None,
@@ -1584,7 +1838,80 @@ def _self_hand_change(
                 f"{confidence_threshold:.3f}"
             ),
         )
-    return _SelfHandChange(cards=cards, confidence=confidence)
+    return _SelfHandChange(cards=inferred, confidence=confidence)
+
+
+def _infer_self_play_from_legal_actions(
+    state: ObservableGameState,
+    observed_cards: tuple[str, ...],
+    *,
+    removed_count: int,
+    max_corrections: int,
+) -> CardSet | None:
+    """Resolve a hand difference against the legal-action set.
+
+    A selected/moving hand occasionally gives one crop the neighbouring
+    rank.  The previous implementation treated that single classifier error
+    as permanent state drift.  Here the physical previous hand, observed hand
+    size and current trick jointly constrain the answer.  Normally only one
+    substitution is allowed; a verified next-player action permits a few more
+    transient glyph errors, still only when one legal action is the unique
+    best fit.
+    """
+
+    if removed_count <= 0:
+        return None
+    observed = Counter(observed_cards)
+    previous = Counter(state.self_hand.cards)
+    target = Play.parse(state.trick_target.cards) if state.trick_target else None
+    candidates: list[tuple[int, int, CardSet]] = []
+    for play in legal_actions(state.self_hand, target, include_pass=False):
+        if len(play.cards) != removed_count:
+            continue
+        remaining = previous - Counter(play.cards)
+        # Both counters have the same total.  The positive difference counts
+        # the number of rank substitutions needed to explain the observation.
+        substitutions = sum((observed - remaining).values())
+        remaining_cards = CardSet.parse(
+            rank
+            for rank, count in remaining.items()
+            for _ in range(count)
+        ).cards
+        ordered_mismatches = min(
+            sum(
+                actual != expected
+                for actual, expected in zip(
+                    observed_cards,
+                    expected_order,
+                    strict=True,
+                )
+            )
+            for expected_order in (
+                remaining_cards,
+                tuple(reversed(remaining_cards)),
+            )
+        )
+        candidates.append((
+            substitutions,
+            ordered_mismatches,
+            CardSet.parse(play.cards),
+        ))
+    if not candidates:
+        return None
+    candidates = list({
+        cards.cards: (substitutions, ordered, cards)
+        for substitutions, ordered, cards in candidates
+    }.values())
+    candidates.sort(key=lambda item: (item[0], item[1], item[2].cards))
+    best_score = candidates[0][:2]
+    best = [cards for error, ordered, cards in candidates if (error, ordered) == best_score]
+    if (
+        best_score[0] > max_corrections
+        or best_score[1] > max_corrections
+        or len(best) != 1
+    ):
+        return None
+    return best[0]
 
 
 def _remaining_confirms_play(
@@ -1597,6 +1924,90 @@ def _remaining_confirms_play(
         and observation.remaining_count
         == state.remaining_for(observation.seat) - len(observation.cards)
     )
+
+
+def _buffered_play_evidence(
+    state: ObservableGameState,
+    seat: PlayerSeat,
+    scenes: Sequence[SceneObservation],
+    *,
+    confidence_threshold: float,
+    min_frame_id: int | None = None,
+) -> tuple[SceneObservation, SeatObservation] | None:
+    """Recover a short-lived play captured beside the preceding action.
+
+    The game may advance twice between processed frames.  A later actor's
+    cards can therefore be visible in the same image in which the reducer is
+    still committing the preceding actor.  The verified post-play counter is
+    monotonic and makes such a cached observation unambiguous once that actor
+    becomes current.
+    """
+
+    if seat is PlayerSeat.SELF:
+        return None
+    for scene in reversed(scenes):
+        if min_frame_id is not None and scene.frame_id < min_frame_id:
+            continue
+        observation = scene.seat(seat)
+        if _remaining_confirms_play(state, observation):
+            return scene, observation
+        if _terminal_play_confirms_round(state, observation):
+            return scene, observation
+        if _verified_low_confidence_play(
+            state,
+            observation,
+            confidence_threshold=confidence_threshold,
+        ) is not None:
+            return scene, observation
+    return None
+
+
+def _buffered_pass_evidence(
+    state: ObservableGameState,
+    seat: PlayerSeat,
+    scenes: Sequence[SceneObservation],
+    *,
+    confidence_threshold: float,
+    min_frame_id: int | None = None,
+) -> SceneObservation | None:
+    previous: SeatObservation | None = None
+    for scene in scenes:
+        observation = scene.seat(seat)
+        if (
+            (min_frame_id is None or scene.frame_id >= min_frame_id)
+            and previous is not None
+            and previous.signal is VisualSignal.NEUTRAL
+            and observation.signal is VisualSignal.PASS
+            and observation.pass_confidence >= confidence_threshold
+            and observation.remaining_verified
+            and observation.remaining_count == state.remaining_for(seat)
+        ):
+            return scene
+        previous = observation
+    return None
+
+
+def _action_stability_frames(
+    state: ObservableGameState,
+    observation: SeatObservation,
+    *,
+    armed: bool,
+    default: int,
+) -> int:
+    """Use one frame only when the action has an independent visual proof."""
+
+    if _remaining_confirms_play(state, observation):
+        return 1
+    if armed and _terminal_play_confirms_round(state, observation):
+        return 1
+    if (
+        armed
+        and observation.signal is VisualSignal.PASS
+        and observation.remaining_verified
+        and observation.remaining_count == state.remaining_for(observation.seat)
+    ):
+        return min(2, default)
+    return default
 
 
 def _verified_low_confidence_play(
@@ -1624,6 +2035,49 @@ def _verified_low_confidence_play(
     return min(
         observation.remaining_confidence,
         max(card_confidence, calibrated_floor),
+    )
+
+
+def _remaining_proves_play(
+    state: ObservableGameState,
+    observation: SeatObservation,
+    *,
+    confidence_threshold: float,
+) -> bool:
+    return bool(
+        _remaining_confirms_play(state, observation)
+        or _terminal_play_confirms_round(state, observation)
+        or _verified_low_confidence_play(
+            state,
+            observation,
+            confidence_threshold=confidence_threshold,
+        ) is not None
+    )
+
+
+def _terminal_play_confirms_round(
+    state: ObservableGameState,
+    observation: SeatObservation,
+) -> bool:
+    """Accept the visible last hand when the counter disappears at zero.
+
+    The client removes an opponent's yellow counter at the same moment as the
+    final card animation.  The previously tracked count is still exact: if the
+    player had N cards and the newly visible legal group contains N cards, the
+    action itself proves the zero transition.  Requiring an unavailable or
+    unverified post-action counter prevents this path from weakening ordinary
+    mid-round counter checks.
+    """
+
+    return bool(
+        observation.seat is not PlayerSeat.SELF
+        and observation.signal is VisualSignal.PLAY
+        and observation.cards
+        and state.remaining_for(observation.seat) == len(observation.cards)
+        and (
+            observation.remaining_count is None
+            or not observation.remaining_verified
+        )
     )
 
 
@@ -1672,6 +2126,9 @@ def _can_infer_pass(
     confidence_threshold: float,
     stable_count: int,
     stability_frames: int,
+    successor_action_armed: bool = False,
+    buffered_successor_play: bool = False,
+    buffered_successor_pass: bool = False,
 ) -> bool:
     # A visible card group always gets the first opportunity to become a play.
     # The self-turn indicator describes the end of the whole opponent cycle;
@@ -1682,19 +2139,87 @@ def _can_infer_pass(
         and observation.signal in {VisualSignal.PLAY, VisualSignal.UNKNOWN}
     ):
         return False
+    if not state.trick_target:
+        return False
     if (
-        not state.trick_target
-        or not observation.remaining_verified
-        or observation.remaining_count != state.remaining_for(observation.seat)
-        or observation.remaining_confidence < confidence_threshold
+        observation.seat is not PlayerSeat.SELF
+        and (
+            not observation.remaining_verified
+            or observation.remaining_count
+            != state.remaining_for(observation.seat)
+            or observation.remaining_confidence < confidence_threshold
+        )
     ):
         return False
     if observation.seat is PlayerSeat.SELF:
+        successor = (
+            state.trick_leader
+            if state.consecutive_passes == 1
+            else state.next_player(PlayerSeat.SELF)
+        )
+        successor_play_proves_pass = bool(
+            successor is not None
+            and successor is not PlayerSeat.SELF
+            and (
+                _remaining_proves_play(
+                    state,
+                    scene.seat(successor),
+                    confidence_threshold=confidence_threshold,
+                )
+                or (
+                    state.consecutive_passes == 0
+                    and scene.seat(successor).remaining_verified
+                    and scene.seat(successor).remaining_count
+                    == state.remaining_for(successor)
+                    and _remaining_proves_play(
+                        state,
+                        scene.seat(state.next_player(successor)),
+                        confidence_threshold=confidence_threshold,
+                    )
+                )
+            )
+        )
+        successor_observation = (
+            scene.seat(successor)
+            if successor is not None and successor is not PlayerSeat.SELF
+            else None
+        )
+        successor_pass_proves_pass = bool(
+            state.consecutive_passes == 0
+            and (successor_action_armed or buffered_successor_pass)
+            and successor_observation is not None
+            and (
+                buffered_successor_pass
+                or (
+                    successor_observation.signal is VisualSignal.PASS
+                    and successor_observation.pass_confidence
+                    >= confidence_threshold
+                    and successor_observation.remaining_verified
+                    and successor_observation.remaining_count
+                    == state.remaining_for(successor_observation.seat)
+                )
+            )
+        )
         try:
-            if scene.self_hand_set != state.self_hand:
+            exact_hand = scene.self_hand_set == state.self_hand
+            same_physical_count = len(scene.self_hand) == len(state.self_hand)
+            if not exact_hand and not (
+                (
+                    same_physical_count
+                    and successor_play_proves_pass
+                )
+                or successor_pass_proves_pass
+            ):
                 return False
         except ValueError:
-            return False
+            if not (
+                (
+                    len(scene.self_hand) == len(state.self_hand)
+                    and successor_play_proves_pass
+                )
+                or successor_pass_proves_pass
+            ):
+                return False
         # The local client does not always keep a visible "不出" label for
         # our own seat. A stable disappearance of the turn controls while the
         # complete hand remains unchanged proves a pass. self_turn participates
@@ -1703,7 +2228,11 @@ def _can_infer_pass(
         if (
             scene.self_turn is False
             and scene.self_turn_confidence >= confidence_threshold
-            and stable_count >= stability_frames
+            and (
+                stable_count >= stability_frames
+                or successor_play_proves_pass
+                or successor_pass_proves_pass
+            )
         ):
             return True
     elif scene.self_turn is True:
@@ -1722,7 +2251,11 @@ def _can_infer_pass(
         return bool(
             scene.self_turn is True
             and scene.self_turn_confidence >= confidence_threshold
-        )
+            )
+    if buffered_successor_play:
+        return True
+    if buffered_successor_pass and state.consecutive_passes == 0:
+        return True
     successor_observation = scene.seat(successor)
     if _remaining_confirms_play(state, successor_observation):
         return True
@@ -1753,6 +2286,26 @@ def _inferred_pass_confidence(
     scene: SceneObservation,
     observation: SeatObservation,
 ) -> float:
+    if observation.seat is PlayerSeat.SELF:
+        # A hand-rank outlier must not lower a pass that is independently
+        # proved by the turn returning to us or by a verified opponent action.
+        # The physical hand-count equality was already checked by
+        # _can_infer_pass.
+        proof_confidences: list[float] = []
+        if scene.self_turn is not None:
+            proof_confidences.append(scene.self_turn_confidence)
+        for seat in scene.seats:
+            if seat.seat is PlayerSeat.SELF:
+                continue
+            if seat.signal in {VisualSignal.PLAY, VisualSignal.PASS}:
+                proof_confidences.append(
+                    min(
+                        _action_confidence(seat),
+                        seat.remaining_confidence,
+                    )
+                )
+        if proof_confidences:
+            return max(proof_confidences)
     confidences = [observation.remaining_confidence]
     if scene.self_turn is True:
         confidences.append(scene.self_turn_confidence)

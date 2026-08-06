@@ -1,11 +1,16 @@
 from __future__ import annotations
 
 import argparse
+import sys
 from pathlib import Path
 
-import sys
-
-from src.pipeline import DEFAULT_APP_NAME, WindowLookupError, calibrate_roi, find_window, save_runtime_config
+from src.pipeline import (
+    DEFAULT_APP_NAME,
+    WindowLookupError,
+    calibrate_roi,
+    find_window,
+    save_runtime_config,
+)
 
 
 def build_parser() -> argparse.ArgumentParser:

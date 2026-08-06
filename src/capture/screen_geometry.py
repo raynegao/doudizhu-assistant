@@ -4,13 +4,17 @@ import os
 import subprocess
 import tempfile
 import time
+from collections.abc import Callable
 from dataclasses import dataclass
 from enum import Enum
 from pathlib import Path
-from typing import Callable
 
 from PIL import Image, ImageGrab
 
+from src.capture.macos_stream import (
+    MacOSStreamCaptureError,
+    ScreenCaptureKitWindowStream,
+)
 from src.pipeline.calibration import WindowInfo, find_window
 
 
@@ -84,6 +88,7 @@ class CapturedWindow:
     window: WindowInfo
     pixel_box: tuple[int, int, int, int]
     geometry: ScreenGeometry
+    capture_backend: str = "unknown"
 
 
 @dataclass(frozen=True)
@@ -324,7 +329,11 @@ class MacWindowCapture:
             find_window_server_window
         ),
         window_grabber: Callable[[int], Image.Image] = grab_window_by_id,
+        stream_factory: Callable[[str], ScreenCaptureKitWindowStream] = (
+            ScreenCaptureKitWindowStream
+        ),
         prefer_window_level: bool = True,
+        prefer_streaming: bool = True,
         clock: Callable[[], float] = time.time,
     ) -> None:
         self.app_name = app_name
@@ -333,15 +342,58 @@ class MacWindowCapture:
         self._grabber = grabber
         self._window_server_finder = window_server_finder
         self._window_grabber = window_grabber
+        self._stream_factory = stream_factory
         self._prefer_window_level = prefer_window_level
+        legacy_capture_overridden = (
+            window_server_finder is not find_window_server_window
+            or window_grabber is not grab_window_by_id
+        )
+        self._prefer_streaming = (
+            prefer_window_level
+            and prefer_streaming
+            and not legacy_capture_overridden
+        )
         self._clock = clock
         self._geometry: ScreenGeometry | None = None
         self._window_server_info: WindowServerInfo | None = None
+        self._window_stream: ScreenCaptureKitWindowStream | None = None
+        self._stream_retry_after_frame = 0
 
     def capture(self, frame_id: int) -> CapturedWindow:
         if self._prefer_window_level:
+            if (
+                self._prefer_streaming
+                and frame_id >= self._stream_retry_after_frame
+            ):
+                try:
+                    return self._capture_stream_level(frame_id)
+                except MacOSStreamCaptureError:
+                    self._close_window_stream()
+                    self._stream_retry_after_frame = frame_id + 20
             return self._capture_window_level(frame_id)
         return self._capture_screen_crop(frame_id)
+
+    def _capture_stream_level(self, frame_id: int) -> CapturedWindow:
+        if self._window_stream is None:
+            self._window_stream = self._stream_factory(self.app_name)
+        streamed = self._window_stream.capture()
+        try:
+            geometry = _geometry_from_window_image(
+                streamed.window,
+                streamed.image.size,
+            )
+        except ScreenGeometryError as exc:
+            raise MacOSStreamCaptureError(str(exc)) from exc
+        pixel_box = geometry.logical_to_pixel_box(streamed.window.window_box)
+        return CapturedWindow(
+            frame_id=frame_id,
+            timestamp=streamed.timestamp,
+            image=streamed.image,
+            window=streamed.window,
+            pixel_box=pixel_box,
+            geometry=geometry,
+            capture_backend="screen_capture_kit_stream",
+        )
 
     def _capture_window_level(self, frame_id: int) -> CapturedWindow:
         # Querying CGWindowList through a new Swift process costs hundreds of
@@ -362,14 +414,14 @@ class MacWindowCapture:
             )
         try:
             image = self._window_grabber(info.window_id).convert("RGB")
-        except ScreenGeometryError:
+        except ScreenGeometryError as exc:
             self._window_server_info = self._window_server_finder(self.app_name)
             info = self._window_server_info
             if not info.is_onscreen:
                 raise WindowAvailabilityError(
                     WindowCaptureStatus.MINIMIZED,
                     "斗地主窗口已最小化，当前无法识别；请还原窗口",
-                )
+                ) from exc
             image = self._window_grabber(info.window_id).convert("RGB")
         # A WindowServer image already has the exact target-window pixels.
         # Derive the Retina scale from that image instead of taking an
@@ -379,7 +431,7 @@ class MacWindowCapture:
         # with "could not create image from display".
         try:
             geometry = _geometry_from_window_image(info.window, image.size)
-        except ScreenGeometryError:
+        except ScreenGeometryError as exc:
             refreshed = self._window_server_finder(self.app_name)
             self._window_server_info = refreshed
             info = refreshed
@@ -387,7 +439,7 @@ class MacWindowCapture:
                 raise WindowAvailabilityError(
                     WindowCaptureStatus.MINIMIZED,
                     "斗地主窗口已最小化，当前无法识别；请还原窗口",
-                )
+                ) from exc
             image = self._window_grabber(info.window_id).convert("RGB")
             geometry = _geometry_from_window_image(info.window, image.size)
         pixel_box = geometry.logical_to_pixel_box(info.window.window_box)
@@ -398,6 +450,7 @@ class MacWindowCapture:
             window=info.window,
             pixel_box=pixel_box,
             geometry=geometry,
+            capture_backend="window_server_screenshot",
         )
 
     def _capture_screen_crop(self, frame_id: int) -> CapturedWindow:
@@ -428,7 +481,29 @@ class MacWindowCapture:
             window=window,
             pixel_box=pixel_box,
             geometry=geometry,
+            capture_backend="screen_crop",
         )
+
+    def close(self) -> None:
+        self._close_window_stream()
+
+    def _close_window_stream(self) -> None:
+        if self._window_stream is None:
+            return
+        self._window_stream.close()
+        self._window_stream = None
+
+    def __enter__(self) -> MacWindowCapture:
+        return self
+
+    def __exit__(self, *_exc: object) -> None:
+        self.close()
+
+    def __del__(self) -> None:
+        try:
+            self.close()
+        except Exception:  # noqa: BLE001
+            pass
 
 
 __all__ = [

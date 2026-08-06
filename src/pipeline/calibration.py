@@ -3,10 +3,9 @@ from __future__ import annotations
 import json
 import subprocess
 import time
-from dataclasses import asdict, dataclass
+from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
-
 
 DEFAULT_APP_NAME = "斗地主"
 DEFAULT_WINDOW_OFFSET = (33, 473)

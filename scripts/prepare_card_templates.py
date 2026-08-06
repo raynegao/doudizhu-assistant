@@ -8,7 +8,6 @@ from dataclasses import dataclass
 from pathlib import Path
 from time import sleep
 
-
 RANK_MAP = {
     "3": "3",
     "4": "4",
@@ -43,7 +42,7 @@ class RepoRef:
     ref: str
 
     @classmethod
-    def parse(cls, value: str) -> "RepoRef":
+    def parse(cls, value: str) -> RepoRef:
         if "@" not in value:
             raise ValueError(f"Repository must include a ref, e.g. owner/repo@main: {value}")
         owner_repo, ref = value.rsplit("@", 1)

@@ -2,19 +2,19 @@ from __future__ import annotations
 
 import argparse
 import json
-from pathlib import Path
 import random
 import warnings
+from pathlib import Path
 
-from PIL import Image
 import torch
+from PIL import Image
 from torch import nn
 from torch.utils.data import DataLoader, Dataset
 
 from src.vision.card_classifier import (
     CARD_CLASSES,
-    DEFAULT_IMAGE_SIZE,
     CLASS_TO_INDEX,
+    DEFAULT_IMAGE_SIZE,
     CardClassifierCNN,
     preprocess_image,
     save_checkpoint,

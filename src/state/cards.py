@@ -1,10 +1,9 @@
 from __future__ import annotations
 
-from collections import Counter
-from dataclasses import dataclass
 import re
-from typing import Iterable
-
+from collections import Counter
+from collections.abc import Iterable
+from dataclasses import dataclass
 
 RANKS: tuple[str, ...] = (
     "3",
@@ -112,7 +111,7 @@ class CardSet:
     cards: tuple[str, ...]
 
     @classmethod
-    def parse(cls, value: str | Iterable[str] | None) -> "CardSet":
+    def parse(cls, value: str | Iterable[str] | None) -> CardSet:
         cards = parse_cards(value)
         validate_card_counts(cards)
         return cls(cards)

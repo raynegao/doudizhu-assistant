@@ -1,14 +1,13 @@
 from __future__ import annotations
 
+from collections.abc import Iterable
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Iterable
 
-from PIL import Image, ImageOps
 import torch
-from torch import Tensor, nn
 import torch.nn.functional as F
-
+from PIL import Image, ImageOps
+from torch import Tensor, nn
 
 CARD_CLASSES: tuple[str, ...] = ("3", "4", "5", "6", "7", "8", "9", "10", "J", "Q", "K", "A", "2", "SJ", "BJ")
 CLASS_TO_INDEX: dict[str, int] = {rank: index for index, rank in enumerate(CARD_CLASSES)}

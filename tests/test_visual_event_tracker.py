@@ -17,7 +17,6 @@ from src.vision.scene_recognizer import (
     VisualSignal,
 )
 
-
 LANDLORD_HAND = (
     "3", "3", "3", "3",
     "4", "4", "4", "4",
@@ -58,7 +57,7 @@ def _scene(
     self_cards: tuple[str, ...] = (),
     right_signal: VisualSignal = VisualSignal.NEUTRAL,
     right_cards: tuple[str, ...] = (),
-    right_remaining: int = 17,
+    right_remaining: int | None = 17,
     right_remaining_verified: bool = True,
     left_signal: VisualSignal = VisualSignal.NEUTRAL,
     left_cards: tuple[str, ...] = (),
@@ -195,6 +194,182 @@ def _scene_with_landlord(
     )
 
 
+def test_verified_remaining_drop_confirms_opponent_play_in_one_frame() -> None:
+    state = ObservableGameState.from_inputs(
+        LANDLORD_HAND[1:],
+        round_id="round-fast-opponent",
+        landlord=PlayerSeat.SELF,
+        current_actor=PlayerSeat.RIGHT,
+        remaining_cards={
+            PlayerSeat.SELF: 19,
+            PlayerSeat.RIGHT: 17,
+            PlayerSeat.LEFT: 17,
+        },
+        played_cards=("3",),
+        last_play=("3",),
+        last_player=PlayerSeat.SELF,
+    )
+    tracker = VisualEventTracker(
+        stability_frames=3,
+        initial_state=state,
+    )
+
+    update = tracker.update(_scene(
+        frame_id=1,
+        visible_hand=LANDLORD_HAND[1:],
+        right_signal=VisualSignal.PLAY,
+        right_cards=("8",),
+        right_remaining=16,
+        self_turn=False,
+    ))
+
+    assert update.event is not None
+    assert update.event.actor is PlayerSeat.RIGHT
+    assert update.event.cards == CardSet.parse(("8",))
+    assert update.state is not None
+    assert update.state.current_actor is PlayerSeat.LEFT
+
+
+def test_compressed_two_passes_preserve_following_play_evidence() -> None:
+    hand = ("3", "5", "6")
+    state = ObservableGameState.from_inputs(
+        hand,
+        round_id="round-compressed-cycle",
+        landlord=PlayerSeat.SELF,
+        current_actor=PlayerSeat.SELF,
+        remaining_cards={
+            PlayerSeat.SELF: len(hand),
+            PlayerSeat.RIGHT: 17,
+            PlayerSeat.LEFT: 17,
+        },
+        played_cards=("4", "4", "4", "4"),
+        last_play=("4", "4", "4", "4"),
+        last_player=PlayerSeat.LEFT,
+    )
+    tracker = VisualEventTracker(stability_frames=3, initial_state=state)
+    compressed = _scene(
+        frame_id=1,
+        visible_hand=hand,
+        right_remaining=17,
+        left_signal=VisualSignal.PLAY,
+        left_cards=("A",),
+        left_remaining=16,
+        self_turn=False,
+    )
+
+    self_pass = tracker.update(compressed)
+    right_pass = tracker.update(replace(
+        compressed,
+        frame_id=2,
+        timestamp=2.0,
+        seats=tuple(
+            replace(seat, signal=VisualSignal.NEUTRAL, cards=())
+            for seat in compressed.seats
+        ),
+    ))
+    left_play = tracker.update(replace(
+        compressed,
+        frame_id=3,
+        timestamp=3.0,
+        seats=tuple(
+            replace(seat, signal=VisualSignal.NEUTRAL, cards=())
+            for seat in compressed.seats
+        ),
+    ))
+
+    assert self_pass.event is not None and self_pass.event.is_pass
+    assert self_pass.event.actor is PlayerSeat.SELF
+    assert right_pass.event is not None and right_pass.event.is_pass
+    assert right_pass.event.actor is PlayerSeat.RIGHT
+    assert left_play.event is not None
+    assert left_play.event.actor is PlayerSeat.LEFT
+    assert left_play.event.cards == CardSet.parse(("A",))
+
+
+def test_opponent_final_play_uses_tracked_count_when_counter_disappears() -> None:
+    hand = ("5", "6", "7")
+    state = ObservableGameState.from_inputs(
+        hand,
+        round_id="round-terminal-counter-hidden",
+        landlord=PlayerSeat.SELF,
+        current_actor=PlayerSeat.RIGHT,
+        remaining_cards={
+            PlayerSeat.SELF: len(hand),
+            PlayerSeat.RIGHT: 1,
+            PlayerSeat.LEFT: 17,
+        },
+        played_cards=("3",),
+        hidden_played_count=32,
+        last_play=("3",),
+        last_player=PlayerSeat.SELF,
+    )
+    tracker = VisualEventTracker(stability_frames=3, initial_state=state)
+    tracker.update(_scene(
+        frame_id=1,
+        visible_hand=hand,
+        right_remaining=1,
+        left_remaining=17,
+        self_turn=False,
+    ))
+
+    finished = tracker.update(_scene(
+        frame_id=2,
+        visible_hand=hand,
+        right_signal=VisualSignal.PLAY,
+        right_cards=("A",),
+        right_remaining=None,
+        right_remaining_verified=False,
+        left_remaining=17,
+        self_turn=False,
+    ))
+
+    assert finished.event is not None
+    assert finished.event.actor is PlayerSeat.RIGHT
+    assert finished.event.cards == CardSet.parse(("A",))
+    assert finished.mode is VisualTrackerMode.FINISHED
+    assert finished.state is not None
+    assert finished.state.remaining_for(PlayerSeat.RIGHT) == 0
+
+
+def test_self_hand_difference_corrects_one_unique_ordered_rank_error() -> None:
+    hand = ("5", "6", "7", "7", "7", "10", "J")
+    state = ObservableGameState.from_inputs(
+        hand,
+        round_id="round-hand-correction",
+        landlord=PlayerSeat.SELF,
+        current_actor=PlayerSeat.SELF,
+        remaining_cards={
+            PlayerSeat.SELF: len(hand),
+            PlayerSeat.RIGHT: 17,
+            PlayerSeat.LEFT: 16,
+        },
+        played_cards=("6",),
+        last_play=("6",),
+        last_player=PlayerSeat.LEFT,
+    )
+    tracker = VisualEventTracker(
+        stability_frames=3,
+        initial_state=state,
+    )
+    # True remaining hand after playing 10 is J, 7, 7, 7, 6, 5.  The middle
+    # seven is transiently classified as 2 while selected cards settle.
+    misread = ("J", "7", "2", "7", "6", "5")
+    scene = _scene(
+        frame_id=1,
+        visible_hand=misread,
+        right_remaining=17,
+        left_remaining=16,
+        self_turn=False,
+    )
+
+    applied = tracker.update(scene)
+
+    assert applied.event is not None
+    assert applied.event.cards == CardSet.parse(("10",))
+    assert applied.state is not None
+    assert applied.state.self_hand == CardSet.parse(("5", "6", "7", "7", "7", "J"))
+
+
 def test_visual_tracker_initializes_and_advances_play_pass_round() -> None:
     tracker = VisualEventTracker(
         stability_frames=2,
@@ -222,13 +397,8 @@ def test_visual_tracker_initializes_and_advances_play_pass_round() -> None:
     assert self_play.state.remaining_for(PlayerSeat.SELF) == 19
     assert self_play.state.current_actor is PlayerSeat.RIGHT
 
-    tracker.update(_scene(
-        frame_id=5,
-        self_signal=VisualSignal.NEUTRAL,
-        right_signal=VisualSignal.PASS,
-    ))
     right_pass = tracker.update(_scene(
-        frame_id=6,
+        frame_id=5,
         self_signal=VisualSignal.NEUTRAL,
         right_signal=VisualSignal.PASS,
     ))
@@ -236,12 +406,8 @@ def test_visual_tracker_initializes_and_advances_play_pass_round() -> None:
     assert right_pass.state is not None
     assert right_pass.state.current_actor is PlayerSeat.LEFT
 
-    tracker.update(_scene(
-        frame_id=7,
-        left_signal=VisualSignal.PASS,
-    ))
     left_pass = tracker.update(_scene(
-        frame_id=8,
+        frame_id=7,
         left_signal=VisualSignal.PASS,
     ))
     assert left_pass.event is not None and left_pass.event.is_pass
@@ -324,18 +490,17 @@ def test_visual_tracker_derives_self_play_and_two_passes_from_scene_state() -> N
     tracker.update(_scene(frame_id=2))
     remaining_hand = LANDLORD_HAND[1:]
 
-    stabilizing = tracker.update(_scene(
+    self_play = tracker.update(_scene(
         frame_id=3,
         visible_hand=remaining_hand,
         self_turn=False,
     ))
-    self_play = tracker.update(_scene(
+    tracker.update(_scene(
         frame_id=4,
         visible_hand=remaining_hand,
         self_turn=False,
     ))
 
-    assert stabilizing.event is None
     assert self_play.event is not None
     assert self_play.event.cards.cards == ("3",)
     assert self_play.event.source == "live_hand_diff"
@@ -648,14 +813,13 @@ def test_visual_tracker_finishes_on_empty_hand_then_initializes_next_round() -> 
         left_remaining=17,
         self_turn=False,
     )
-    stabilizing = tracker.update(terminal_scene)
-    finished = tracker.update(replace(
+    finished = tracker.update(terminal_scene)
+    cleared = tracker.update(replace(
         terminal_scene,
         frame_id=3,
         timestamp=3.0,
     ))
 
-    assert stabilizing.event is None
     assert finished.event is not None
     assert finished.event.actor is PlayerSeat.SELF
     assert finished.event.cards.cards == ("3",)
@@ -665,11 +829,6 @@ def test_visual_tracker_finishes_on_empty_hand_then_initializes_next_round() -> 
     assert finished.state.remaining_for(PlayerSeat.SELF) == 0
     assert finished.state.winner is PlayerSeat.SELF
 
-    cleared = tracker.update(replace(
-        terminal_scene,
-        frame_id=4,
-        timestamp=4.0,
-    ))
     assert cleared.mode is VisualTrackerMode.WAITING_FOR_ROUND
     assert cleared.state is None
     assert tracker.state is None
@@ -717,14 +876,13 @@ def test_visual_tracker_finishes_when_self_plays_a_final_pair() -> None:
         right_remaining=11,
         self_turn=False,
     )
-    stabilizing = tracker.update(empty_hand)
-    finished = tracker.update(replace(
+    finished = tracker.update(empty_hand)
+    tracker.update(replace(
         empty_hand,
         frame_id=202,
         timestamp=202.0,
     ))
 
-    assert stabilizing.event is None
     assert finished.event is not None
     assert finished.event.actor is PlayerSeat.SELF
     assert finished.event.cards.cards == ("K", "K")
@@ -798,8 +956,8 @@ def test_visual_tracker_finishes_when_opponent_plays_last_card() -> None:
         self_turn=False,
     )
 
-    tracker.update(terminal_scene)
-    finished = tracker.update(replace(
+    finished = tracker.update(terminal_scene)
+    cleared = tracker.update(replace(
         terminal_scene,
         frame_id=2,
         timestamp=2.0,
@@ -813,6 +971,7 @@ def test_visual_tracker_finishes_when_opponent_plays_last_card() -> None:
     assert finished.state.phase.value == "finished"
     assert finished.state.remaining_for(PlayerSeat.RIGHT) == 0
     assert finished.state.winner is PlayerSeat.RIGHT
+    assert cleared.mode is VisualTrackerMode.WAITING_FOR_ROUND
 
 
 def test_selected_card_animation_cannot_replace_pristine_opening_hand() -> None:
@@ -855,12 +1014,12 @@ def test_selected_card_animation_cannot_replace_pristine_opening_hand() -> None:
     remaining = list(LIVE_SELECTION_HAND)
     for rank in ("4", "5", "6", "7", "8", "9", "10", "J"):
         remaining.remove(rank)
-    tracker.update(_scene(
+    played = tracker.update(_scene(
         frame_id=5,
         visible_hand=tuple(remaining),
         self_turn=False,
     ))
-    played = tracker.update(_scene(
+    tracker.update(_scene(
         frame_id=6,
         visible_hand=tuple(remaining),
         self_turn=False,
@@ -907,12 +1066,25 @@ def test_visual_tracker_continues_after_self_play_opponent_bomb_and_pass() -> No
         self_turn=True,
     )
 
-    tracker.update(_scene(frame_id=3, **current))
-    self_play = tracker.update(_scene(frame_id=4, **current))
-    tracker.update(_scene(frame_id=5, **current))
-    tracker.update(_scene(frame_id=6, **current))
-    right_play = tracker.update(_scene(frame_id=7, **current))
-    left_pass = tracker.update(_scene(frame_id=8, **current))
+    followups = [
+        tracker.update(_scene(frame_id=frame_id, **current))
+        for frame_id in range(3, 9)
+    ]
+    self_play = next(
+        update
+        for update in followups
+        if update.event is not None and update.event.actor is PlayerSeat.SELF
+    )
+    right_play = next(
+        update
+        for update in followups
+        if update.event is not None and update.event.actor is PlayerSeat.RIGHT
+    )
+    left_pass = next(
+        update
+        for update in followups
+        if update.event is not None and update.event.actor is PlayerSeat.LEFT
+    )
 
     assert self_play.event is not None
     assert self_play.event.cards.cards == ("7", "2", "2", "2")
@@ -936,12 +1108,20 @@ def test_visual_tracker_continues_after_self_play_opponent_bomb_and_pass() -> No
         self_turn=True,
     )
     inferred_self_pass = tracker.update(_scene(frame_id=9, **later))
-    tracker.update(_scene(frame_id=10, **later))
-    tracker.update(_scene(frame_id=11, **later))
-    right_lead = tracker.update(_scene(frame_id=12, **later))
-    tracker.update(_scene(frame_id=13, **later))
-    tracker.update(_scene(frame_id=14, **later))
-    left_play = tracker.update(_scene(frame_id=15, **later))
+    later_updates = [
+        tracker.update(_scene(frame_id=frame_id, **later))
+        for frame_id in range(10, 16)
+    ]
+    right_lead = next(
+        update
+        for update in later_updates
+        if update.event is not None and update.event.actor is PlayerSeat.RIGHT
+    )
+    left_play = next(
+        update
+        for update in later_updates
+        if update.event is not None and update.event.actor is PlayerSeat.LEFT
+    )
 
     assert inferred_self_pass.event is not None
     assert inferred_self_pass.event.actor is PlayerSeat.SELF
@@ -1160,7 +1340,7 @@ def test_live_cycle_survives_counter_animation_without_rescan() -> None:
     after_a_cards = list(starting_hand)
     after_a_cards.remove("A")
     after_a = tuple(after_a_cards)
-    tracker.update(_scene(
+    self_play = tracker.update(_scene(
         frame_id=61,
         visible_hand=after_a,
         right_remaining=16,
@@ -1169,7 +1349,7 @@ def test_live_cycle_survives_counter_animation_without_rescan() -> None:
         left_remaining=16,
         self_turn=False,
     ))
-    self_play = tracker.update(_scene(
+    tracker.update(_scene(
         frame_id=62,
         visible_hand=after_a,
         right_remaining=16,
@@ -1560,12 +1740,12 @@ def test_auto_scanned_midgame_continues_through_full_trick_cycle() -> None:
         self_turn=False,
     )
     self_pass = tracker.update(right_play_scene)
-    tracker.update(replace(
+    right_play = tracker.update(replace(
         right_play_scene,
         frame_id=43,
         timestamp=43.0,
     ))
-    right_play = tracker.update(replace(
+    tracker.update(replace(
         right_play_scene,
         frame_id=44,
         timestamp=44.0,
@@ -1602,8 +1782,8 @@ def test_auto_scanned_midgame_continues_through_full_trick_cycle() -> None:
         left_remaining=7,
         self_turn=False,
     )
-    tracker.update(self_play_scene)
-    self_play = tracker.update(replace(
+    self_play = tracker.update(self_play_scene)
+    tracker.update(replace(
         self_play_scene,
         frame_id=47,
         timestamp=47.0,
@@ -1678,12 +1858,12 @@ def test_tracker_catches_up_three_missed_actions_from_live_table() -> None:
         frame_id=83,
         timestamp=83.0,
     ))
-    tracker.update(replace(
+    left_play = tracker.update(replace(
         current_table,
         frame_id=84,
         timestamp=84.0,
     ))
-    left_play = tracker.update(replace(
+    tracker.update(replace(
         current_table,
         frame_id=85,
         timestamp=85.0,

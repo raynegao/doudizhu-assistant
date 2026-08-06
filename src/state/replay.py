@@ -1,9 +1,9 @@
 from __future__ import annotations
 
-from dataclasses import dataclass
 import json
+from collections.abc import Mapping
+from dataclasses import dataclass
 from pathlib import Path
-from typing import Mapping
 
 from .events import DEFAULT_TURN_ORDER, ObservedAction
 from .game_tracker import (
@@ -49,26 +49,39 @@ def load_event_replay(
     remaining_payload = start.get("remaining_cards")
     if not isinstance(remaining_payload, dict):
         raise ValueError("game_started.remaining_cards must be an object")
-
-    state = ObservableGameState.from_inputs(
-        start.get("hand", ()),
-        round_id=str(start.get("round_id", path.stem)),
-        landlord=str(start.get("landlord", "self")),
-        current_actor=str(start.get("current_actor", "self")),
-        turn_order=start.get(
+    hand = _card_input(start.get("hand", ()), field="hand")
+    turn_order = _string_sequence(
+        start.get(
             "turn_order",
             [seat.value for seat in DEFAULT_TURN_ORDER],
         ),
+        field="turn_order",
+    )
+    played_cards = _card_input(
+        start.get("played_cards", ()),
+        field="played_cards",
+    )
+    last_play = _card_input(start.get("last_play", ()), field="last_play")
+    raw_last_player = start.get("last_player")
+    if raw_last_player is not None and not isinstance(raw_last_player, str):
+        raise ValueError("game_started.last_player must be a string or null")
+
+    state = ObservableGameState.from_inputs(
+        hand,
+        round_id=str(start.get("round_id", path.stem)),
+        landlord=str(start.get("landlord", "self")),
+        current_actor=str(start.get("current_actor", "self")),
+        turn_order=turn_order,
         remaining_cards={
-            str(seat): int(count)
+            str(seat): int(str(count))
             for seat, count in remaining_payload.items()
         },
-        played_cards=start.get("played_cards", ()),
-        hidden_played_count=int(start.get("hidden_played_count", 0)),
-        last_play=start.get("last_play", ()),
-        last_player=start.get("last_player"),
-        consecutive_passes=int(start.get("consecutive_passes", 0)),
-        state_confidence=float(start.get("state_confidence", 1.0)),
+        played_cards=played_cards,
+        hidden_played_count=int(str(start.get("hidden_played_count", 0))),
+        last_play=last_play,
+        last_player=raw_last_player,
+        consecutive_passes=int(str(start.get("consecutive_passes", 0))),
+        state_confidence=float(str(start.get("state_confidence", 1.0))),
     )
     tracker = GameStateTracker(
         state,
@@ -90,6 +103,24 @@ def load_event_replay(
         warnings=tuple(dict.fromkeys(warnings)),
         event_count=len(payloads) - 1,
     )
+
+
+def _card_input(value: object, *, field: str) -> str | tuple[str, ...]:
+    if isinstance(value, str):
+        return value
+    if isinstance(value, (list, tuple)) and all(
+        isinstance(item, str) for item in value
+    ):
+        return tuple(value)
+    raise ValueError(f"game_started.{field} must be a string or string array")
+
+
+def _string_sequence(value: object, *, field: str) -> tuple[str, ...]:
+    if isinstance(value, (list, tuple)) and all(
+        isinstance(item, str) for item in value
+    ):
+        return tuple(value)
+    raise ValueError(f"game_started.{field} must be a string array")
 
 
 __all__ = ["ReplayLoadResult", "load_event_replay"]
