@@ -70,7 +70,22 @@ jobs:
             requirements-dev.txt
       - name: Install full development dependencies
         run: python -m pip install -r requirements-dev.txt
+      - name: Lint
+        run: python -m ruff check src scripts tests
+      - name: Type check core and reporting layers
+        run: >-
+          python -m mypy
+          src/state
+          src/logic
+          src/config/live_layout.py
+          src/capture/recording_integrity.py
+          src/reporting
       - name: Run full test suite
         env:
           PYTHONWARNINGS: error
-        run: python -m pytest -q
+        run: >-
+          python -m pytest -q
+          --cov=src
+          --cov=scripts
+          --cov-report=term-missing
+          --cov-fail-under=65

@@ -13,10 +13,10 @@ from src.capture.screen_geometry import (
     WindowAvailabilityError,
     WindowCaptureStatus,
 )
+from src.config.live_layout import LiveLayoutConfig
 from src.logic.monte_carlo import MonteCarloSettings, recommend_phase4
 from src.logic.rules import Play
 from src.pipeline.calibration import WindowInfo
-from src.pipeline.live_layout import LiveLayoutConfig
 from src.pipeline.live_runtime import (
     LiveGameRuntime,
     _rotate_jsonl_log,
@@ -36,7 +36,6 @@ from src.vision.scene_recognizer import (
     VisualCard,
     VisualSignal,
 )
-
 
 POST_BIDDING_HAND = (
     "3", "3", "3", "3",
@@ -273,6 +272,32 @@ class _FinishedEventTracker(_Tracker):
                 source="live_hand_diff",
             ),
         )
+
+
+def test_live_runtime_closes_capture_source(
+    tmp_path: Path,
+    phase4_ready_state,
+) -> None:
+    class ClosableFrameSource(_FrameSource):
+        closed = False
+
+        def close(self) -> None:
+            self.closed = True
+
+    source = ClosableFrameSource()
+    runtime = LiveGameRuntime(
+        LiveLayoutConfig(
+            log_file=tmp_path / "live.jsonl",
+            error_frames_dir=tmp_path / "errors",
+        ),
+        frame_source=source,
+        recognizer=_Recognizer(),
+        tracker=_Tracker(phase4_ready_state),
+    )
+
+    runtime.close()
+
+    assert source.closed is True
 
 
 def test_live_runtime_schedules_and_logs_revision_scoped_decision(
@@ -674,6 +699,36 @@ def test_live_runtime_throttles_repeated_available_telemetry(
         ] == [1, 20]
 
 
+def test_live_replay_mode_logs_every_scene_frame(tmp_path: Path) -> None:
+    config = LiveLayoutConfig(
+        log_file=tmp_path / "live.jsonl",
+        error_frames_dir=tmp_path / "errors",
+    )
+    runtime = LiveGameRuntime(
+        config,
+        frame_source=_FrameSource(),
+        recognizer=_Recognizer(),
+        tracker=_Tracker(None),
+        sleeper=lambda _: None,
+        log_every_scene_frame=True,
+    )
+    try:
+        for frame_id in range(1, 4):
+            runtime.run_once(frame_id)
+    finally:
+        runtime.close()
+
+    rows = [
+        json.loads(line)
+        for line in config.log_file.read_text(encoding="utf-8").splitlines()
+    ]
+    assert [
+        row["frame_id"]
+        for row in rows
+        if row["event"] == "scene_observation"
+    ] == [1, 2, 3]
+
+
 def test_live_runtime_archives_oversized_log_without_deleting_it(
     tmp_path: Path,
 ) -> None:
@@ -1005,6 +1060,7 @@ def test_live_runtime_saves_one_error_frame_per_uncertain_episode(
     tmp_path: Path,
     phase4_ready_state,
 ) -> None:
+    error_frame_times = iter((0.0, 1.0, 61.0))
     config = LiveLayoutConfig(
         log_file=tmp_path / "live.jsonl",
         error_frames_dir=tmp_path / "errors",
@@ -1015,6 +1071,7 @@ def test_live_runtime_saves_one_error_frame_per_uncertain_episode(
         recognizer=_Recognizer(),
         tracker=_Tracker(phase4_ready_state),
         sleeper=lambda _: None,
+        error_frame_clock=lambda: next(error_frame_times),
     )
     uncertain_state = replace(
         phase4_ready_state,
@@ -1054,3 +1111,54 @@ def test_live_runtime_saves_one_error_frame_per_uncertain_episode(
         runtime.close()
 
     assert len(tuple(config.error_frames_dir.glob("*.png"))) == 2
+
+
+def test_live_runtime_caps_error_frames_per_round_and_session(
+    tmp_path: Path,
+    phase4_ready_state,
+) -> None:
+    config = LiveLayoutConfig(
+        log_file=tmp_path / "live.jsonl",
+        error_frames_dir=tmp_path / "errors",
+        error_frame_cooldown_seconds=0,
+        max_error_frames_per_round=2,
+        max_error_frames_per_session=3,
+    )
+    runtime = LiveGameRuntime(
+        config,
+        frame_source=_FrameSource(),
+        recognizer=_Recognizer(),
+        tracker=_Tracker(phase4_ready_state),
+        sleeper=lambda _: None,
+        error_frame_clock=iter((1.0, 2.0, 3.0, 4.0, 5.0)).__next__,
+    )
+    first_round = replace(phase4_ready_state, phase=RoundPhase.UNCERTAIN)
+    second_round = replace(
+        first_round,
+        round_id="second-round",
+    )
+
+    try:
+        for frame_id, state in enumerate(
+            (first_round, first_round, first_round, second_round, second_round),
+            start=1,
+        ):
+            runtime._handle_uncertain_frame(  # noqa: SLF001
+                _FrameSource().capture(frame_id),
+                VisualTrackerUpdate(
+                    mode=VisualTrackerMode.UNCERTAIN,
+                    message=f"failure {frame_id}: volatile cards",
+                    state=state,
+                    warnings=(f"failure {frame_id}: volatile cards",),
+                ),
+            )
+    finally:
+        runtime.close()
+
+    saved = tuple(config.error_frames_dir.glob("*.png"))
+    assert len(saved) == 3
+    rows = [
+        json.loads(line)
+        for line in config.log_file.read_text(encoding="utf-8").splitlines()
+    ]
+    assert len([row for row in rows if row["event"] == "error_frame_saved"]) == 3

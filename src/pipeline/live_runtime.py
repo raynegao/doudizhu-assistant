@@ -1,12 +1,14 @@
 from __future__ import annotations
 
 import json
+import re
 import time
 from collections import Counter
+from collections.abc import Callable, Iterator
 from concurrent.futures import Future, ThreadPoolExecutor
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Callable, Iterator, Protocol
+from typing import Protocol
 
 from PIL import Image
 
@@ -17,13 +19,13 @@ from src.capture.screen_geometry import (
     WindowAvailabilityError,
     WindowCaptureStatus,
 )
+from src.config.live_layout import LiveLayoutConfig
 from src.logic.monte_carlo import (
     MonteCarloSettings,
     Phase4DecisionResult,
     recommend_phase4,
 )
 from src.logic.rules import Play, legal_actions
-from src.pipeline.live_layout import LiveLayoutConfig
 from src.state.cards import CardSet, parse_cards
 from src.state.events import PlayerSeat, RoundPhase
 from src.state.observable_state import ObservableGameState
@@ -133,6 +135,8 @@ class LiveGameRuntime:
         decision_fn: DecisionFn = recommend_phase4,
         sleeper: Callable[[float], None] = time.sleep,
         resume_session_id: str | None = None,
+        error_frame_clock: Callable[[], float] = time.monotonic,
+        log_every_scene_frame: bool = False,
     ) -> None:
         self.config = config
         self.resume_session_id = resume_session_id
@@ -155,6 +159,8 @@ class LiveGameRuntime:
             )
         self.decision_fn = decision_fn
         self._sleeper = sleeper
+        self._error_frame_clock = error_frame_clock
+        self._log_every_scene_frame = log_every_scene_frame
         self._next_frame_id = 1
         self._executor = ThreadPoolExecutor(
             max_workers=1,
@@ -164,7 +170,9 @@ class LiveGameRuntime:
         self._decision_revision: tuple[str, int] | None = None
         self._decision: LiveDecisionRecord | None = None
         self._logged_decisions: set[tuple[str, int]] = set()
-        self._last_error_signature: tuple[str | None, str] | None = None
+        self._error_frame_saved_at: dict[tuple[str | None, str], float] = {}
+        self._error_frame_round_counts: Counter[str | None] = Counter()
+        self._saved_error_frame_count = 0
         self._last_window_status: WindowCaptureStatus | None = None
         self._last_scene_log_signature: tuple[object, ...] | None = None
         self._last_update_log_signature: tuple[object, ...] | None = None
@@ -209,7 +217,7 @@ class LiveGameRuntime:
             "scene",
             _scene_log_signature(scene),
             frame_id=current_frame_id,
-            force=status_changed,
+            force=status_changed or self._log_every_scene_frame,
         ):
             _write_jsonl(self.config.log_file, scene.to_log_payload())
 
@@ -458,14 +466,23 @@ class LiveGameRuntime:
         max_frames: int | None = None,
     ) -> Iterator[LiveRuntimeSnapshot]:
         produced = 0
+        next_frame_at = time.monotonic()
         while max_frames is None or produced < max_frames:
             yield self.run_once()
             produced += 1
             if max_frames is None or produced < max_frames:
-                self._sleeper(self.config.interval_seconds)
+                next_frame_at += self.config.interval_seconds
+                delay = next_frame_at - time.monotonic()
+                if delay > 0:
+                    self._sleeper(delay)
+                else:
+                    next_frame_at = time.monotonic()
 
     def close(self) -> None:
         self._executor.shutdown(wait=False, cancel_futures=True)
+        close_frame_source = getattr(self.frame_source, "close", None)
+        if callable(close_frame_source):
+            close_frame_source()
 
     def _allocate_frame_id(self, frame_id: int | None) -> int:
         if frame_id is not None:
@@ -604,20 +621,49 @@ class LiveGameRuntime:
         update: VisualTrackerUpdate,
     ) -> None:
         if update.mode is not VisualTrackerMode.UNCERTAIN:
-            self._last_error_signature = None
             return
         round_id = update.state.round_id if update.state else None
         reason = update.warnings[0] if update.warnings else update.message
-        signature = (round_id, reason)
-        if self._last_error_signature == signature:
+        reason_key = _error_reason_key(reason)
+        signature = (round_id, reason_key)
+        now = self._error_frame_clock()
+        last_saved_at = self._error_frame_saved_at.get(signature)
+        if (
+            last_saved_at is not None
+            and now - last_saved_at < self.config.error_frame_cooldown_seconds
+        ):
+            return
+        if (
+            self._error_frame_round_counts[round_id]
+            >= self.config.max_error_frames_per_round
+        ):
+            return
+        if self._saved_error_frame_count >= self.config.max_error_frames_per_session:
             return
         self.config.error_frames_dir.mkdir(parents=True, exist_ok=True)
         safe_round_id = (round_id or "uninitialized").replace("/", "_")
-        path = self.config.error_frames_dir / (
-            f"{safe_round_id}-frame-{frame.frame_id:06d}.png"
+        path = _unique_error_frame_path(
+            self.config.error_frames_dir,
+            f"{safe_round_id}-frame-{frame.frame_id:06d}",
         )
         frame.image.save(path)
-        self._last_error_signature = signature
+        self._error_frame_saved_at[signature] = now
+        self._error_frame_round_counts[round_id] += 1
+        self._saved_error_frame_count += 1
+        _write_jsonl(
+            self.config.log_file,
+            {
+                "event": "error_frame_saved",
+                "round_id": round_id,
+                "frame_id": frame.frame_id,
+                "reason": reason,
+                "reason_key": reason_key,
+                "path": path.as_posix(),
+                "session_saved_count": self._saved_error_frame_count,
+                "round_saved_count": self._error_frame_round_counts[round_id],
+                "timestamp": time.time(),
+            },
+        )
 
     def _persist_round_context(
         self,
@@ -926,12 +972,31 @@ def _decision_scene_block_reason(
 
 
 def _revision_seed(state: ObservableGameState) -> int:
-    payload = f"{state.round_id}:{state.revision}".encode("utf-8")
+    payload = f"{state.round_id}:{state.revision}".encode()
     value = 2166136261
     for byte in payload:
         value ^= byte
         value = (value * 16777619) & 0xFFFFFFFF
     return value
+
+
+def _error_reason_key(reason: str) -> str:
+    """Collapse volatile card/confidence details into a stable incident key."""
+
+    category = reason.split(":", 1)[0].strip().lower()
+    category = re.sub(r"\d+(?:\.\d+)?", "#", category)
+    return re.sub(r"\s+", " ", category) or "unknown_error"
+
+
+def _unique_error_frame_path(directory: Path, stem: str) -> Path:
+    """Return a non-overwriting path even when a worker restarts frame ids."""
+
+    candidate = directory / f"{stem}.png"
+    suffix = 1
+    while candidate.exists():
+        candidate = directory / f"{stem}-{suffix}.png"
+        suffix += 1
+    return candidate
 
 
 def _write_jsonl(path: Path, payload: dict[str, object]) -> None:
@@ -1015,6 +1080,13 @@ def format_live_snapshot(snapshot: LiveRuntimeSnapshot) -> str:
         scope = "个人" if state.landlord is PlayerSeat.SELF else "农民团队"
         lines.append(
             f"最佳：{result.action} | 估计{scope}胜率={best.estimated_win_rate:.1%}"
+            + (
+                f" (95% CI {best.win_rate_ci95_low:.1%}–"
+                f"{best.win_rate_ci95_high:.1%})"
+                if best.win_rate_ci95_low is not None
+                and best.win_rate_ci95_high is not None
+                else ""
+            )
         )
         for index, evaluation in enumerate(result.rankings, start=1):
             lines.append(

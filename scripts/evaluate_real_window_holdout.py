@@ -3,13 +3,20 @@
 from __future__ import annotations
 
 import argparse
-from collections import Counter
 import csv
-import hashlib
 import json
+import re
+import time
+from collections import Counter
+from collections.abc import Iterable, Mapping
 from pathlib import Path
-from typing import Iterable, Mapping
 
+from src.capture.recording_integrity import (
+    sha256_file,
+    sha256_json_payload,
+    sha256_python_implementation,
+    write_json_atomic,
+)
 from src.vision.card_classifier import (
     CARD_CLASSES,
     CardPrediction,
@@ -18,21 +25,15 @@ from src.vision.card_classifier import (
     select_device,
 )
 
-
 FOCUS_CONFUSION_GROUPS: tuple[frozenset[str], ...] = (
     frozenset(("SJ", "BJ")),
     frozenset(("10", "J")),
     frozenset(("6", "9")),
     frozenset(("J", "Q", "K", "A")),
 )
-
-
-def sha256_file(path: Path) -> str:
-    digest = hashlib.sha256()
-    with path.open("rb") as handle:
-        for chunk in iter(lambda: handle.read(1024 * 1024), b""):
-            digest.update(chunk)
-    return digest.hexdigest()
+HOLDOUT_SEAL_SCHEMA_VERSION = "real-window-holdout-blind-seal-v1"
+HOLDOUT_SESSION_SCHEMA_VERSION = "real-window-holdout-session-v2"
+SOURCE_ID_PATTERN = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._-]*$")
 
 
 def load_holdout_manifest(path: Path) -> list[dict[str, object]]:
@@ -64,6 +65,8 @@ def load_holdout_manifest(path: Path) -> list[dict[str, object]]:
             raise ValueError(f"line {line_number} has unsupported label {label!r}")
         if not isinstance(source_id, str) or not source_id.strip():
             raise ValueError(f"line {line_number} requires a non-empty source_id")
+        if not SOURCE_ID_PATTERN.fullmatch(source_id):
+            raise ValueError(f"line {line_number} has an unsafe source_id")
         if not image.is_file():
             raise ValueError(f"line {line_number} image does not exist: {image_value}")
 
@@ -82,12 +85,166 @@ def load_holdout_manifest(path: Path) -> list[dict[str, object]]:
             "image_value": image_value,
             "label": label,
             "source_id": source_id.strip(),
+            "crop_index": record.get("crop_index"),
             "sha256": actual_sha256,
             "roi_sha256": record.get("roi_sha256"),
         })
     if not records:
         raise ValueError("holdout manifest contains no samples")
     return records
+
+
+def seal_holdout_manifest(
+    *,
+    model_path: Path,
+    manifest_path: Path,
+    training_manifest_path: Path,
+    output_path: Path,
+    predictions_root: Path,
+) -> dict[str, object]:
+    if output_path.exists():
+        raise ValueError(f"holdout seal already exists: {output_path}")
+    if predictions_root.exists() and any(predictions_root.iterdir()):
+        raise ValueError(
+            "holdout labels must be sealed before prediction output exists: "
+            f"{predictions_root}"
+        )
+    if not model_path.is_file():
+        raise ValueError(f"holdout model is missing: {model_path}")
+    if not training_manifest_path.is_file():
+        raise ValueError(
+            f"holdout training manifest is missing: {training_manifest_path}"
+        )
+    records = load_holdout_manifest(manifest_path)
+    leakage = find_training_leakage(
+        records,
+        load_training_hashes(training_manifest_path),
+    )
+    if leakage:
+        raise ValueError(
+            f"holdout leakage detected before sealing: {len(leakage)} sample(s)"
+        )
+    summary, sessions = _validate_holdout_structure(records, manifest_path)
+    project_root = Path(__file__).resolve().parents[1]
+    seal: dict[str, object] = {
+        "schema_version": HOLDOUT_SEAL_SCHEMA_VERSION,
+        "completed_at": time.time(),
+        "annotation_mode": "blind_without_model_predictions",
+        "prediction_inputs_used": False,
+        "model": _fingerprint(model_path),
+        "manifest": _fingerprint(manifest_path),
+        "training_manifest": _fingerprint(training_manifest_path),
+        "implementation": {
+            "project_root": project_root.as_posix(),
+            "sha256": sha256_python_implementation(project_root),
+        },
+        "sessions": sessions,
+        "summary": summary,
+    }
+    seal["report_sha256"] = sha256_json_payload(seal)
+    write_json_atomic(output_path, seal)
+    return seal
+
+
+def validate_holdout_seal(
+    seal_path: Path,
+    *,
+    model_path: Path,
+    manifest_path: Path,
+    training_manifest_path: Path,
+) -> dict[str, object]:
+    seal = _read_sealed_object(
+        seal_path,
+        schema_version=HOLDOUT_SEAL_SCHEMA_VERSION,
+        label="holdout seal",
+    )
+    if seal.get("annotation_mode") != "blind_without_model_predictions":
+        raise ValueError("holdout seal was not created in blind mode")
+    if seal.get("prediction_inputs_used") is not False:
+        raise ValueError("holdout seal declares prediction-assisted labels")
+    completed_at = seal.get("completed_at")
+    if (
+        isinstance(completed_at, bool)
+        or not isinstance(completed_at, (int, float))
+    ):
+        raise ValueError("holdout seal completion time is invalid")
+    for name, path in (
+        ("model", model_path),
+        ("manifest", manifest_path),
+        ("training_manifest", training_manifest_path),
+    ):
+        _validate_fingerprint(seal.get(name), path, f"holdout {name}")
+    project_root = Path(__file__).resolve().parents[1]
+    implementation = _mapping(seal.get("implementation"))
+    if implementation.get("project_root") != project_root.as_posix():
+        raise ValueError("holdout implementation root does not match")
+    if implementation.get("sha256") != sha256_python_implementation(project_root):
+        raise ValueError("holdout implementation changed after label sealing")
+    records = load_holdout_manifest(manifest_path)
+    summary, sessions = _validate_holdout_structure(records, manifest_path)
+    if seal.get("summary") != summary:
+        raise ValueError("holdout seal summary no longer matches the manifest")
+    if seal.get("sessions") != sessions:
+        raise ValueError("holdout session fingerprints changed after sealing")
+    return seal
+
+
+def _validate_holdout_structure(
+    records: list[dict[str, object]],
+    manifest_path: Path,
+) -> tuple[dict[str, object], list[dict[str, str]]]:
+    class_counts = Counter(str(record["label"]) for record in records)
+    source_counts = Counter(str(record["source_id"]) for record in records)
+    if len(records) < 300:
+        raise ValueError("blind holdout seal requires at least 300 samples")
+    if any(class_counts[label] < 10 for label in CARD_CLASSES):
+        raise ValueError("blind holdout seal requires at least 10 samples per class")
+    if len(source_counts) < 3:
+        raise ValueError("blind holdout seal requires at least 3 independent sources")
+
+    session_fingerprints: list[dict[str, str]] = []
+    for source_id in sorted(source_counts):
+        source_records = [
+            record for record in records if record["source_id"] == source_id
+        ]
+        indices = [record.get("crop_index") for record in source_records]
+        if indices != list(range(len(source_records))):
+            raise ValueError(f"holdout source {source_id} crop indices are invalid")
+        session_path = manifest_path.parent / "sessions" / source_id / "session.json"
+        session = _read_sealed_object(
+            session_path,
+            schema_version=HOLDOUT_SESSION_SCHEMA_VERSION,
+            label=f"holdout source {source_id}",
+        )
+        if session.get("source_id") != source_id:
+            raise ValueError(f"holdout source {source_id} metadata does not match")
+        if session.get("crop_count") != len(source_records):
+            raise ValueError(f"holdout source {source_id} crop count does not match")
+        if session.get("labels") != [
+            str(record["label"]) for record in source_records
+        ]:
+            raise ValueError(f"holdout source {source_id} labels changed")
+        if session.get("manifest") != manifest_path.resolve().as_posix():
+            raise ValueError(f"holdout source {source_id} manifest path does not match")
+        roi_hashes = {str(record.get("roi_sha256") or "") for record in source_records}
+        if len(roi_hashes) != 1 or session.get("roi_sha256") not in roi_hashes:
+            raise ValueError(f"holdout source {source_id} ROI fingerprint does not match")
+        _validate_fingerprint(
+            session.get("roi"),
+            Path(str(_mapping(session.get("roi")).get("path") or "")),
+            f"holdout source {source_id} ROI",
+        )
+        _validate_fingerprint(
+            session.get("contact_sheet"),
+            session_path.parent / "contact_sheet.png",
+            f"holdout source {source_id} contact sheet",
+        )
+        session_fingerprints.append(_fingerprint(session_path))
+    return ({
+        "sample_count": len(records),
+        "class_counts": dict(sorted(class_counts.items())),
+        "source_counts": dict(sorted(source_counts.items())),
+    }, session_fingerprints)
 
 
 def load_training_hashes(path: Path) -> set[str]:
@@ -137,7 +294,23 @@ def evaluate_holdout(
     minimum_per_class: int = 10,
     minimum_sources: int = 3,
     confidence_threshold: float = 0.70,
+    minimum_accuracy: float = 0.95,
+    minimum_per_class_accuracy: float = 0.90,
+    holdout_seal_path: Path | None = None,
+    require_holdout_seal: bool = False,
 ) -> dict[str, object]:
+    holdout_seal: dict[str, object] | None = None
+    if holdout_seal_path is not None and holdout_seal_path.is_file():
+        if training_manifest_path is None:
+            raise ValueError("blind holdout seal requires a training manifest")
+        holdout_seal = validate_holdout_seal(
+            holdout_seal_path,
+            model_path=model_path,
+            manifest_path=manifest_path,
+            training_manifest_path=training_manifest_path,
+        )
+    elif require_holdout_seal:
+        raise ValueError("formal holdout evaluation requires a blind holdout seal")
     records = load_holdout_manifest(manifest_path)
     leakage_checked = training_manifest_path is not None and training_manifest_path.is_file()
     training_hashes = (
@@ -170,30 +343,54 @@ def evaluate_holdout(
         minimum_per_class=minimum_per_class,
         minimum_sources=minimum_sources,
         confidence_threshold=confidence_threshold,
+        minimum_accuracy=minimum_accuracy,
+        minimum_per_class_accuracy=minimum_per_class_accuracy,
+        blind_holdout_sealed=holdout_seal is not None,
     )
-    report.update({
-        "model": str(model_path),
-        "manifest": str(manifest_path),
-        "artifacts": {
-            "predictions": "predictions.jsonl",
-            "errors": "errors.jsonl",
-            "confusion_matrix": "confusion_matrix.csv",
-        },
-    })
     output_dir.mkdir(parents=True, exist_ok=True)
-    (output_dir / "report.json").write_text(
-        json.dumps(report, ensure_ascii=False, indent=2) + "\n",
-        encoding="utf-8",
-    )
-    _write_jsonl(output_dir / "predictions.jsonl", rows)
+    predictions_path = output_dir / "predictions.jsonl"
+    errors_path = output_dir / "errors.jsonl"
+    confusion_matrix_path = output_dir / "confusion_matrix.csv"
+    _write_jsonl(predictions_path, rows)
     _write_jsonl(
-        output_dir / "errors.jsonl",
+        errors_path,
         [row for row in rows if not row["correct"]],
     )
     _write_confusion_matrix(
-        output_dir / "confusion_matrix.csv",
+        confusion_matrix_path,
         classes,
         rows,
+    )
+    report.update({
+        "schema_version": "real-window-holdout-v3",
+        "created_at": time.time(),
+        "model": str(model_path),
+        "manifest": str(manifest_path),
+        "inputs": {
+            "model": _fingerprint(model_path),
+            "manifest": _fingerprint(manifest_path),
+            "training_manifest": (
+                _fingerprint(training_manifest_path)
+                if training_manifest_path is not None
+                and training_manifest_path.is_file()
+                else None
+            ),
+        },
+        "artifacts": {
+            "predictions": _fingerprint(predictions_path),
+            "errors": _fingerprint(errors_path),
+            "confusion_matrix": _fingerprint(confusion_matrix_path),
+        },
+        "holdout_seal": (
+            _fingerprint(holdout_seal_path)
+            if holdout_seal is not None and holdout_seal_path is not None
+            else None
+        ),
+    })
+    report["report_sha256"] = sha256_json_payload(report)
+    (output_dir / "report.json").write_text(
+        json.dumps(report, ensure_ascii=False, indent=2) + "\n",
+        encoding="utf-8",
     )
     return report
 
@@ -209,6 +406,9 @@ def summarize_predictions(
     minimum_per_class: int,
     minimum_sources: int,
     confidence_threshold: float,
+    minimum_accuracy: float = 0.95,
+    minimum_per_class_accuracy: float = 0.90,
+    blind_holdout_sealed: bool = False,
 ) -> tuple[dict[str, object], list[dict[str, object]]]:
     if len(records) != len(predictions):
         raise ValueError("prediction count does not match manifest sample count")
@@ -242,6 +442,11 @@ def summarize_predictions(
 
     readiness_checks = [
         {
+            "name": "blind_labels_sealed_before_prediction",
+            "passed": blind_holdout_sealed,
+            "evidence": "holdout-seal.json" if blind_holdout_sealed else "not_available",
+        },
+        {
             "name": "training_leakage_checked",
             "passed": leakage_checked,
             "evidence": str(training_manifest_path) if leakage_checked else "not_available",
@@ -268,15 +473,43 @@ def summarize_predictions(
         },
     ]
     correct_count = sum(bool(row["correct"]) for row in rows)
+    accuracy = correct_count / len(records)
+    class_accuracies = [
+        float(per_class[label]["accuracy"])
+        for label in classes
+        if isinstance(per_class[label]["accuracy"], (int, float))
+    ]
+    readiness_checks.extend((
+        {
+            "name": "minimum_accuracy",
+            "passed": accuracy >= minimum_accuracy,
+            "evidence": f"{accuracy:.6f}/{minimum_accuracy:.6f}",
+        },
+        {
+            "name": "minimum_per_class_accuracy",
+            "passed": (
+                len(class_accuracies) == len(classes)
+                and min(class_accuracies) >= minimum_per_class_accuracy
+            ),
+            "evidence": (
+                f"minimum={min(class_accuracies, default=0.0):.6f}/"
+                f"{minimum_per_class_accuracy:.6f}"
+            ),
+        },
+    ))
     return ({
-        "schema_version": "real-window-holdout-v2",
+        "schema_version": "real-window-holdout-v3",
         "sample_count": len(records),
         "correct_count": correct_count,
-        "accuracy": correct_count / len(records),
+        "accuracy": accuracy,
         "error_count": len(records) - correct_count,
         "low_confidence_count": sum(bool(row["low_confidence"]) for row in rows),
         "focus_error_count": sum(bool(row["focus_error"]) for row in rows),
         "confidence_threshold": confidence_threshold,
+        "accuracy_thresholds": {
+            "overall": minimum_accuracy,
+            "per_class": minimum_per_class_accuracy,
+        },
         "class_counts": dict(sorted(class_counts.items())),
         "source_counts": dict(sorted(source_counts.items())),
         "per_class": per_class,
@@ -290,7 +523,7 @@ def summarize_predictions(
         "limitations": [
             "Every sample must come from real game-window screenshots excluded from training.",
             "This result must not be merged with the fixed-ROI synthetic/local split metric.",
-            "Publication readiness checks dataset independence and coverage, not a target accuracy.",
+            "Publication readiness requires both dataset independence and explicit accuracy thresholds.",
         ],
     }, rows)
 
@@ -344,6 +577,52 @@ def _write_confusion_matrix(
             writer.writerow([expected, *(matrix[expected][predicted] for predicted in classes)])
 
 
+def _fingerprint(path: Path) -> dict[str, str]:
+    resolved = path.resolve()
+    return {
+        "path": resolved.as_posix(),
+        "sha256": sha256_file(resolved),
+    }
+
+
+def _read_sealed_object(
+    path: Path,
+    *,
+    schema_version: str,
+    label: str,
+) -> dict[str, object]:
+    if not path.is_file():
+        raise ValueError(f"{label} is missing: {path}")
+    try:
+        payload = json.loads(path.read_text(encoding="utf-8"))
+    except json.JSONDecodeError as exc:
+        raise ValueError(f"{label} is invalid JSON: {path}") from exc
+    if not isinstance(payload, dict):
+        raise ValueError(f"{label} must contain an object")
+    if payload.get("schema_version") != schema_version:
+        raise ValueError(f"{label} schema is missing or unsupported")
+    sealed = dict(payload)
+    report_sha256 = sealed.pop("report_sha256", None)
+    if report_sha256 != sha256_json_payload(sealed):
+        raise ValueError(f"{label} checksum is invalid")
+    return payload
+
+
+def _validate_fingerprint(value: object, path: Path, label: str) -> None:
+    fingerprint = _mapping(value)
+    expected = path.resolve()
+    if fingerprint.get("path") != expected.as_posix():
+        raise ValueError(f"{label} path does not match")
+    if not expected.is_file():
+        raise ValueError(f"{label} file is missing: {expected}")
+    if fingerprint.get("sha256") != sha256_file(expected):
+        raise ValueError(f"{label} checksum changed after sealing")
+
+
+def _mapping(value: object) -> Mapping[str, object]:
+    return value if isinstance(value, Mapping) else {}
+
+
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(
         description="Evaluate a real-window independent card classifier holdout."
@@ -361,6 +640,17 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--minimum-per-class", type=int, default=10)
     parser.add_argument("--minimum-sources", type=int, default=3)
     parser.add_argument("--confidence-threshold", type=float, default=0.70)
+    parser.add_argument("--minimum-accuracy", type=float, default=0.95)
+    parser.add_argument(
+        "--minimum-per-class-accuracy",
+        type=float,
+        default=0.90,
+    )
+    parser.add_argument(
+        "--holdout-seal",
+        default="data/real_window_holdout/holdout-seal.json",
+    )
+    parser.add_argument("--require-seal", action="store_true")
     return parser
 
 
@@ -378,6 +668,10 @@ def main(argv: list[str] | None = None) -> int:
             minimum_per_class=args.minimum_per_class,
             minimum_sources=args.minimum_sources,
             confidence_threshold=args.confidence_threshold,
+            minimum_accuracy=args.minimum_accuracy,
+            minimum_per_class_accuracy=args.minimum_per_class_accuracy,
+            holdout_seal_path=Path(args.holdout_seal),
+            require_holdout_seal=args.require_seal,
         )
     except (OSError, ValueError, RuntimeError) as exc:
         parser.error(str(exc))

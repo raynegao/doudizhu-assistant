@@ -8,17 +8,17 @@ import os
 import subprocess
 import tempfile
 import zlib
+from collections.abc import Callable, Iterable, Mapping, Sequence
 from dataclasses import dataclass
 from enum import Enum
 from pathlib import Path
-from typing import Callable, Iterable, Mapping, Sequence
 
 import numpy as np
-from PIL import Image, ImageOps
 import torch
+from PIL import Image, ImageOps
 
 from src.capture.screen_geometry import CapturedWindow
-from src.pipeline.live_layout import LiveLayoutConfig
+from src.config.live_layout import LiveLayoutConfig
 from src.state.cards import RANKS, CardSet, normalize_rank
 from src.state.events import PlayerSeat
 from src.vision.card_classifier import (
@@ -241,7 +241,7 @@ class CvRemainingReader:
             masks = _remaining_digit_masks(image)
             if len(masks) != len(label):
                 continue
-            for digit, mask in zip(label, masks):
+            for digit, mask in zip(label, masks, strict=True):
                 signature = _remaining_glyph_signature(mask)
                 if not signature:
                     continue
@@ -416,7 +416,7 @@ class MacVisionRemainingReader:
             except (OSError, subprocess.SubprocessError):
                 return {}
         matches: dict[PlayerSeat, RemainingTextMatch] = {}
-        for seat, line in zip(seats, result.stdout.splitlines()):
+        for seat, line in zip(seats, result.stdout.splitlines(), strict=False):
             parts = line.rsplit("\t", 2)
             if len(parts) != 3:
                 continue
@@ -864,9 +864,20 @@ class SceneRecognizer:
             return None
         best_score, best_rank = scores[-1]
         runner_up = scores[-2][0] if len(scores) > 1 else 0.0
+        # Large table cards can make a joker reference moderately similar to
+        # a rounded numeral (notably 6), even though the correct per-round hand
+        # glyph is an almost exact match.  At >=0.90 absolute overlap, a 0.025
+        # lead is already stronger evidence than the cross-scale CNN trained
+        # on compact hand crops.  Keep the wider configured margin for all
+        # weaker matches.
+        required_margin = (
+            min(minimum_margin, 0.025)
+            if best_score >= 0.90
+            else minimum_margin
+        )
         if (
             best_score < minimum_similarity
-            or best_score - runner_up < minimum_margin
+            or best_score - runner_up < required_margin
         ):
             return None
         # IoU/Jaccard between rasterized glyphs is intentionally conservative:
@@ -1471,6 +1482,77 @@ def _active_x_runs(
     )
 
 
+def _single_portrait_card_box(
+    image: Image.Image,
+    *,
+    white_mask: np.ndarray | None = None,
+) -> tuple[int, int, int, int] | None:
+    """Recover one portrait card whose middle is hidden by a wide notice.
+
+    A horizontal game notice splits the white body into top and bottom runs.
+    Looking only at the longest run can then expose the landlord sash, suit,
+    and glyph edges as several fake card starts.  Combining the earliest and
+    latest durable white runs recovers the original portrait geometry.  A
+    genuinely overlapped pair is almost square, so it deliberately fails the
+    portrait aspect-ratio guard.
+    """
+
+    width, height = image.size
+    if white_mask is None:
+        white_mask = _card_white_mask(image)
+    column_runs = [
+        run
+        for run in _active_x_runs_from_mask(
+            white_mask,
+            min_column_ratio=0.15,
+            max_gap=3,
+        )
+        if run[1] - run[0] >= max(12, round(width * 0.03))
+    ]
+    if len(column_runs) != 1:
+        return None
+
+    left, right = column_runs[0]
+    row_counts = white_mask[:, left:right].sum(axis=1)
+    row_runs = _boolean_runs(
+        [
+            int(count) >= max(8, round((right - left) * 0.25))
+            for count in row_counts
+        ],
+        max_gap=2,
+    )
+    durable_runs = [
+        run
+        for run in row_runs
+        if run[1] - run[0] >= max(12, round(height * 0.10))
+    ]
+    if not durable_runs:
+        return None
+
+    top = min(run[0] for run in durable_runs)
+    bottom = max(run[1] for run in durable_runs)
+    span = bottom - top
+    if (
+        span <= 0
+        or top > round(height * 0.28)
+        or bottom < round(height * 0.70)
+    ):
+        return None
+    aspect_ratio = (right - left) / span
+    visible_ratio = sum(
+        run_bottom - run_top
+        for run_top, run_bottom in durable_runs
+    ) / span
+    if not 0.48 <= aspect_ratio <= 0.80 or visible_ratio < 0.32:
+        return None
+    return (
+        left,
+        max(0, top - 2),
+        right,
+        min(height, bottom + 3),
+    )
+
+
 def segment_card_boxes(image: Image.Image) -> tuple[tuple[int, int, int, int], ...]:
     """Locate separated or overlapped face-up cards on the blue table."""
 
@@ -1479,6 +1561,12 @@ def segment_card_boxes(image: Image.Image) -> tuple[tuple[int, int, int, int], .
     boxes: list[tuple[int, int, int, int]] = []
     rgb = image.convert("RGB")
     white_mask = _card_white_mask(rgb)
+    single_card = _single_portrait_card_box(
+        rgb,
+        white_mask=white_mask,
+    )
+    if single_card is not None:
+        return (single_card,)
     for left, right in _active_x_runs_from_mask(
         white_mask,
         min_column_ratio=0.08,
@@ -1540,6 +1628,8 @@ def infer_visible_hand_count(
     *,
     maximum: int = 20,
 ) -> int | None:
+    if _single_portrait_card_box(image) is not None:
+        return 1
     # The local client's hand is always overlapped. Trying separated-card
     # segmentation first scans the same large ROI twice and made each live
     # frame take multiple seconds.

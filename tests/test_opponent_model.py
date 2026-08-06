@@ -1,8 +1,8 @@
 from __future__ import annotations
 
+import random
 from collections import Counter
 from dataclasses import replace
-import random
 
 import pytest
 

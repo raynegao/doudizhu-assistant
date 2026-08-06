@@ -7,8 +7,8 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Protocol
 
-from PIL import Image
 import torch
+from PIL import Image
 
 from src.logic.decision import recommend_action
 from src.state.cards import CardParseError, CardSet
@@ -20,7 +20,6 @@ from src.vision.card_classifier import (
     preprocess_image,
     select_device,
 )
-
 
 DEFAULT_ROI_BOX = (380, 1110, 2555, 1515)
 DEFAULT_CARD_COUNT = 15

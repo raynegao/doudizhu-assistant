@@ -1,9 +1,9 @@
 from __future__ import annotations
 
 from collections import Counter
+from collections.abc import Callable
 from dataclasses import dataclass, replace
 from enum import Enum
-from typing import Callable
 
 from .cards import CardSet, sort_cards, validate_card_counts
 from .events import ObservedAction, PlayerSeat, RoundPhase
@@ -83,7 +83,7 @@ def reduce_observed_action(
     trick_target = state.trick_target
     trick_leader = state.trick_leader
     passes = state.consecutive_passes
-    phase = state.phase
+    phase: RoundPhase = state.phase
 
     if event.is_pass:
         if not trick_target:

@@ -3,20 +3,24 @@
 from __future__ import annotations
 
 import argparse
-from datetime import datetime, timezone
 import json
 import os
-from pathlib import Path
 import re
-from typing import Sequence
+from collections.abc import Sequence
+from datetime import datetime, timezone
+from pathlib import Path
 
 from PIL import Image, ImageDraw, ImageFont, ImageOps
 
 from scripts.crop_hand_roi_cards import crop_hand_roi_cards, parse_crop_size
-from scripts.evaluate_real_window_holdout import load_holdout_manifest, sha256_file
+from scripts.evaluate_real_window_holdout import (
+    HOLDOUT_SESSION_SCHEMA_VERSION,
+    load_holdout_manifest,
+    sha256_file,
+)
+from src.capture.recording_integrity import sha256_json_payload, write_json_atomic
 from src.state.cards import normalize_rank
 from src.vision.card_classifier import CARD_CLASSES
-
 
 SOURCE_ID_PATTERN = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._-]*$")
 
@@ -102,20 +106,19 @@ def prepare_holdout_session(
             handle.write(json.dumps(record, ensure_ascii=False) + "\n")
             records.append(record)
 
-    summary = {
-        "schema_version": "real-window-holdout-session-v1",
+    summary: dict[str, object] = {
+        "schema_version": HOLDOUT_SESSION_SCHEMA_VERSION,
         "source_id": source_id,
-        "roi": str(roi_path),
+        "created_at_utc": captured_at,
+        "roi": _fingerprint(roi_path),
         "roi_sha256": roi_sha256,
         "crop_count": len(records),
         "labels": list(normalized_labels),
-        "manifest": str(manifest_path),
-        "contact_sheet": str(contact_sheet_path),
+        "manifest": manifest_path.resolve().as_posix(),
+        "contact_sheet": _fingerprint(contact_sheet_path),
     }
-    (session_dir / "session.json").write_text(
-        json.dumps(summary, ensure_ascii=False, indent=2) + "\n",
-        encoding="utf-8",
-    )
+    summary["report_sha256"] = sha256_json_payload(summary)
+    write_json_atomic(session_dir / "session.json", summary)
     return summary
 
 
@@ -163,6 +166,14 @@ def build_contact_sheet(
 
 def _parse_labels(value: str) -> list[str]:
     return [part for part in value.split() if part]
+
+
+def _fingerprint(path: Path) -> dict[str, str]:
+    resolved = path.resolve()
+    return {
+        "path": resolved.as_posix(),
+        "sha256": sha256_file(resolved),
+    }
 
 
 def build_parser() -> argparse.ArgumentParser:

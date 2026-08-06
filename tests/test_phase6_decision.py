@@ -65,3 +65,17 @@ def test_phase6_enforces_minimum_rollouts_before_soft_deadline(
 
     assert result.completed_simulations == 3
     assert result.rankings[0].simulations == 3
+    evaluation = result.rankings[0]
+    assert evaluation.win_rate_standard_error is not None
+    assert evaluation.estimated_win_rate is not None
+    assert evaluation.win_rate_ci95_low is not None
+    assert evaluation.win_rate_ci95_high is not None
+    assert (
+        evaluation.win_rate_ci95_low
+        <= evaluation.estimated_win_rate
+        <= evaluation.win_rate_ci95_high
+    )
+    assert evaluation.to_log_payload()["win_rate_ci95"] == [
+        evaluation.win_rate_ci95_low,
+        evaluation.win_rate_ci95_high,
+    ]

@@ -1,7 +1,7 @@
 from __future__ import annotations
 
-from PIL import Image
 import torch
+from PIL import Image
 
 from src.vision.card_classifier import CARD_CLASSES, CardClassifierCNN, preprocess_image
 

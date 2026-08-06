@@ -8,8 +8,7 @@ from pathlib import Path
 from PIL import Image
 
 from src.capture.screen_geometry import MacWindowCapture
-from src.pipeline.live_layout import load_live_layout
-
+from src.config.live_layout import load_live_layout
 
 VALID_KINDS = {"pass", "remaining", "role", "turn"}
 

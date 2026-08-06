@@ -12,7 +12,6 @@ from src.logic.decision import recommend_action
 from src.logic.rules import Play, legal_actions
 from src.state.game_state import GameStateSnapshot
 
-
 WINDOW_MODE_ROI_BOX = (380, 1110, 2555, 1515)
 WINDOW_MODE_CARD_COUNT = 15
 WINDOW_MODE_START_X = 0

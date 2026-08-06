@@ -7,9 +7,10 @@ import json
 import logging
 import threading
 import time
+from collections.abc import Callable
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Any, Callable, Optional
+from typing import Any
 
 import yaml
 from pydantic import BaseModel, ConfigDict, Field, ValidationError
@@ -45,7 +46,7 @@ class LoggingConfig(BaseModel):
 
     level: str = "INFO"
     json_output: bool = Field(default=False, alias="json")
-    file: Optional[Path] = None
+    file: Path | None = None
 
 
 class AppConfig(BaseModel):
@@ -77,7 +78,7 @@ def _read_config_file(path: Path) -> dict[str, Any]:
 
 @dataclass
 class ConfigSnapshot:
-    source: Optional[Path]
+    source: Path | None
     config: AppConfig
     last_loaded_at: float
 
@@ -88,14 +89,14 @@ class ConfigManager:
     热重载线程是守护线程，可通过 stop_hot_reload 停止。
     """
 
-    def __init__(self, path: Optional[Path] = None, reload_interval: float = 2.0) -> None:
+    def __init__(self, path: Path | None = None, reload_interval: float = 2.0) -> None:
         self._path = path
         self._reload_interval = reload_interval
         self._lock = threading.Lock()
         self._snapshot = ConfigSnapshot(source=path, config=AppConfig(), last_loaded_at=time.time())
-        self._watcher: Optional[threading.Thread] = None
+        self._watcher: threading.Thread | None = None
         self._stop_event = threading.Event()
-        self._last_mtime: Optional[float] = None
+        self._last_mtime: float | None = None
 
     def load(self) -> AppConfig:
         if self._path is None:
@@ -125,7 +126,7 @@ class ConfigManager:
         with self._lock:
             return self._snapshot.config
 
-    def start_hot_reload(self, callback: Optional[Callable[[AppConfig], None]] = None) -> None:
+    def start_hot_reload(self, callback: Callable[[AppConfig], None] | None = None) -> None:
         """
         开启热重载轮询线程。回调在配置重新加载后被调用。
         """
@@ -149,7 +150,7 @@ class ConfigManager:
         if self._watcher:
             self._watcher.join(timeout=1.0)
 
-    def _watch_loop(self, callback: Optional[Callable[[AppConfig], None]] = None) -> None:
+    def _watch_loop(self, callback: Callable[[AppConfig], None] | None = None) -> None:
         while not self._stop_event.is_set():
             try:
                 if self._path is None or not self._path.exists():

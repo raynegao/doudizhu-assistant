@@ -1,8 +1,7 @@
 from __future__ import annotations
 
-from collections import Counter
-from dataclasses import dataclass
 import random
+from dataclasses import dataclass
 
 from src.logic.rules import Play, legal_actions
 from src.state.cards import RANKS, CardSet, sort_cards

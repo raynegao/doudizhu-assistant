@@ -4,9 +4,9 @@ from pathlib import Path
 
 import numpy as np
 from PIL import Image, ImageDraw
-import src.vision.scene_recognizer as scene_recognizer_module
 
-from src.pipeline.live_layout import LiveLayoutConfig
+import src.vision.scene_recognizer as scene_recognizer_module
+from src.config.live_layout import LiveLayoutConfig
 from src.state.cards import RANKS
 from src.state.events import PlayerSeat
 from src.vision.card_classifier import CardPrediction
@@ -28,10 +28,10 @@ from src.vision.scene_recognizer import (
     _remaining_glyph_signature,
     _remaining_signature_hole_count,
     _resolve_card_prediction,
-    _resolve_roles_from_hand_count,
     _resolve_remaining,
-    infer_visible_hand_count,
+    _resolve_roles_from_hand_count,
     infer_overlapping_hand_boxes,
+    infer_visible_hand_count,
     segment_card_boxes,
 )
 
@@ -213,7 +213,7 @@ def test_infer_overlapping_hand_boxes_accepts_centered_short_hand() -> None:
     assert len(boxes) == 3
     assert all(
         abs(box[0] - expected) <= 3
-        for box, expected in zip(boxes, starts)
+        for box, expected in zip(boxes, starts, strict=True)
     )
 
 
@@ -236,7 +236,7 @@ def test_infer_overlapping_hand_boxes_accepts_one_and_two_card_endgames() -> Non
         assert len(boxes) == len(starts)
         assert all(
             abs(box[0] - expected) <= 3
-            for box, expected in zip(boxes, starts)
+            for box, expected in zip(boxes, starts, strict=True)
         )
 
 
@@ -262,6 +262,33 @@ def test_visible_count_rejects_two_internal_edges_inside_one_card(
     )
 
     assert infer_visible_hand_count(image, maximum=20) == 1
+
+
+def test_landlord_card_stays_single_when_notice_splits_white_body() -> None:
+    image = Image.new("RGB", (900, 414), (43, 73, 145))
+    draw = ImageDraw.Draw(image)
+    draw.rounded_rectangle(
+        (310, 10, 590, 402),
+        radius=8,
+        fill="white",
+        outline=(80, 80, 80),
+        width=2,
+    )
+    draw.text((330, 28), "Q", fill=(25, 25, 25))
+    draw.polygon(
+        ((440, 10), (590, 10), (590, 190)),
+        fill=(186, 38, 34),
+    )
+    # Reproduce the dark, full-width in-game notice that hides the middle of
+    # the final landlord card while leaving its top and bottom visible.
+    draw.rectangle((0, 90, image.width, 273), fill=(70, 67, 74))
+    draw.ellipse((495, 300, 535, 360), fill=(30, 30, 30))
+
+    assert infer_visible_hand_count(image, maximum=20) == 1
+    assert len(segment_card_boxes(image)) == 1
+    boxes = infer_overlapping_hand_boxes(image, 1)
+    assert len(boxes) == 1
+    assert boxes[0][1] <= 12
 
 
 def test_infer_overlapping_hand_boxes_keeps_card_tops_above_notice() -> None:

@@ -1,17 +1,17 @@
 from __future__ import annotations
 
-from dataclasses import dataclass
-from datetime import datetime, timezone
 import hashlib
-from html import escape
 import json
-from pathlib import Path
 import platform
 import statistics
 import subprocess
 import sys
 import time
-from typing import Callable, Mapping
+from collections.abc import Callable, Mapping
+from dataclasses import dataclass
+from datetime import datetime, timezone
+from html import escape
+from pathlib import Path
 
 from src.logic.action_validation import validate_observed_action
 from src.logic.decision import recommend_action
@@ -65,7 +65,7 @@ def build_showcase_report(
         *(
             check
             for scenario in scenarios
-            for check in scenario["checks"]
+            for check in _mapping_items(scenario["checks"])
         ),
     ]
     overall_passed = all(bool(check["passed"]) for check in checks)
@@ -207,7 +207,12 @@ def _run_phase4_scenario(
     fingerprints = tuple(_decision_fingerprint(result.to_log_payload()) for result in results)
     first = results[0]
     latencies = [result.elapsed_ms for result in results]
-    win_rates = [evaluation.estimated_win_rate for evaluation in first.rankings]
+    win_rates = [
+        evaluation.estimated_win_rate
+        if evaluation.estimated_win_rate is not None
+        else -1.0
+        for evaluation in first.rankings
+    ]
     checks = [
         {
             "name": f"{path.stem}_state_decision_ready",
@@ -330,8 +335,8 @@ def _git_commit() -> str:
 
 
 def _render_markdown(report: Mapping[str, object]) -> str:
-    phase1 = report["phase1"]
-    phase4 = report["phase4"]
+    phase1 = _mapping(report["phase1"])
+    phase4 = _mapping(report["phase4"])
     lines = [
         "# doudizhu-assistant Phase 5 Showcase",
         "",
@@ -350,7 +355,8 @@ def _render_markdown(report: Mapping[str, object]) -> str:
         "## Phase 4 replay scenarios",
         "",
     ]
-    for scenario in phase4["scenarios"]:
+    for scenario in _mapping_items(phase4["scenarios"]):
+        latency = _mapping(scenario["latency_ms"])
         lines.extend((
             f"### {scenario['name']}",
             "",
@@ -358,30 +364,36 @@ def _render_markdown(report: Mapping[str, object]) -> str:
             f"- Role: `{scenario['landlord']}` is landlord",
             f"- Recommendation: `{_cards(scenario['recommended_action'])}`",
             f"- Worlds: `{scenario['completed_simulations']}/{scenario['requested_simulations']}`",
-            f"- Median latency: `{scenario['latency_ms']['median']} ms`",
+            f"- Median latency: `{latency['median']} ms`",
             f"- Decision fingerprint: `{scenario['decision_fingerprint']}`",
             "",
             "| Rank | Action | Strategy score | Estimated result | Risks |",
             "|---:|---|---:|---:|---|",
         ))
-        for rank, evaluation in enumerate(scenario["top_k"], start=1):
+        for rank, evaluation in enumerate(
+            _mapping_items(scenario["top_k"]),
+            start=1,
+        ):
             estimated = evaluation["estimated_win_rate"]
-            estimated_text = "n/a" if estimated is None else f"{estimated:.1%}"
+            estimated_text = _percentage(estimated)
+            strategy_score = _number(evaluation["strategy_score"])
+            risks = ", ".join(
+                str(item) for item in _object_items(evaluation["risk_flags"])
+            ) or "none"
             lines.append(
                 f"| {rank} | `{_cards(evaluation['action'])}` | "
-                f"{evaluation['strategy_score']:.3f} | {estimated_text} | "
-                f"{', '.join(evaluation['risk_flags']) or 'none'} |"
+                f"{strategy_score:.3f} | {estimated_text} | {risks} |"
             )
         lines.append("")
     lines.extend((
         "## Important limitations",
         "",
-        *(f"- {item}" for item in report["limitations"]),
+        *(f"- {item}" for item in _object_items(report["limitations"])),
         "",
         "## Reproduce",
         "",
         "```bash",
-        str(report["reproduce"]["command"]),
+        str(_mapping(report["reproduce"])["command"]),
         "```",
         "",
     ))
@@ -389,20 +401,27 @@ def _render_markdown(report: Mapping[str, object]) -> str:
 
 
 def _render_html(report: Mapping[str, object]) -> str:
-    phase1 = report["phase1"]
-    scenarios = report["phase4"]["scenarios"]
+    phase1 = _mapping(report["phase1"])
+    scenarios = _mapping_items(_mapping(report["phase4"])["scenarios"])
     status_class = "ok" if report["overall_status"] == "passed" else "bad"
     scenario_sections = []
     for scenario in scenarios:
+        latency = _mapping(scenario["latency_ms"])
         rows = []
-        for rank, evaluation in enumerate(scenario["top_k"], start=1):
+        for rank, evaluation in enumerate(
+            _mapping_items(scenario["top_k"]),
+            start=1,
+        ):
             estimated = evaluation["estimated_win_rate"]
-            estimated_text = "n/a" if estimated is None else f"{estimated:.1%}"
-            risks = ", ".join(evaluation["risk_flags"]) or "none"
+            estimated_text = _percentage(estimated)
+            strategy_score = _number(evaluation["strategy_score"])
+            risks = ", ".join(
+                str(item) for item in _object_items(evaluation["risk_flags"])
+            ) or "none"
             rows.append(
                 "<tr>"
                 f"<td>{rank}</td><td><code>{escape(_cards(evaluation['action']))}</code></td>"
-                f"<td>{evaluation['strategy_score']:.3f}</td><td>{estimated_text}</td>"
+                f"<td>{strategy_score:.3f}</td><td>{estimated_text}</td>"
                 f"<td>{escape(risks)}</td></tr>"
             )
         scenario_sections.append(
@@ -413,14 +432,15 @@ def _render_html(report: Mapping[str, object]) -> str:
             "<div class='metrics'>"
             f"<div><span>Recommendation</span><strong>{escape(_cards(scenario['recommended_action']))}</strong></div>"
             f"<div><span>Sampled worlds</span><strong>{scenario['completed_simulations']}/{scenario['requested_simulations']}</strong></div>"
-            f"<div><span>Median latency</span><strong>{scenario['latency_ms']['median']} ms</strong></div>"
+            f"<div><span>Median latency</span><strong>{latency['median']} ms</strong></div>"
             f"<div><span>Fingerprint</span><strong class='mono'>{scenario['decision_fingerprint']}</strong></div>"
             "</div><div class='table-wrap'><table><thead><tr>"
             "<th>#</th><th>Action</th><th>Score</th><th>Estimated result</th><th>Risks</th>"
             f"</tr></thead><tbody>{''.join(rows)}</tbody></table></div></section>"
         )
     limitations = "".join(
-        f"<li>{escape(str(item))}</li>" for item in report["limitations"]
+        f"<li>{escape(str(item))}</li>"
+        for item in _object_items(report["limitations"])
     )
     return f"""<!doctype html>
 <html lang="en">
@@ -463,6 +483,36 @@ def _cards(cards: object) -> str:
     if isinstance(cards, (list, tuple)):
         return " ".join(str(card) for card in cards) if cards else "pass"
     return str(cards)
+
+
+def _mapping(value: object) -> Mapping[str, object]:
+    if not isinstance(value, Mapping):
+        raise TypeError(f"expected a mapping, got {type(value).__name__}")
+    return value
+
+
+def _mapping_items(value: object) -> tuple[Mapping[str, object], ...]:
+    if not isinstance(value, (list, tuple)) or not all(
+        isinstance(item, Mapping) for item in value
+    ):
+        raise TypeError("expected a sequence of mappings")
+    return tuple(_mapping(item) for item in value)
+
+
+def _object_items(value: object) -> tuple[object, ...]:
+    if not isinstance(value, (list, tuple)):
+        raise TypeError("expected a sequence")
+    return tuple(value)
+
+
+def _number(value: object) -> float:
+    if isinstance(value, (int, float)) and not isinstance(value, bool):
+        return float(value)
+    raise TypeError(f"expected a number, got {value!r}")
+
+
+def _percentage(value: object) -> str:
+    return "n/a" if value is None else f"{_number(value):.1%}"
 
 
 __all__ = [

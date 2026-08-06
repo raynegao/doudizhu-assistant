@@ -2,9 +2,10 @@ from __future__ import annotations
 
 from pathlib import Path
 
-from PIL import Image
 import pytest
+from PIL import Image
 
+from src.capture.macos_stream import StreamedWindowFrame
 from src.capture.screen_geometry import (
     MacWindowCapture,
     ScreenGeometry,
@@ -14,8 +15,7 @@ from src.capture.screen_geometry import (
     parse_desktop_bounds,
     parse_window_server_candidates,
 )
-from src.pipeline.calibration import WindowInfo
-from src.pipeline.live_layout import (
+from src.config.live_layout import (
     LiveLayoutConfig,
     NormalizedBox,
     load_live_layout,
@@ -23,6 +23,7 @@ from src.pipeline.live_layout import (
     render_roi_contact_sheet,
     save_live_layout,
 )
+from src.pipeline.calibration import WindowInfo
 
 
 def test_retina_geometry_maps_logical_window_to_pixels() -> None:
@@ -91,6 +92,42 @@ def test_mac_window_capture_uses_window_server_image() -> None:
     assert frame.window == window
     assert frame.pixel_box == (20, 40, 220, 240)
     assert frame.image.getpixel((0, 0)) == (0, 0, 128)
+
+
+def test_mac_window_capture_prefers_persistent_stream_and_closes_it() -> None:
+    window = WindowInfo(
+        app_name="斗地主",
+        window_name="斗地主",
+        window_box=(10, 20, 110, 120),
+    )
+
+    class FakeStream:
+        closed = False
+
+        def capture(self) -> StreamedWindowFrame:
+            return StreamedWindowFrame(
+                timestamp=123.0,
+                image=Image.new("RGB", (200, 200), "navy"),
+                window_id=42,
+                window=window,
+            )
+
+        def close(self) -> None:
+            self.closed = True
+
+    stream = FakeStream()
+    source = MacWindowCapture(
+        "斗地主",
+        stream_factory=lambda _: stream,  # type: ignore[arg-type]
+    )
+
+    frame = source.capture(7)
+    source.close()
+
+    assert frame.timestamp == 123.0
+    assert frame.pixel_box == (20, 40, 220, 240)
+    assert frame.image.getpixel((0, 0)) == (0, 0, 128)
+    assert stream.closed is True
 
 
 def test_mac_window_capture_reuses_window_id_between_refresh_frames() -> None:
@@ -207,6 +244,9 @@ def test_live_layout_roundtrip_and_preview(tmp_path: Path) -> None:
 
     assert loaded.roi("self_turn") == NormalizedBox(0.4, 0.4, 0.6, 0.6)
     assert loaded.initial_stability_frames == 2
+    assert loaded.error_frame_cooldown_seconds == 60.0
+    assert loaded.max_error_frames_per_round == 4
+    assert loaded.max_error_frames_per_session == 25
     assert preview.size == image.size
     assert contact.width == 360
     assert contact.height > 80

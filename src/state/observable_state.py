@@ -1,8 +1,8 @@
 from __future__ import annotations
 
 from collections import Counter
+from collections.abc import Iterable, Mapping
 from dataclasses import dataclass
-from typing import Iterable, Mapping
 
 from .cards import FULL_DECK, CardParseError, CardSet, parse_cards, sort_cards, validate_card_counts
 from .events import DEFAULT_TURN_ORDER, ObservedAction, PlayerSeat, RoundPhase
@@ -120,7 +120,7 @@ class ObservableGameState:
         last_player: PlayerSeat | str | None = None,
         consecutive_passes: int = 0,
         state_confidence: float = 1.0,
-    ) -> "ObservableGameState":
+    ) -> ObservableGameState:
         hand_set = CardSet.parse(hand)
         target = CardSet.parse(last_play)
         known_played = parse_cards(played_cards)

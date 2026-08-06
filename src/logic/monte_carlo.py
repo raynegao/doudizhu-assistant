@@ -1,11 +1,12 @@
 from __future__ import annotations
 
-from collections import Counter
-from dataclasses import dataclass
 import math
 import random
 import time
-from typing import Callable, Mapping, Protocol, Sequence
+from collections import Counter
+from collections.abc import Callable, Mapping, Sequence
+from dataclasses import dataclass
+from typing import Protocol
 
 from src.logic.action_validation import validate_decision_state
 from src.logic.decision import recommend_action
@@ -19,7 +20,6 @@ from src.logic.rules import Play, PlayType, can_beat, legal_actions
 from src.state.cards import RANK_VALUE, CardSet, sort_cards
 from src.state.events import PlayerSeat
 from src.state.observable_state import ObservableGameState
-
 
 RULESET_VERSION = "phase4-standard-subset-v1"
 
@@ -72,6 +72,9 @@ class ActionEvaluation:
     average_margin: float
     reason_factors: tuple[str, ...]
     risk_flags: tuple[str, ...]
+    win_rate_standard_error: float | None = None
+    win_rate_ci95_low: float | None = None
+    win_rate_ci95_high: float | None = None
 
     def to_log_payload(self) -> dict[str, object]:
         return {
@@ -79,6 +82,13 @@ class ActionEvaluation:
             "play_type": self.action.type.value,
             "strategy_score": self.strategy_score,
             "estimated_win_rate": self.estimated_win_rate,
+            "win_rate_standard_error": self.win_rate_standard_error,
+            "win_rate_ci95": (
+                [self.win_rate_ci95_low, self.win_rate_ci95_high]
+                if self.win_rate_ci95_low is not None
+                and self.win_rate_ci95_high is not None
+                else None
+            ),
             "terminal_win_rate": self.terminal_win_rate,
             "terminal_rate": self.terminal_rate,
             "simulations": self.simulations,
@@ -102,7 +112,7 @@ class Phase4DecisionResult:
     reason: str
     warnings: tuple[str, ...]
     opponent_estimate: OpponentEstimate | None
-    model_version: str = "phase4-monte-carlo-v1"
+    model_version: str = "phase4-monte-carlo-v2"
     ruleset_version: str = RULESET_VERSION
 
     @property
@@ -294,6 +304,8 @@ class MonteCarloEvaluator:
         )
         ordered = tuple(sorted(evaluations, key=_evaluation_sort_key))
         top = ordered[: min(settings.top_k, len(ordered))]
+        if len(top) >= 2 and _confidence_intervals_overlap(top[0], top[1]):
+            warnings.append("top_action_confidence_intervals_overlap")
         best = top[0]
         reason = _recommendation_reason(best, completed)
         estimate = self.opponent_model.summarize(state, tuple(completed_worlds))
@@ -498,6 +510,19 @@ def _aggregate_action(
         raise ValueError("cannot aggregate zero rollout outcomes")
     simulations = len(outcomes)
     estimated_win_rate = sum(value.expected_result for value in outcomes) / simulations
+    if simulations >= 2:
+        variance = sum(
+            (value.expected_result - estimated_win_rate) ** 2
+            for value in outcomes
+        ) / (simulations - 1)
+        standard_error = math.sqrt(variance / simulations)
+        confidence_margin = 1.96 * standard_error
+        ci95_low = max(0.0, estimated_win_rate - confidence_margin)
+        ci95_high = min(1.0, estimated_win_rate + confidence_margin)
+    else:
+        standard_error = None
+        ci95_low = None
+        ci95_high = None
     terminal_values = [
         value.terminal_result
         for value in outcomes
@@ -564,6 +589,28 @@ def _aggregate_action(
         average_margin=round(average_margin, 3),
         reason_factors=tuple(reasons),
         risk_flags=tuple(dict.fromkeys(risks)),
+        win_rate_standard_error=(
+            round(standard_error, 6) if standard_error is not None else None
+        ),
+        win_rate_ci95_low=round(ci95_low, 6) if ci95_low is not None else None,
+        win_rate_ci95_high=round(ci95_high, 6) if ci95_high is not None else None,
+    )
+
+
+def _confidence_intervals_overlap(
+    first: ActionEvaluation,
+    second: ActionEvaluation,
+) -> bool:
+    if (
+        first.win_rate_ci95_low is None
+        or first.win_rate_ci95_high is None
+        or second.win_rate_ci95_low is None
+        or second.win_rate_ci95_high is None
+    ):
+        return False
+    return max(first.win_rate_ci95_low, second.win_rate_ci95_low) <= min(
+        first.win_rate_ci95_high,
+        second.win_rate_ci95_high,
     )
 
 

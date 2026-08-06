@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import argparse
 import multiprocessing
+import os
 import queue
 import signal
 import time
@@ -10,7 +11,7 @@ import uuid
 from pathlib import Path
 from typing import Any
 
-from src.pipeline.live_layout import load_live_layout
+from src.config.live_layout import load_live_layout
 from src.pipeline.live_runtime import LiveGameRuntime, format_live_snapshot
 
 _RESTART_WINDOW_SECONDS = 30.0
@@ -30,6 +31,7 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--max-frames", type=int)
     parser.add_argument("--no-clear", action="store_true")
     parser.add_argument("--overlay-geometry", default="260x480+0+70")
+    parser.add_argument("--pid-file", type=Path)
     return parser
 
 
@@ -138,6 +140,8 @@ class _RuntimeProcessController:
             return None
         process.join(timeout=0)
         if self.max_frames is not None and process.exitcode == 0:
+            self.process = None
+            _close_process_handle(process)
             return None
 
         now = time.monotonic()
@@ -148,6 +152,8 @@ class _RuntimeProcessController:
         ]
         self.failure_times.append(now)
         exit_code = process.exitcode
+        self.process = None
+        _close_process_handle(process)
         if len(self.failure_times) >= _MAX_FAILURES_IN_WINDOW:
             return (
                 "识别进程连续异常退出，已停止自动恢复；"
@@ -169,6 +175,8 @@ class _RuntimeProcessController:
         if process is None or not process.is_alive():
             if process is not None:
                 process.join(timeout=0)
+                self.process = None
+                _close_process_handle(process)
             self.failure_times.clear()
             self.start()
         try:
@@ -191,6 +199,13 @@ class _RuntimeProcessController:
             if process.is_alive():
                 process.terminate()
                 process.join(timeout=2.0)
+            if process.is_alive():
+                kill = getattr(process, "kill", None)
+                if callable(kill):
+                    kill()
+                    process.join(timeout=2.0)
+            self.process = None
+            _close_process_handle(process)
         for channel in (self.snapshots, self.commands):
             try:
                 channel.close()
@@ -198,6 +213,38 @@ class _RuntimeProcessController:
             except (OSError, ValueError):
                 pass
         print("[live-assistant] stopped", flush=True)
+
+
+def _close_process_handle(process: Any) -> None:
+    """Release a joined multiprocessing handle before replacing its worker."""
+
+    close = getattr(process, "close", None)
+    if not callable(close) or process.is_alive():
+        return
+    try:
+        close()
+    except (OSError, ValueError):
+        pass
+
+
+def _write_pid_file(path: Path) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    temporary = path.with_suffix(path.suffix + ".tmp")
+    temporary.write_text(f"{os.getpid()}\n", encoding="utf-8")
+    temporary.replace(path)
+
+
+def _remove_owned_pid_file(path: Path) -> None:
+    try:
+        recorded_pid = int(path.read_text(encoding="utf-8").strip())
+    except (FileNotFoundError, OSError, ValueError):
+        return
+    if recorded_pid != os.getpid():
+        return
+    try:
+        path.unlink()
+    except FileNotFoundError:
+        pass
 
 
 def _make_gui_shutdown_handler(
@@ -215,8 +262,7 @@ def _make_gui_shutdown_handler(
     return handle_signal
 
 
-def main(argv: list[str] | None = None) -> int:
-    args = build_parser().parse_args(argv)
+def _run(args: argparse.Namespace) -> int:
     if args.no_ui:
         config = load_live_layout(args.config)
         runtime = LiveGameRuntime(
@@ -254,6 +300,17 @@ def main(argv: list[str] | None = None) -> int:
     finally:
         controller.stop()
     return 0
+
+
+def main(argv: list[str] | None = None) -> int:
+    args = build_parser().parse_args(argv)
+    if args.pid_file is not None:
+        _write_pid_file(args.pid_file)
+    try:
+        return _run(args)
+    finally:
+        if args.pid_file is not None:
+            _remove_owned_pid_file(args.pid_file)
 
 
 if __name__ == "__main__":

@@ -1,10 +1,13 @@
 from __future__ import annotations
 
+import os
 from pathlib import Path
 
 from scripts.run_live_assistant import (
-    _RuntimeProcessController,
     _make_gui_shutdown_handler,
+    _remove_owned_pid_file,
+    _RuntimeProcessController,
+    _write_pid_file,
 )
 
 
@@ -46,12 +49,16 @@ class _DeadProcess:
 
     def __init__(self) -> None:
         self.joined = False
+        self.closed = False
 
     def is_alive(self) -> bool:
         return False
 
     def join(self, timeout: float = 0) -> None:
         self.joined = True
+
+    def close(self) -> None:
+        self.closed = True
 
 
 def test_gui_shutdown_signal_uses_normal_overlay_close_path() -> None:
@@ -100,6 +107,21 @@ def test_scan_button_restarts_worker_after_restart_budget_is_exhausted(
         controller.stop()
 
     assert dead.joined is True
+    assert dead.closed is True
     assert starts == [True]
     assert controller.failure_times == []
     assert command == "scan_current"
+
+
+def test_pid_file_is_atomic_and_removed_only_by_owner(tmp_path: Path) -> None:
+    path = tmp_path / "live.pid"
+
+    _write_pid_file(path)
+
+    assert path.read_text(encoding="utf-8") == f"{os.getpid()}\n"
+    _remove_owned_pid_file(path)
+    assert not path.exists()
+
+    path.write_text(f"{os.getpid() + 1}\n", encoding="utf-8")
+    _remove_owned_pid_file(path)
+    assert path.exists()

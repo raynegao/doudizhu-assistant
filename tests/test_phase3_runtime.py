@@ -3,9 +3,17 @@ from __future__ import annotations
 import json
 from pathlib import Path
 
-from PIL import Image
 import pytest
+from PIL import Image
 
+from src.pipeline.calibration import (
+    WindowInfo,
+    calibrate_roi,
+    load_runtime_config,
+    parse_window_candidates,
+    parse_window_info,
+    save_runtime_config,
+)
 from src.pipeline.runtime import (
     CardObservation,
     MacScreenFrameSource,
@@ -15,14 +23,6 @@ from src.pipeline.runtime import (
     ScreenFrame,
     compute_crop_boxes,
     format_runtime_event,
-)
-from src.pipeline.calibration import (
-    WindowInfo,
-    calibrate_roi,
-    load_runtime_config,
-    parse_window_info,
-    parse_window_candidates,
-    save_runtime_config,
 )
 from src.pipeline.stabilizer import ObservationStabilizer
 from src.vision.card_classifier import CardPrediction

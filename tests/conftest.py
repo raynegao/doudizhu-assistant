@@ -3,7 +3,7 @@ from __future__ import annotations
 import pytest
 
 from src.logic.action_validation import validate_observed_action
-from src.state.events import ObservedAction, PlayerSeat
+from src.state.events import ObservedAction
 from src.state.game_tracker import GameStateTracker
 from src.state.observable_state import ObservableGameState
 

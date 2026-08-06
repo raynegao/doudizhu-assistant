@@ -2,7 +2,7 @@
 
 ## 当前进度
 
-当前项目已完成 Phase 1–5B，并完成 Phase 6 的代码与自动化测试闭环；Phase 6 的真实窗口模板、完整对局 replay 和数值指标仍待 5–10 局真实数据到位后执行。
+当前项目已完成 Phase 1–5B，并完成 Phase 6 的代码、自动化测试、独立录制/replay 验收工具和工程质量门禁。Phase 6 的最终发布验收仍待 5–10 局真实完整对局和独立牌面 holdout 数据到位后执行。
 
 | 阶段 | 状态 | 已验证闭环 |
 | --- | --- | --- |
@@ -13,11 +13,11 @@
 | Phase 4 | 已完成 | 显式事件状态 -> 对手牌采样 -> 蒙特卡洛 -> Top-K 推荐/JSONL |
 | Phase 5A | 已完成 | 三场景 Showcase -> 固定指纹/基准 -> HTML/JSON -> CI/Docker |
 | Phase 5B | 已完成（评测待数据） | 最小只读 Web/API、Demo GIF 生成、真实窗口独立 holdout 评测流程 |
-| Phase 6 | 代码已完成（真实验收待数据） | Retina 窗口 -> 场面观测 -> 视觉事件 -> 状态跟踪 -> 异步 Top-3 -> 置顶小窗 |
+| Phase 6 | 离线工程闭环已完成（真实验收待数据） | Retina 窗口 -> 场面观测 -> 视觉事件 -> 状态跟踪 -> 异步 Top-3 -> 置顶小窗；带录制指纹、replay 指标和聚合验收门禁 |
 
 当前自动化测试基线以最新 CI 为准；Phase 2 本地小样本 train/val/test 为 `1589/422/99`，三组准确率均为 `100%`，`error_count = 0`。这些数据只证明当前固定 ROI/CNN 小样本闭环，不代表真实游戏窗口泛化准确率。
 
-当前主要缺口：Phase 6 已有出牌/过牌/角色/余牌的识别接口和严格事件门控，但仍缺 5–10 局真实录像、模板和独立 replay 指标，因此暂不宣称已经达到真实对局 F1/准确率目标；公开发布模型资产也需要另行规划。
+当前唯一不能在纯离线条件下补齐的核心缺口，是 5–10 局彼此独立的真实完整对局、逐局动作/余牌/终局标注，以及未参与模板修正的牌面 holdout。聚合验收会校验 session/frame SHA256、评测输入指纹、事件 F1、整组牌点、余牌、牌数守恒和整局成功率；门禁通过前不宣称真实准确率达标。
 
 ## Phase 1：规则引擎 MVP
 
@@ -151,7 +151,7 @@ python -m scripts.run_phase4_decision \
   --top-k 3
 ```
 
-边界：真实窗口自动对手事件识别尚未完成；均匀对手模型和当前规则子集会作为风险字段写入结果，不宣称为真实对手牌或完美胜率。
+边界：Phase 4 本身仍是显式事件/离线决策层；Phase 6 负责把真实窗口观测转换为事件。均匀未知牌模型会剔除已观测牌和未知历史弃牌，并输出抽样标准误与 95% 置信区间，但仍不等同于真实对手手牌分布或精确胜率。
 
 ## Phase 5：工程化展示
 
@@ -189,16 +189,26 @@ Phase 5B 已实现范围：
 - `VisualEventTracker`：连续帧稳定、空白到动作门控、余牌交叉校验、54 张牌守恒和不确定状态阻断。
 - `VisualEventTracker` 会把稳定地主位置变化作为新局边界，立即暂停旧状态的推荐。
 - `LiveGameRuntime`：截图、视觉、状态、后台决策和 JSONL 编排；断点仅在同一 UI 运行会话内恢复。
-- Top-1 改为估计胜率优先；Phase 6 默认 1.5 秒预算、至少 32 组 sampled worlds 和 Top-3。
+- Top-1 改为估计胜率优先；Phase 6 默认 1.5 秒预算、至少 32 组 sampled worlds 和 Top-3，并展示 95% 置信区间和候选区间重叠风险。
 - Tkinter 只读置顶助手窗与截图/Vision 分进程运行，识别子进程异常退出自动拉起；不读取鼠标、不点击游戏、不自动代打。
 - 标定、模板采集、完整窗口录制和出牌 crop 标注脚本。
+- 录制 session 保存不可变配置快照，每帧/每个 ROI 带 SHA256；中断安全收尾并由独立 finalize 确认完整对局。replay 报告绑定 manifest、配置、模型、模板、预测日志和两类人工标注的输入指纹。
+- `phase6-acceptance` 聚合审计 5–10 局独立样本，`live-diagnostics` 流式汇总现有 JSONL 的故障、延迟和轮次覆盖。
+- 错误截图按原因冷却并设每局/每次运行上限；PID 原子写入且仅由所属进程清理，识别进程和队列句柄在退出/重启时显式释放。
+- Ruff、Mypy、分支覆盖率和完整 Pytest 已进入本地 `make quality` 与 CI。
 
 运行入口：
 
 ```bash
 python -m scripts.calibrate_live_game --save-config configs/live_game.local.json
-python -m scripts.record_live_game --config configs/live_game.local.json --session game-001
+python -m scripts.record_live_game \
+  --config configs/live_game.local.json \
+  --session game-001 \
+  --until-interrupt
+make live-finalize SESSION=game-001
 python -m scripts.run_live_assistant --config configs/live_game.local.json
+make live-diagnostics
+make phase6-acceptance
 ```
 
-验收边界：必须使用未参与模板/微调的完整对局 replay 验证出牌/过牌 F1、牌点整组准确率、余牌准确率和整局状态守恒。没有真实数据时，只能确认代码、状态保护和合成测试通过。
+验收边界：必须使用未参与模板/微调的完整对局 replay 验证出牌/过牌 F1、牌点整组准确率、余牌准确率和整局状态守恒。没有真实数据时，只能确认离线代码、状态保护、证据链和自动化质量门禁通过；详细流程见 `docs/PHASE6_ACCEPTANCE.md`。

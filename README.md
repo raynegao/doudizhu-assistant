@@ -20,6 +20,7 @@ open runs/showcase/index.html
 - [精简架构图](docs/ARCHITECTURE.md)
 - [Demo 与录屏说明](docs/SHOWCASE.md)
 - [评测口径与基准](docs/EVALUATION.md)
+- [Phase 6 真实对局验收](docs/PHASE6_ACCEPTANCE.md)
 - [中英文作品集/简历描述](docs/PORTFOLIO.md)
 
 ## 环境
@@ -53,7 +54,10 @@ python -m src.ui.cli \
 
 ```bash
 python -m pytest -q
+make quality
 ```
+
+`make quality` 依次执行 Ruff、核心/决策/报告层 Mypy 和带分支覆盖率的完整测试；当前 CI 覆盖率门槛为 65%。
 
 当前 Phase 1 已跑通的能力：
 
@@ -347,7 +351,7 @@ Phase 5A 已完成可复现证据链：
 - GitHub Actions 在 Python 3.10/3.12 验证核心路径，并在 Python 3.12 跑完整测试。
 - 当前自动化测试基线以最新 CI 为准，Phase 5 证据见 `docs/evidence/`。
 
-Phase 5B 已实现最小 Web API/UI、可重复生成的 Demo GIF 和真实窗口 holdout 工具链；不引入自动点击、强化学习或未经验证的真实窗口准确率宣传。
+Phase 5B 已实现最小 Web API/UI、可重复生成的 Demo GIF 和真实窗口 holdout 工具链；holdout 的发布门禁要求总体准确率至少 95%、每类至少 90%，不引入自动点击、强化学习或未经验证的真实窗口准确率宣传。
 
 ## Phase 5B：本地 Web 展示与真实窗口 Holdout
 
@@ -365,7 +369,7 @@ make demo-gif
 # 输出 runs/phase5b/demo.gif
 ```
 
-真实窗口独立 holdout 的采集与评测说明见 [`docs/REAL_WINDOW_HOLDOUT.md`](docs/REAL_WINDOW_HOLDOUT.md)。工具支持 ROI 自动切牌、单行/交互标注、contact sheet、crop/ROI SHA256、训练集泄漏阻断、逐类别指标与混淆矩阵；尚未采集的数据不会被虚构为泛化指标。
+真实窗口独立 holdout 的采集与评测说明见 [`docs/REAL_WINDOW_HOLDOUT.md`](docs/REAL_WINDOW_HOLDOUT.md)。工具支持 ROI 自动切牌、单行/交互标注、contact sheet、crop/ROI SHA256、训练集泄漏阻断、逐类别指标与混淆矩阵；达到覆盖要求后必须先运行 `make holdout-seal`，再运行 `make holdout-evaluate`。盲封存会绑定人工标签、全部采集 session、模型、训练 manifest 和完整实现，Phase 6 验收还要求模型与 replay 完全一致。尚未采集的数据不会被虚构为泛化指标。
 
 ## Phase 6：完整场面感知与实时胜率助手
 
@@ -388,9 +392,14 @@ make live-calibrate
 ```bash
 python -m scripts.record_live_game \
   --config configs/live_game.local.json \
-  --session game-001 \
-  --frames 800
+  --session acceptance-001 \
+  --evidence-split acceptance \
+  --until-interrupt
 ```
+
+对局结束后按 `Ctrl-C`，再执行 `make live-finalize SESSION=acceptance-001`。每个 session 会保存不可变配置快照、无损视频容器 SHA256、逐帧完整 RGB 像素 SHA256，以及可从解码帧无损重算的各 ROI 像素 SHA256；不再同步写完整帧和 14 份 ROI PNG。正式局使用 `libx264rgb` 无损帧间压缩，50 帧真实窗口 smoke 仅 3.4 MiB，解码后逐帧哈希完全一致。录制器默认使用持久化 ScreenCaptureKit 窗口流并以 0.1 秒周期采样，当前 Mac 实测为中位数约 10.00 FPS、最大帧间隔约 0.105 秒；正式局还强制中位数 ≤0.15 秒、P95 ≤0.20 秒。正式验收必须显式使用 `--evidence-split acceptance`，录制时会封印 Python、原生 Swift 采集器、FFmpeg 编码器、模型和模板指纹；默认开发录制不会进入聚合，封印后发生实现改动也会自动让正式局失效，防止针对验收局调参。同名 session 默认拒绝静默追加；尚未录完时需显式 `--resume`，且不能更换配置或证据分区。
+
+正式验收局必须在 replay 之前完成盲标：先运行 `make live-annotate-prepare SESSION=acceptance-001`，仅根据原始帧 contact sheet 填写动作与余牌真值，再运行 `make live-annotate-seal SESSION=acceptance-001`。封存工具与正式 replay 会双向阻止“先看预测、后改真值”，聚合审计还会核对标注时间、contact sheet、manifest、代码/评测工具链、模型和模板指纹。旧五局和所有用于调试的录制只属于开发证据，不能计入泛化指标。
 
 准备好模板和模型后运行置顶助手窗：
 
@@ -421,19 +430,19 @@ python -m scripts.run_live_assistant \
   --no-clear
 ```
 
-实时入口优先在地主和加倍完成、首手尚未打出时完成 54 张牌一致性初始化，不要求从发牌或抢地主阶段持续运行。如果助手漏掉了纯空场初始帧，但画面仍稳定显示地主第一手、自己的完整 17 张农民手牌、角色和另一名农民的 17 张，系统会先验证首手牌型与 54 张守恒，再安全重建首个事件。更晚的中途启动会在下一次自己回合自动建立带未知历史牌池的近似模型，也可通过“扫描当前牌局”按钮立即请求重建；任何可信余牌冲突、非法牌型或多项低置信度仍会暂停推荐。Top-1 按估计团队胜率优先，默认计算预算为 1.5 秒且至少完成 32 组 sampled worlds。完整采集、模板标注和验收步骤见 [Phase 6 使用说明](docs/PHASE6_LIVE_ASSISTANT.md)。
+实时入口优先在地主和加倍完成、首手尚未打出时完成 54 张牌一致性初始化，不要求从发牌或抢地主阶段持续运行。如果助手漏掉了纯空场初始帧，但画面仍稳定显示地主第一手、自己的完整 17 张农民手牌、角色和另一名农民的 17 张，系统会先验证首手牌型与 54 张守恒，再安全重建首个事件。更晚的中途启动会在下一次自己回合自动建立带未知历史牌池的近似模型，也可通过“扫描当前牌局”按钮立即请求重建；任何可信余牌冲突、非法牌型或多项低置信度仍会暂停推荐。Top-1 按估计团队胜率优先，默认计算预算为 1.5 秒且至少完成 32 组 sampled worlds；界面同时显示 95% 置信区间，前两名区间重叠会写入风险提示。完整采集、模板标注和验收步骤见 [Phase 6 使用说明](docs/PHASE6_LIVE_ASSISTANT.md)。
 
 跟踪开始后，自己的出牌以连续两帧稳定的“上一手牌 − 当前手牌”生成事件，不再依赖会与游戏按钮重叠的自己出牌 ROI。自己的完整手牌保持不变而回合控件连续稳定消失时，会直接确认本次“过牌”；控件状态已纳入稳定指纹，单帧闪烁不会产生假事件。手牌切分会始终锚定牌顶，并按近似等距网格剔除竖排 `JOKER` 内部的伪牌边；进入残局后，牌扇缩窄到 1–3 张时会按实际可见牌边重新定位，不再沿用完整手牌必须横跨大区域的门槛。大/小王的高置信度 CNN 结果不会再被普通 `J` 字形覆盖。即使“您当前没有牌大过对方”等横幅遮住牌身，也不会把牌底白块当作牌点；同一局的初始牌点参考会辅助后续稳定识别。点击选牌导致牌面抬高时，仍是 17/20 张但牌点短暂变化的动画帧不会被当成新局。瞬时错误手牌会先暂停推荐并等待恢复，只有持续多帧仍无法解释才把整局标为不确定。对手场上牌会同时使用牌点图形和余牌数字变化确认；“不出”还会直接检测各座位上半区的白色字形，避免本地只有 neutral 模板时永远无法生成明确 pass。可见牌组始终先于回合提示触发的过牌推断，接近阈值的牌点可由精确余牌下降交叉确认。状态机会持续记住三家各自最近出现过的空白边缘，即使该座位当时还不是当前行动者；因此两名对手在一个采样间隔内连续行动时，后一个座位的新牌不会被误判成旧场面。余牌字形还使用闭环拓扑区分容易混淆的 `5/6`。若自己出牌后两名对手都在下一帧前完成“不出”，状态机会先提交已确认的手牌差集，再依次生成两次 pass、清空 trick 并立即恢复自由出牌推荐；不会把这一次完整循环降级成新的近似 round。若短暂的“不出”文字恰好落在两个采样帧之间，状态机会用后续行动者已验证的余牌减少和出牌反推遗漏的过牌事件。若当前 trick 中两名对手的余牌均未减少，而界面已经重新出现自己的回合按钮，则依次生成两次“不出”、清空当前待压牌并立即计算新的自由出牌 Top-3。活动状态自动重建必须同时看到手牌或至少一家余牌真实减少，场上残留的旧牌不能单独覆盖正确 revision。
 
 推荐展示还有两层独立安全门：最新画面中的完整手牌必须与产生该 revision 的状态手牌一致；异步结果返回后，实时层还会重新生成该状态的合法动作集合，要求最佳动作和每个 Top-K 都在其中且最佳动作等于 Top-1。任一检查失败都会隐藏结果并写入 `live_decision_rejected`，避免再次建议当前手中不存在的牌；视觉恢复一致后自动重新计算。自己的最后一手合法组合（单张、对子、三张或顺子等）打出后，稳定的空手牌区和已消失的出牌控件会生成终局事件；整个剩余手牌必须能构成合法牌型，异常空 ROI 不会误判获胜。终局会清理本局断点，并允许下一副完整手牌自动创建新 `round_id`。
 
-场面分割使用 NumPy 批量计算白色区域与牌边缘，并缓存稳定的 Window ID；当前 Mac 经典窗口的真实采样从修复前约 `2.7s/帧` 降至通常 `0.6–0.9s/帧`。置顶窗状态行显示 `R<revision>` 和 `F<frame>`，即使尚未产生新动作，也可以直接确认截图线程仍在持续刷新。
+场面分割使用 NumPy 批量计算白色区域与牌边缘；窗口采集优先使用随源码分发、按源码哈希本地编译缓存的 ScreenCaptureKit 持久流，不再为每帧启动 `screencapture` 子进程。当前 Mac 经典窗口的热态采集约 9.8 ms、完整识别中位数约 128 ms，20 帧真实循环约 6.19 FPS；Swift 不可用或流异常时仍回退到原 WindowServer Window ID 截图路径。置顶窗状态行显示 `R<revision>` 和 `F<frame>`，即使尚未产生新动作，也可以直接确认截图线程仍在持续刷新。
 
 等待斗地主窗口和稳定跟踪期间，重复的场面、状态与运行快照只按内容变化和每 20 帧心跳写入日志；真实出牌、过牌、重扫和决策仍会立即记录。这样避免长时间运行时每帧重复写入相同手牌导致磁盘持续增长。实时 JSONL 达到 64 MiB 会带时间戳归档，不删除历史证据。GUI 正常关闭或收到终止信号时都会显式停止识别子进程并回收队列资源，避免重启后残留多个采集器或积累 semaphore。
 
 每条 `play_observed` / `pass_observed` 同时记录 `round_id` 和来源 `frame_id`，便于按整局复核。识别子进程重启后帧号会从 1 重新开始，置顶窗会同步重置自己的帧游标；如果重启恰好发生在手动扫描期间，扫描按钮会恢复可点击，不会等待旧进程的高帧号。
 
-录制数据可以通过 `scripts.replay_live_game` 离线重放，并用 `scripts.evaluate_live_replay` 生成事件 F1、牌点整组准确率、余牌准确率和牌数守恒报告。
+录制数据可以通过 `scripts.replay_live_game` 离线重放；正式 session 必须先有有效的盲标封印。replay 默认读取 session 内的配置快照，拒绝静默覆盖旧输出，并把 manifest、标注封印、配置、模型、模板和事件日志指纹写入 `replay.json`。`scripts.evaluate_live_replay` 生成事件 F1、牌点整组准确率、余牌准确率、54 张守恒和终局报告，同时绑定人工标注。`make phase6-acceptance` 只汇总代码冻结后新录制的 `acceptance` session，要求至少 5 个，并逐帧核对完整图/派生 ROI、采样间隔、盲标时间、录制封印、跨 session 泄漏、replay/评测输入和独立牌面 holdout；在数据不足时返回非零并把缺口写入 `runs/phase6-acceptance/report.json`。`make live-diagnostics` 可流式分析大型实时日志，给出有效 round、动作/决策覆盖、扫描成功率、延迟和错误类别。
 
 ## 配置与日志
 - 配置文件支持 YAML/JSON，示例见 `configs/app.example.yaml`。

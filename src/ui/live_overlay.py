@@ -1,8 +1,9 @@
 from __future__ import annotations
 
 import queue
+from collections.abc import Callable
 from dataclasses import dataclass
-from typing import Any, Callable
+from typing import Any
 
 from src.capture.screen_geometry import WindowCaptureStatus
 from src.pipeline.live_runtime import LiveRuntimeSnapshot
@@ -21,7 +22,7 @@ class LiveOverlayViewModel:
     warnings: str
 
     @classmethod
-    def from_runtime_error(cls, message: str) -> "LiveOverlayViewModel":
+    def from_runtime_error(cls, message: str) -> LiveOverlayViewModel:
         return cls(
             status="识别线程异常停止",
             roles="识别状态：不可用",
@@ -34,7 +35,7 @@ class LiveOverlayViewModel:
         )
 
     @classmethod
-    def from_snapshot(cls, snapshot: LiveRuntimeSnapshot) -> "LiveOverlayViewModel":
+    def from_snapshot(cls, snapshot: LiveRuntimeSnapshot) -> LiveOverlayViewModel:
         if not snapshot.window_available:
             return cls(
                 status=snapshot.window_message,
@@ -128,15 +129,29 @@ class LiveOverlayViewModel:
         else:
             result = snapshot.decision.result
             first = result.rankings[0]
+            interval = (
+                f"（95%区间 {first.win_rate_ci95_low:.1%}–"
+                f"{first.win_rate_ci95_high:.1%}）"
+                if first.win_rate_ci95_low is not None
+                and first.win_rate_ci95_high is not None
+                else ""
+            )
             best = (
                 f"最佳：{result.action}\n"
-                f"估计{scope}胜率：{first.estimated_win_rate:.1%}"
+                f"估计{scope}胜率：{first.estimated_win_rate:.1%}{interval}"
             )
             top_k = tuple(
                 (
                     f"{index}. {evaluation.action}  "
                     f"{evaluation.estimated_win_rate:.1%}  "
-                    f"n={evaluation.simulations}"
+                    + (
+                        f"CI {evaluation.win_rate_ci95_low:.1%}–"
+                        f"{evaluation.win_rate_ci95_high:.1%}  "
+                        if evaluation.win_rate_ci95_low is not None
+                        and evaluation.win_rate_ci95_high is not None
+                        else ""
+                    )
+                    + f"n={evaluation.simulations}"
                 )
                 for index, evaluation in enumerate(result.rankings, start=1)
             )
@@ -184,9 +199,9 @@ class LiveAssistantOverlay:
 
     def __init__(
         self,
-        snapshots: "queue.Queue[LiveRuntimeSnapshot]",
+        snapshots: queue.Queue[LiveRuntimeSnapshot],
         *,
-        runtime_errors: "queue.Queue[str] | None" = None,
+        runtime_errors: queue.Queue[str] | None = None,
         on_close: Callable[[], None] | None = None,
         on_scan: Callable[[], None] | None = None,
         health_check: Callable[[], str | None] | None = None,

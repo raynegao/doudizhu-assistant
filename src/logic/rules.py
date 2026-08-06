@@ -1,10 +1,10 @@
 from __future__ import annotations
 
 from collections import Counter
+from collections.abc import Iterable
 from dataclasses import dataclass
 from enum import Enum
 from itertools import combinations
-from typing import Iterable
 
 from src.state.cards import CHAIN_RANKS, RANK_VALUE, CardSet, parse_cards, sort_cards
 
@@ -37,7 +37,7 @@ class Play:
     combo_size: int = 0
 
     @classmethod
-    def parse(cls, value: str | Iterable[str] | None) -> "Play":
+    def parse(cls, value: str | Iterable[str] | None) -> Play:
         return classify_play(parse_cards(value))
 
     @property
@@ -61,7 +61,10 @@ def _rank_groups(cards: tuple[str, ...]) -> Counter[str]:
 
 def _is_consecutive(ranks: list[str]) -> bool:
     values = [RANK_VALUE[rank] for rank in ranks]
-    return all(next_value == value + 1 for value, next_value in zip(values, values[1:]))
+    return all(
+        next_value == value + 1
+        for value, next_value in zip(values, values[1:], strict=False)
+    )
 
 
 def _chain_main_rank(ranks: Iterable[str]) -> str:
