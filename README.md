@@ -1,15 +1,30 @@
 # doudizhu-assistant
+
 AI-based Dou Dizhu assistant with Mac screen capture, CNN card recognition, a rule engine, real-time recommendations, and multi-frame stabilization.
 
 [![CI](https://github.com/raynegao/doudizhu-assistant/actions/workflows/ci.yml/badge.svg)](https://github.com/raynegao/doudizhu-assistant/actions/workflows/ci.yml)
 
-当前已完成 Phase 1–6 的代码闭环：规则引擎、CNN 牌面识别 replay、Mac 实时流水线、显式事件状态、蒙特卡洛 Top-K、可复现 Showcase/CI/Docker，以及 Phase 6 的 Retina 窗口采集、三家场面观测、视觉事件跟踪、异步胜率决策和只读置顶助手窗。Phase 6 的真实对局准确率仍需用 5–10 局独立录制数据验收。
+一个**只读**的斗地主实时助手：抓取 macOS 上斗地主客户端的窗口画面，用纯 CV + 小 CNN 识别三家出牌、过牌、角色和余牌，把稳定的视觉事件送进带 54 张牌守恒约束的状态机，再用蒙特卡洛 rollout 给出带 95% 置信区间的 Top-3 出牌建议，显示在一个置顶小窗里。
 
-2026-09-07 已完成五局 **AI 参考标注冻结基线评测**：整局成功 **0/5**，独立几何裁剪后的冻结 CNN 分类 **436/438（99.54%）**。二者范围不同，不能用分类分数宣称整局可靠，也不宣称独立人工真值。已据失败原帧开展选牌动画、事件证据与模板污染修复；这批数据此后属于回归证据，新实现需重新冻结后录制验证。详见 [本轮证据与限制](docs/AI_REFERENCE_ACCEPTANCE_20260907.md)。
+它**不会**点牌、不会代打、不会修改游戏客户端；所有推荐只在最新画面手牌与状态 revision 完全一致时才展示。
 
-## 一分钟作品集 Demo
+## 现状一览
 
-不需要模型权重、原始数据或游戏窗口即可生成可复现报告：
+| 维度 | 状态 | 证据 |
+|---|---|---|
+| 规则引擎 / 合法动作 / 牌型比较 | 完成，CLI 可独立使用 | `tests/`，`python -m src.ui.cli` |
+| CNN 牌面分类（固定 ROI 切牌） | 完成；本地 train/val/test 100%，**不是**真实窗口泛化准确率 | `models/card_cnn.metrics.json`（不入库） |
+| Mac 实时流水线（ScreenCaptureKit 持久流 → 识别 → 状态 → 决策 → Tk 置顶窗） | 完成；热态采集约 9.8 ms，完整识别中位数约 128 ms | [PHASE6_LIVE_ASSISTANT.md](docs/PHASE6_LIVE_ASSISTANT.md) |
+| 蒙特卡洛 Top-K + 置信区间 | 完成；对手模型为**均匀未知牌抽样**，是可解释基线而非行为模型 | [ARCHITECTURE.md](docs/ARCHITECTURE.md) |
+| 无损录制 / 逐帧 SHA256 / 盲标封印 / replay 评测 | 完成 | [PHASE6_ACCEPTANCE.md](docs/PHASE6_ACCEPTANCE.md) |
+| AI 参考标注回归（六局 11,025 帧） | 动作 188/188、余牌 557/564、严格完整局 6/6 | [AI_REFERENCE_FIXES_20260908_V11.md](docs/AI_REFERENCE_FIXES_20260908_V11.md) |
+| **独立盲测验收**（5–10 局新录制 + 300 张牌面 holdout） | **未完成** | `make phase6-acceptance` 当前预期返回非零 |
+
+关于最后两行要说清楚：2026-09-07 冻结的五局 AI 参考基线最初整局成功 **0/5**，之后据失败原帧做了 v8–v11 四轮修复，回归到 6/6。这批数据因此已参与调参，属于**回归证据**，不能当成泛化指标；真实准确率仍要等代码冻结后录制全新对局。详见 [AI_REFERENCE_ACCEPTANCE_20260907.md](docs/AI_REFERENCE_ACCEPTANCE_20260907.md)。
+
+## 一分钟 Demo
+
+不需要模型权重、原始数据或游戏窗口：
 
 ```bash
 source .venv/bin/activate
@@ -17,451 +32,140 @@ make demo
 open runs/showcase/index.html
 ```
 
-输出包括机器可读 `report.json`、CI 摘要 `summary.md` 和完全离线的响应式 `index.html`。默认覆盖地主主动、地主响应和农民响应三个固定事件场景，并验证 sampled worlds 完成数、Top-K 排序与固定 seed 决策指纹。
+生成机器可读 `report.json`、CI 摘要 `summary.md` 和完全离线的 `index.html`，覆盖地主主动、地主响应、农民响应三个固定事件场景，并验证固定 seed 的决策指纹。更多见 [SHOWCASE.md](docs/SHOWCASE.md)。
 
-- [精简架构图](docs/ARCHITECTURE.md)
-- [Demo 与录屏说明](docs/SHOWCASE.md)
-- [评测口径与基准](docs/EVALUATION.md)
-- [Phase 6 真实对局验收](docs/PHASE6_ACCEPTANCE.md)
-- [中英文作品集/简历描述](docs/PORTFOLIO.md)
+## 架构
 
-## 环境
-- Python 3.12.13（>=3.10 均可，当前本地开发使用 3.12）
-- 建议使用虚拟环境隔离依赖
+```text
+capture ──> vision ──> tracking ──> state ──> logic ──> ui / reporting
+ 窗口帧     SceneObservation  稳定事件   ObservableGameState  合法动作+MC   Tk/CLI/Web/JSONL
+```
+
+| 层 | 目录 | 职责 | 禁止 |
+|---|---|---|---|
+| capture | `src/capture/` | ScreenCaptureKit / WindowServer 窗口采集、Retina 几何、无损录制 | 识别牌、选动作 |
+| config | `src/config/` | Pydantic 配置模型，含 `LiveLayoutConfig` 和各视觉阈值 | 引入运行时编排 |
+| vision | `src/vision/` | 牌面、角色、过牌、回合控件、余牌的纯 CV / CNN 观测 + 置信度 | 导入 `pipeline`、调用规则 |
+| tracking | `src/tracking/` | 多帧融合，只输出稳定、有序的视觉事件 | 模拟对手、渲染 UI |
+| state | `src/state/` | 事件 reducer、54 张牌守恒、未知历史牌池、团队结果语义 | 读图像、依赖模型框架 |
+| logic | `src/logic/` | 牌型、合法动作、对手采样、蒙特卡洛、推荐解释 | 读屏幕坐标、GUI 控件 |
+| pipeline | `src/pipeline/` | 实时主循环、标定、异步决策、录制写入 | 把规则藏进循环 |
+| ui | `src/ui/` | CLI、只读 Web、Tk 置顶窗 | 持有采集或状态变更 |
+| reporting | `src/reporting/` | Showcase、诊断、证据会话、聚合验收 | 改游戏状态或模型输出 |
+
+完整边界、运行时安全门和验收拒绝条件见 [ARCHITECTURE.md](docs/ARCHITECTURE.md)。
 
 ## 快速开始
+
+需要 Python ≥ 3.10（本地开发用 3.12），macOS 实时功能需要 Apple Silicon Mac 和屏幕录制权限。
+
 ```bash
 python3.12 -m venv .venv
 source .venv/bin/activate
 pip install --upgrade pip
 pip install -r requirements-dev.txt
-```
-
-## Phase 1：规则引擎 MVP
-当前阶段先不依赖 CV/YOLO，使用手动输入跑通规则引擎闭环：
-
-```bash
-python -m src.ui.cli \
-  --hand "3 3 4 4 5 5 6 6 7 8 9 SJ BJ" \
-  --last-play "5 5" \
-  --log-file logs/phase1.jsonl
-```
-
-牌面记法：
-- 普通牌：`3 4 5 6 7 8 9 10 J Q K A 2`
-- 小王：`SJ`
-- 大王：`BJ`
-
-运行测试：
-
-```bash
-python -m pytest -q
 make quality
 ```
 
-`make quality` 依次执行 Ruff、核心/决策/报告层 Mypy 和带分支覆盖率的完整测试；当前 CI 覆盖率门槛为 65%。
+`make quality` = Ruff + 核心层 Mypy + 带分支覆盖率的完整 Pytest（门槛 65%，当前约 78%）。`make macos-smoke` 用真实 Tk / spawn / Swift 编译验证桌面集成但不读屏幕。本地存在 `.venv/bin/python` 时 Makefile 自动使用它。
 
-macOS 桌面集成另有 `make macos-smoke`：使用真实 Tk、spawn 子进程和 Swift 编译器验证启动、停止与回收，但不读取屏幕。CI 的 Linux 完整检查与本地共用 `make quality`，macOS 作业执行同一冒烟入口。
-
-当前 Phase 1 已跑通的能力：
-
-- 解析手牌和上一手牌，校验重复牌和大小王数量。
-- 识别单张、对子、三张、三带一、三带二、顺子、连对、飞机、炸弹和火箭等基础牌型。
-- 根据上一手牌生成可行动作集合。
-- 输出一个确定性的基础推荐动作和中文理由。
-- 写入 JSONL 日志，字段包括 `event`、`input_cards`、`last_play`、`candidate_count`、`recommended_action`、`reason`、`warnings`。
-
-Phase 1 现在作为稳定基础保留；后续 CV 和实时系统继续复用 CLI、测试和日志字段。
-
-## Phase 2：CNN 牌面识别闭环
-
-Phase 2 采用“固定 ROI + 规则切牌 + PyTorch CNN 分类”路线。Mac 本地已完成数据准备、训练、ONNX 导出、crop 推理和 replay 演示，并已被 Phase 3/3.5 实时系统复用。
-
-当前本地评估结果来自 `models/card_cnn.metrics.json` 和 `models/card_cnn.eval.json`：
-
-- train：`1589/1589 = 100%`
-- val：`422/422 = 100%`
-- test：`99/99 = 100%`
-- `error_count = 0`
-
-这个准确率只代表当前小样本、本地 ROI/CNN 闭环验收，不代表真实游戏窗口泛化准确率。Phase 3 需要继续用更多真实截图验证。
+### 离线使用：规则引擎 CLI
 
 ```bash
-python -m scripts.prepare_card_templates --dry-run
-python -m scripts.prepare_card_templates
-python -m scripts.rebuild_card_cls_dataset \
-  --template-per-seed 20 \
-  --real-per-crop 30
+python -m src.ui.cli --hand "3 3 4 4 5 5 6 6 7 8 9 SJ BJ" --last-play "5 5"
 ```
 
-`rebuild_card_cls_dataset` 会清空并重建 `data/cards_cls/train`、`data/cards_cls/val`、`data/cards_cls/test`，并写出 `data/cards_cls/manifest.jsonl` 记录每张增强样本的来源。当前会跳过坏 crop 目录 `data/roi_samples/hand_roi_001_step135`。
+牌面记法：`3 4 5 6 7 8 9 10 J Q K A 2`，小王 `SJ`，大王 `BJ`。
 
-训练小 CNN、导出 ONNX，并生成基础 metrics：
-
-```bash
-python -m scripts.train_card_cnn --epochs 30 --batch-size 32
-```
-
-单独评估训练集、验证集和测试集，输出混淆矩阵与错例报告：
-
-```bash
-python -m scripts.evaluate_card_cnn \
-  --model models/card_cnn.pt \
-  --dataset data/cards_cls \
-  --output-dir models
-```
-
-输出目录：
-
-- `data/cards_cls_seed/<rank>/`：从 DouZero fork 的 `pics/` 提取的模板 seed。
-- `data/cards_cls/train/<rank>/`：增强后的训练集。
-- `data/cards_cls/val/<rank>/`：增强后的验证集。
-- `data/cards_cls/test/<rank>/`：从真实 crop 拆分出的最小测试集。
-- `data/cards_cls/manifest.jsonl`：增强样本的数据来源记录。
-- `models/card_cnn.pt`：PyTorch checkpoint。
-- `models/card_cnn.onnx`：ONNX 推理模型。
-- `models/card_cnn.metrics.json`：训练过程中的最佳 epoch 和 train/val/test 指标。
-- `models/card_cnn.confusion_matrix.csv`：混淆矩阵。
-- `models/card_cnn.error_report.jsonl`：错例报告。
-- `src/vision/assets/rank_glyph_signatures.json`：从真实牌点 crop 导出的 64×64 匿名二值字形特征；随代码提交，用于在没有本地模板目录时纠正提示横幅遮挡下的 CNN 误识别，不包含原始截图。
-
-数据和模型目录默认不提交 Git；仅提交上述不可逆还原原图的轻量字形特征。需要从新标注集刷新时运行 `python -m scripts.export_rank_glyph_signatures`。Phase 2 默认在 Mac 本地完成，不依赖 Windows/WSL。
-
-## Phase 2D：Mac 斗地主 ROI 切牌
-
-当前 Mac 客户端可用固定 ROI + 固定步长切牌。先从完整截图裁出手牌 ROI，再把重叠手牌切成可分类的 rank+suit 小图：
-
-```bash
-python -m scripts.crop_hand_roi_cards \
-  --roi data/raw_screenshots/window_mode_hand_roi_tight_001.png \
-  --output-dir data/roi_samples/window_mode_hand_roi_tight_001 \
-  --count 15 \
-  --start-x 0 \
-  --start-y 20 \
-  --step-x 135 \
-  --crop-size 126x210
-```
-
-把真实 crop 加入训练集用于当前客户端风格微调：
-
-```bash
-python -m scripts.add_labeled_crops_to_dataset \
-  --crop-dir data/roi_samples/window_mode_hand_roi_tight_001 \
-  --labels "A K Q J 10 10 9 8 7 7 6 5 4 3 3"
-```
-
-`data/raw_screenshots/` 和 `data/roi_samples/` 默认不提交 Git。当前窗口模式实测手牌 ROI 为 `(380, 1110, 2555, 1515)`，当前样本手牌数为 15，`step-x=135`，`start-y=20`；如果窗口缩放、移动到其他显示器或分辨率变化，需要重新标定。
-
-补充 `2/BJ/SJ` 覆盖时，可使用包含大王和 `2` 的 17 张手牌截图。当前 joker 样本参数为 ROI `(360, 1110, 2600, 1515)`、`count=17`、`step-x=120`；`SJ` 暂用 `BJ` crop 的灰度版本生成，后续截到真实小王后再替换。
-
-当前重建数据集使用的真实 crop：
-
-- `data/roi_samples/window_mode_hand_roi_tight_001`：标签为 `A K Q J 10 10 9 8 7 7 6 5 4 3 3`。
-- `data/roi_samples/window_mode_jokers_hand_roi_001`：标签为 `BJ 2 2 K Q J J 9 9 9 8 8 8 6 4 4 3`。
-- `data/roi_samples/window_mode_jokers_sj_gray`：临时 `SJ` 灰度样本；后续应替换为真实小王截图。
-- `data/roi_samples/hand_roi_001_step135`：存在空白/坏 crop，不参与当前数据集重建。
-
-预测已切好的 crop：
-
-```bash
-python -m scripts.predict_card_crops \
-  --model models/card_cnn.pt \
-  --crop-dir data/roi_samples/window_mode_hand_roi_tight_001
-```
-
-端到端 replay：CNN 识别手牌后接入 Phase 1 规则引擎，输出候选动作和推荐理由。
-
-```bash
-python -m scripts.replay_phase2 \
-  --model models/card_cnn.pt \
-  --roi data/raw_screenshots/window_mode_hand_roi_tight_001.png
-```
-
-如果当前手牌数量或重叠间距不同，replay 可显式传入切牌参数，例如：
-
-```bash
-python -m scripts.replay_phase2 \
-  --model models/card_cnn.pt \
-  --roi data/raw_screenshots/window_mode_jokers_hand_roi_001.png \
-  --count 17 \
-  --step-x 120
-```
-
-Replay 默认会在单牌置信度低于 `0.70` 时输出 warning，但不中断规则引擎推荐。
-
-当前 Phase 2 replay smoke 的期望识别结果：
-
-```text
-A K Q J 10 10 9 8 7 7 6 5 4 3 3
-```
-
-## Phase 3：实时系统第一版
-
-Phase 3 第一版已把 Mac 固定 ROI 截屏源接成可刷新流水线：
-
-```text
-固定截图源/窗口源 -> ROI -> CNN 识别 -> 状态刷新 -> 推荐输出 -> JSONL 日志
-```
-
-实时主循环位于 `src/pipeline/`，不塞进 `vision`、`logic` 或 `ui` 内部。第一版只做固定 ROI 截屏、内存切牌、CNN 推理、规则推荐、终端实时面板和 JSONL 日志；复杂 GUI、胜率估计和蒙特卡洛策略仍留到后续阶段。
-
-运行一帧 smoke：
-
-```bash
-python -m scripts.run_phase3_runtime \
-  --max-frames 1 \
-  --device cpu \
-  --no-clear
-```
-
-连续运行：
-
-```bash
-python -m scripts.run_phase3_runtime \
-  --interval 1.0 \
-  --device cpu
-```
-
-当前 Mac 斗地主窗口实测运行方式：
-
-```bash
-cd "/Users/rayne/Documents/university/junior_year_spring/doudizhu-assistant"
-source .venv/bin/activate
-
-python -m scripts.run_phase3_runtime \
-  --max-frames 1 \
-  --device cpu \
-  --no-clear \
-  --roi-box 180,555,1300,758 \
-  --count 17 \
-  --step-x 60 \
-  --crop-size 63x105 \
-  --start-y 10 \
-  --last-play 3
-```
-
-如果当前是主动出牌，去掉 `--last-play 3`。如果上一手是对子、三张或其他牌型，按牌面写入，例如 `--last-play "5 5"`、`--last-play "Q Q Q"`。如果窗口位置、窗口大小、显示器或缩放发生变化，`--roi-box 180,555,1300,758` 需要重新标定。
-
-## Phase 3.5：窗口标定与稳定识别
-
-Phase 3.5 支持从当前 Mac 斗地主窗口生成本地 ROI 配置，并用最近 N 帧投票稳定识别结果。
-
-先打开斗地主窗口并进入牌局，然后运行：
-
-```bash
-python -m scripts.calibrate_phase3_roi \
-  --app-name 斗地主 \
-  --save-config configs/phase3_runtime.local.json
-```
-
-该命令会读取 `斗地主` 窗口位置，生成 `configs/phase3_runtime.local.json`。这个本地配置已被 `.gitignore` 忽略，不会提交到 Git。
-
-使用本地配置运行：
-
-```bash
-python -m scripts.run_phase3_runtime \
-  --config configs/phase3_runtime.local.json \
-  --max-frames 3 \
-  --device cpu \
-  --no-clear
-```
-
-也可以在运行时重新读取窗口位置：
-
-```bash
-python -m scripts.run_phase3_runtime \
-  --config configs/phase3_runtime.local.json \
-  --auto-window \
-  --app-name 斗地主 \
-  --max-frames 3 \
-  --device cpu \
-  --no-clear
-```
-
-默认稳定窗口为 `--stability-window 3`。设为 `1` 可关闭跨帧投票：
-
-```bash
-python -m scripts.run_phase3_runtime \
-  --config configs/phase3_runtime.local.json \
-  --stability-window 1 \
-  --max-frames 1 \
-  --device cpu \
-  --no-clear
-```
-
-如果斗地主窗口移动、缩放或换显示器，重新运行 `scripts.calibrate_phase3_roi` 即可。
-
-常用参数：
-
-- `--roi-box`：屏幕 ROI，格式为 `left,top,right,bottom`，默认 `(380,1110,2555,1515)`。
-- `--count`、`--start-x`、`--start-y`、`--step-x`、`--crop-size`：沿用 Phase 2 固定切牌参数。
-- `--last-play`：上一手牌；留空表示主动出牌。
-- `--config`：读取本地 ROI 配置，通常使用 `configs/phase3_runtime.local.json`。
-- `--auto-window`：运行前重新读取斗地主窗口并换算 ROI。
-- `--stability-window`：最近 N 帧投票稳定识别结果，默认 `3`。
-- `--confidence-threshold`：低置信度 warning 阈值，默认 `0.70`。
-- `--log-file`：默认写入 `logs/phase3_runtime.jsonl`。
-
-macOS 首次运行可能需要给终端或 Codex app 授权“屏幕录制”。如果未授权，CLI 会输出截图权限错误；授权后重新运行即可。如果看到 `does not intersect any displays`，说明当前 `--roi-box` 不在活动显示器坐标范围内，需要重新标定 ROI；Retina 屏幕下 `screencapture` 使用的坐标可能和截图像素尺寸不同。
-
-Phase 3 JSONL 每帧包含 `event`、`frame_id`、`timestamp`、`source`、`roi_box`、`raw_recognized_cards`、`recognized_cards`、`observations`、`last_play`、`candidate_count`、`recommended_action`、`reason`、`warnings`、`latency_ms`、`stabilized` 和 `stability_window`。
-
-## Phase 4：可观测牌局状态与蒙特卡洛决策
-
-Phase 4 已完成离线/显式事件闭环：
-
-```text
-game_started + play/pass 事件
-  -> 54 张牌守恒与状态 reducer
-  -> 未知牌池/对手剩余牌均匀采样
-  -> 三人团队 rollout
-  -> 策略评分、Top-K 推荐、理由和风险
-  -> 终端输出与 JSONL 日志
-```
-
-运行仓库内置事件 replay：
+### 离线使用：事件 replay + 蒙特卡洛
 
 ```bash
 python -m scripts.run_phase4_decision \
   --events-file examples/phase4_round.jsonl \
-  --simulations 200 \
-  --seed 20260721 \
-  --top-k 3 \
-  --log-file logs/phase4_decision.jsonl
+  --simulations 200 --seed 20260721 --top-k 3
 ```
 
-`examples/phase4_round.jsonl` 第一行是 `game_started`，后续每行是带稳定 `event_id` 和递增 `sequence_no` 的 `play_observed` 或 `pass_observed`。状态层会拒绝乱序、越权、物理重复或无法压制的动作；重复事件保持幂等，未确认的低置信度事件会把派生状态标记为 `uncertain` 并阻断推荐，确认事件到达后才能恢复。
+只读 Web 展示：`make web-demo` 后打开 http://127.0.0.1:8765。
 
-Phase 4 当前能力：
+### 实时使用：macOS 置顶助手
 
-- 维护地主、三人顺序、当前行动者、剩余张数、上一手、连续过牌、历史和未知牌池。
-- 两家连续过牌后清空当前牌型，由最后出牌者重新领出。
-- 使用固定 seed 的局部随机数，对未知牌无放回分配，所有候选动作共用同一批 sampled worlds。
-- 支持地主/农民团队胜负、最大深度、时间预算、候选裁剪和确定性回退。
-- 输出估计胜率、真实终局率、终局胜率、策略分、风险字段、对手持牌概率和 Top-K 推荐；状态信息不足时回退到确定性策略，并将胜率显示为 `n/a`，不会伪装成 `0%`。
-- `RolloutPolicy` 是后续替换更强启发式、MCTS 或 RL policy 的显式接口；Phase 4 本身不引入强化学习。
-- 补充四带二单/四带二对；飞机单翅膀仍采用“不同点数单牌”的严格规则口径。
+1. 打开斗地主客户端并进入牌局，标定窗口与 ROI：
+   ```bash
+   make live-calibrate
+   ```
+2. 启动助手（默认处于"扫描已停止"，点击"开始扫描"后才创建截图/识别进程）：
+   ```bash
+   make live-assistant
+   ```
+3. 终端调试模式：
+   ```bash
+   python -m scripts.run_live_assistant --config configs/live_game.local.json --no-ui --start-scanning --no-clear
+   ```
 
-重要边界：Phase 3 仍只负责自己的手牌；Phase 6 在独立实时入口中增加对手出牌、过牌、角色和余牌识别，再把稳定事件送入 Phase 4。均匀分配是可解释的概率基线，不是对手真实手牌预测；日志会保留 `uniform_opponent_model` 和 `rule_subset_only` 风险提示。
+助手可以先于游戏启动，也可以在抢地主、加倍完成后再启动；窗口最小化会暂停推荐，恢复后在下一次自己回合自动重扫。模板采集、断点恢复、诊断证据和日志策略见 [PHASE6_LIVE_ASSISTANT.md](docs/PHASE6_LIVE_ASSISTANT.md)。
 
-## Phase 5A：工程化展示
-
-Phase 5A 已完成可复现证据链：
-
-- `scripts/run_phase5_showcase.py` 一条命令运行 Phase 1 基线和三个 Phase 4 场景。
-- 固定 seed 重复执行并生成决策指纹，区分算法一致性与机器相关延迟。
-- 输出 JSON、Markdown 和完全自包含的 HTML 作品集报告。
-- 核心/视觉依赖分层，CPU Docker 不携带权重、截图或私有数据。
-- GitHub Actions 在 Python 3.10/3.12 验证核心路径，并在 Python 3.12 跑完整测试。
-- 当前自动化测试基线以最新 CI 为准，Phase 5 证据见 `docs/evidence/`。
-
-Phase 5B 已实现最小 Web API/UI、可重复生成的 Demo GIF 和真实窗口 holdout 工具链；holdout 的发布门禁要求总体准确率至少 95%、每类至少 90%，不引入自动点击、强化学习或未经验证的真实窗口准确率宣传。
-
-## Phase 5B：本地 Web 展示与真实窗口 Holdout
-
-启动只读本地展示：
+### 录制与验收
 
 ```bash
-make web-demo
-# 浏览器打开 http://127.0.0.1:8765
+python -m scripts.record_live_game --config configs/live_game.local.json \
+  --session acceptance-001 --evidence-split acceptance --until-interrupt
+make live-finalize SESSION=acceptance-001
+make live-annotate-prepare SESSION=acceptance-001   # 盲标，只看原始帧 contact sheet
+make live-annotate-seal SESSION=acceptance-001
+make phase6-acceptance                              # 数据不足时返回非零
 ```
 
-页面只接受仓库版本化的 Phase 4 replay 场景，展示当前状态、Top-K、风险字段和推荐理由；不会读取任意本地路径、截图或执行游戏操作。生成公开演示素材：
+正式录制会封印 Python / Swift 采集器 / FFmpeg / 模型 / 模板指纹；封印后任何实现改动都会让旧正式局失效，防止针对验收局调参。流程、阈值与拒绝条件见 [PHASE6_ACCEPTANCE.md](docs/PHASE6_ACCEPTANCE.md)。
 
-```bash
-make demo-gif
-# 输出 runs/phase5b/demo.gif
-```
+## 常用命令
 
-真实窗口独立 holdout 的采集与评测说明见 [`docs/REAL_WINDOW_HOLDOUT.md`](docs/REAL_WINDOW_HOLDOUT.md)。工具支持 ROI 自动切牌、单行/交互标注、contact sheet、crop/ROI SHA256、训练集泄漏阻断、逐类别指标与混淆矩阵；达到覆盖要求后必须先运行 `make holdout-seal`，再运行 `make holdout-evaluate`。盲封存会绑定人工标签、全部采集 session、模型、训练 manifest 和完整实现，Phase 6 验收还要求模型与 replay 完全一致。尚未采集的数据不会被虚构为泛化指标。
+| 命令 | 用途 |
+|---|---|
+| `make quality` / `make macos-smoke` | 质量门禁 / 桌面集成冒烟 |
+| `make demo` / `make benchmark` / `make docker-demo` | 可复现 Showcase、基准、CPU Docker |
+| `make web-demo` / `make demo-gif` | 只读 Web 展示、Demo GIF |
+| `make live-calibrate` / `make live-assistant` | 标定、启动实时助手 |
+| `make live-finalize` / `live-annotate-prepare` / `live-annotate-seal` | 录制封存与盲标 |
+| `make live-diagnostics` / `make live-storage` | 分析最近证据会话 / 只读盘点存储 |
+| `make holdout-seal` / `make holdout-evaluate` | 独立牌面 holdout 封存与评测 |
+| `make phase6-acceptance` | 聚合验收门禁 |
 
-## Phase 6：完整场面感知与实时胜率助手
-
-Phase 6 新增只读实时闭环：
+## 仓库结构
 
 ```text
-WindowServer 窗口级 Retina 截图 -> 归一化场面 ROI -> 三家 play/pass/角色/纯 CV 余牌观测
-  -> 连续帧稳定与轮次校验 -> ObservableGameState
-  -> 后台蒙特卡洛 Top-3 -> 置顶助手窗/JSONL
+src/           分层实现（见上表）
+scripts/       训练、导出、录制、replay、标注、诊断、验收、Showcase 的 CLI
+tests/         单元、集成、状态不变量、蒙特卡洛、生命周期、证据指纹、CLI 回放（约 2000 项）
+native/        macOS ScreenCaptureKit 持久流 Swift 源码；二进制按源码哈希本地缓存
+configs/       配置模板；*.local.json 为本机配置，不入库
+docs/          架构、评测、验收、修复报告、作品集文案
+examples/      内置事件 replay 样例
+data/ models/ logs/ runs/   数据、模型、日志、产物，均不入库
 ```
 
-首次使用先启动 Mac “斗地主”客户端并标定：
+## 文档索引
 
-```bash
-make live-calibrate
-```
+- [ARCHITECTURE.md](docs/ARCHITECTURE.md) — 分层边界、运行时安全、决策语义、验收拒绝条件
+- [PHASE6_LIVE_ASSISTANT.md](docs/PHASE6_LIVE_ASSISTANT.md) — 实时助手标定、模板、录制、运行、状态保护
+- [PHASE6_ACCEPTANCE.md](docs/PHASE6_ACCEPTANCE.md) — 正式录制、盲标、replay、聚合门禁
+- [EVALUATION.md](docs/EVALUATION.md) — 评测口径与基准
+- [REAL_WINDOW_HOLDOUT.md](docs/REAL_WINDOW_HOLDOUT.md) — 独立牌面 holdout 采集与评测
+- [SHOWCASE.md](docs/SHOWCASE.md) — Demo 与录屏说明
+- [PORTFOLIO.md](docs/PORTFOLIO.md) — 中英文作品集 / 简历描述
+- [RELIABILITY_REVIEW_20260905.md](docs/RELIABILITY_REVIEW_20260905.md) — 可靠性修复验收表
+- AI 参考回归：[ACCEPTANCE_20260907](docs/AI_REFERENCE_ACCEPTANCE_20260907.md) · [ACCEPTANCE_20260907_003](docs/AI_REFERENCE_ACCEPTANCE_20260907_003.md) · 修复 [v8](docs/AI_REFERENCE_FIXES_20260907_V8.md) · [v9](docs/AI_REFERENCE_FIXES_20260907_V9.md) · [v10](docs/AI_REFERENCE_FIXES_20260908_V10.md) · [v11](docs/AI_REFERENCE_FIXES_20260908_V11.md)
+- [PHASE_HISTORY.md](docs/PHASE_HISTORY.md) — Phase 1–6 的逐阶段命令、参数与实测记录（原 README 主体）
 
-标定会按牌桌 Window ID 抓取窗口，即使牌桌被 Codex 等窗口遮挡也不会混入前台画面，并生成本地配置、ROI 预览和 contact sheet。随后需要从真实对局中采集 `role`、`remaining`、`pass/neutral`、`turn` 模板，并录制 5–10 局用于 replay 验收：
+## 已知限制
 
-```bash
-python -m scripts.record_live_game \
-  --config configs/live_game.local.json \
-  --session acceptance-001 \
-  --evidence-split acceptance \
-  --until-interrupt
-```
-
-对局结束后按 `Ctrl-C`，再执行 `make live-finalize SESSION=acceptance-001`。每个 session 会保存不可变配置快照、无损视频容器 SHA256、逐帧完整 RGB 像素 SHA256，以及可从解码帧无损重算的各 ROI 像素 SHA256；不再同步写完整帧和 14 份 ROI PNG。正式局使用 `libx264rgb` 无损帧间压缩，50 帧真实窗口 smoke 仅 3.4 MiB，解码后逐帧哈希完全一致。录制器默认使用持久化 ScreenCaptureKit 窗口流并以 0.1 秒周期采样，当前 Mac 实测为中位数约 10.00 FPS、最大帧间隔约 0.105 秒；正式局还强制中位数 ≤0.15 秒、P95 ≤0.20 秒。正式验收必须显式使用 `--evidence-split acceptance`，录制时会封印 Python、原生 Swift 采集器、FFmpeg 编码器、模型和模板指纹；默认开发录制不会进入聚合，封印后发生实现改动也会自动让正式局失效，防止针对验收局调参。同名 session 默认拒绝静默追加；尚未录完时需显式 `--resume`，且不能更换配置或证据分区。
-
-正式验收局必须在 replay 之前完成盲标：先运行 `make live-annotate-prepare SESSION=acceptance-001`，仅根据原始帧 contact sheet 填写动作与余牌真值，再运行 `make live-annotate-seal SESSION=acceptance-001`。封存工具与正式 replay 会双向阻止“先看预测、后改真值”，聚合审计还会核对标注时间、contact sheet、manifest、代码/评测工具链、模型和模板指纹。旧五局和所有用于调试的录制只属于开发证据，不能计入泛化指标。
-
-准备好模板和模型后运行置顶助手窗：
-
-```bash
-make live-assistant
-```
-
-本地存在 `.venv/bin/python` 时，Makefile 会自动使用该解释器；无需依赖当前 shell 是否已经执行 `source .venv/bin/activate`。
-
-本机桌面快捷方式 `/Users/rayne/Desktop/斗地主助手.command` 会转交给仓库内的 `scripts/launch_live_assistant_macos.command`。启动成功、检测到助手已在运行或用户确认启动错误后，脚本只会关闭本次启动器对应的 Terminal 标签，并清理历史版本留下且已空闲、包含助手专属启动提示的旧标签；不会关闭其他正在工作的终端。启动过程使用原子锁，连续双击不会拉起两个助手实例。
-
-助手可以先于斗地主启动，但刚打开时只显示置顶窗，不创建截图或识别进程。只有点击“开始扫描”后才会读取斗地主窗口；点击“结束扫描”会关闭截图源并回收本次识别进程。开始扫描后，未检测到游戏窗口时会持续等待；窗口打开后自动识别。游戏窗口最小化时，小窗会立即显示无法识别并暂停推荐，恢复窗口后重新探测。活动牌局会把本局参考手牌帧和最后一个可信 revision 保存到本地忽略目录；无论该局来自完整 17/20 张开局还是中途安全扫描，同一次扫描中的识别子进程异常退出都会自动拉起，并用该扫描会话的断点继续。重新开始扫描会生成新的会话，不会加载上一次已停止进程的旧牌局，以免把停机期间漏掉的出牌伪造成连续状态。若窗口不可见期间可能漏掉场上动作，旧状态不会直接继续给推荐；恢复后会等到下一次稳定的自己回合自动重扫，重扫前始终保持暂停。
-
-也可以先在斗地主中完成抢地主和加倍，再启动助手。助手从桌面、其他窗口或其他 Space 等待斗地主牌桌重新可见；一旦稳定识别到唯一地主、三家角色、完整 17/20 张初始手牌和初始余牌，会用独立的 2 帧开局门槛建立 `ObservableGameState`。如果自己是地主会立即计算第一手 Top-3；如果对手是地主，则等待并识别地主首手，轮到自己时再给决策。普通出牌事件仍使用更严格的 3 帧门槛。
-
-助手在未建模或窗口中断后，只要连续 2 帧稳定看到自己的回合、角色、手牌、左右余牌和当前待压牌，就会自动扫描当前牌局并恢复推荐。跟踪已经启动但状态与桌面发生漂移时，也会先让正常事件推断追赶；若同一差异持续稳定到恢复门槛，则在自己回合自动重建，避免 revision 永久停住。自己的回合优先按提示/出牌按钮的大面积黄色结构判断，避免只有 active 模板时被固定蓝色背景误导。左右余牌使用黄色数字分割和归一化字形轮廓匹配，不再依赖系统把单个描边数字当作文本；数字 `0/1/2` 的匿名轮廓随代码分发，因此干净环境也能读取 `1/2/10/11/12…/20`。置顶窗同时提供“重新扫描当前牌局”按钮用于随时强制重扫，一次点击会自动重试最多 8 个可用帧，不必反复点击；若识别进程已经超过自动重启预算而停止，该按钮会先重新启动识别进程并清除旧错误，再执行扫描。手牌优先使用本机真实牌点模板修正 CNN，场上紧密重叠的对子也会先逐张分割再识别。中途画面无法还原此前牌点时，系统只记录未知历史牌张数，并从剩余未知牌中同时采样对手手牌和历史弃牌池，界面会明确显示近似模型警告。地主、余牌或当前牌在重试后仍无法稳定确认时，本次扫描失败并保持推荐暂停。
-
-窗口级截图直接用目标窗口图像推导 Retina 比例，不再额外读取整个桌面，因此从 Terminal 桌面快捷方式启动时不会因全屏 `ImageGrab` 中断。macOS 仍会按启动应用单独检查“屏幕与系统音频录制”权限；首次从 Terminal 双击启动需允许 Terminal，授权后重新打开快捷方式。Tk 小窗和截图/Vision 识别运行在不同进程，避免 macOS GUI 初始化后再启动 CoreFoundation 辅助进程；识别子进程异常退出会自动恢复，30 秒内连续失败 3 次才停止并在小窗显示日志位置。
-
-角色不再直接比较包含头像和大面积蓝色背景的整块 ROI。当前 Mac 客户端的角色徽标会先按局部字色识别（金色“地主”、白色“农民”），因此同一个角色标志可以跨左、右、自己三个位置识别；完整开局中自己可见的 20 张牌仍作为“自己为地主”的强结构交叉校验。若跟踪中的稳定地主位置发生变化，会立即暂停推荐并等待新局重新建模。
-
-终端调试模式：
-
-```bash
-python -m scripts.run_live_assistant \
-  --config configs/live_game.local.json \
-  --no-ui \
-  --start-scanning \
-  --no-clear
-```
-
-无界面模式缺少 `--start-scanning` 时会直接退出，不加载截图配置，也不会获取屏幕。
-
-实时入口优先在地主和加倍完成、首手尚未打出时完成 54 张牌一致性初始化，不要求从发牌或抢地主阶段持续运行。如果助手漏掉了纯空场初始帧，但画面仍稳定显示地主第一手、自己的完整 17 张农民手牌、角色和另一名农民的 17 张，系统会先验证首手牌型与 54 张守恒，再安全重建首个事件。更晚的中途启动会在下一次自己回合自动建立带未知历史牌池的近似模型，也可通过“重新扫描当前牌局”按钮立即请求重建；任何可信余牌冲突、非法牌型或多项低置信度仍会暂停推荐。Top-1 按估计团队胜率优先，默认计算预算为 1.5 秒且至少完成 32 组 sampled worlds；界面同时显示 95% 置信区间，前两名区间重叠会写入风险提示。完整采集、模板标注和验收步骤见 [Phase 6 使用说明](docs/PHASE6_LIVE_ASSISTANT.md)。
-
-跟踪开始后，自己的出牌以连续两帧稳定的“上一手牌 − 当前手牌”生成事件，不再依赖会与游戏按钮重叠的自己出牌 ROI。自己的完整手牌保持不变而回合控件连续稳定消失时，会直接确认本次“过牌”；控件状态已纳入稳定指纹，单帧闪烁不会产生假事件。手牌切分会始终锚定牌顶，并按近似等距网格剔除竖排 `JOKER` 内部的伪牌边；进入残局后，牌扇缩窄到 1–3 张时会按实际可见牌边重新定位，不再沿用完整手牌必须横跨大区域的门槛。大/小王的高置信度 CNN 结果不会再被普通 `J` 字形覆盖。即使“您当前没有牌大过对方”等横幅遮住牌身，也不会把牌底白块当作牌点；同一局的初始牌点参考会辅助后续稳定识别。点击选牌导致牌面抬高时，仍是 17/20 张但牌点短暂变化的动画帧不会被当成新局。瞬时错误手牌会先暂停推荐并等待恢复，只有持续多帧仍无法解释才把整局标为不确定。对手场上牌会同时使用牌点图形和余牌数字变化确认；“不出”还会直接检测各座位上半区的白色字形，避免本地只有 neutral 模板时永远无法生成明确 pass。可见牌组始终先于回合提示触发的过牌推断，接近阈值的牌点可由精确余牌下降交叉确认。状态机会持续记住三家各自最近出现过的空白边缘，即使该座位当时还不是当前行动者；因此两名对手在一个采样间隔内连续行动时，后一个座位的新牌不会被误判成旧场面。余牌字形还使用闭环拓扑区分容易混淆的 `5/6`。若自己出牌后两名对手都在下一帧前完成“不出”，状态机会先提交已确认的手牌差集，再依次生成两次 pass、清空 trick 并立即恢复自由出牌推荐；不会把这一次完整循环降级成新的近似 round。若短暂的“不出”文字恰好落在两个采样帧之间，状态机会用后续行动者已验证的余牌减少和出牌反推遗漏的过牌事件。若当前 trick 中两名对手的余牌均未减少，而界面已经重新出现自己的回合按钮，则依次生成两次“不出”、清空当前待压牌并立即计算新的自由出牌 Top-3。活动状态自动重建必须同时看到手牌或至少一家余牌真实减少，场上残留的旧牌不能单独覆盖正确 revision。
-
-推荐展示还有两层独立安全门：最新画面中的完整手牌必须与产生该 revision 的状态手牌一致；异步结果返回后，实时层还会重新生成该状态的合法动作集合，要求最佳动作和每个 Top-K 都在其中且最佳动作等于 Top-1。任一检查失败都会隐藏结果并写入 `live_decision_rejected`，避免再次建议当前手中不存在的牌；视觉恢复一致后自动重新计算。自己的最后一手合法组合（单张、对子、三张或顺子等）打出后，稳定的空手牌区和已消失的出牌控件会生成终局事件；整个剩余手牌必须能构成合法牌型，异常空 ROI 不会误判获胜。终局会清理本局断点，并允许下一副完整手牌自动创建新 `round_id`。
-
-场面分割使用 NumPy 批量计算白色区域与牌边缘；窗口采集优先使用随源码分发、按源码哈希本地编译缓存的 ScreenCaptureKit 持久流，不再为每帧启动 `screencapture` 子进程。当前 Mac 经典窗口的热态采集约 9.8 ms、完整识别中位数约 128 ms，20 帧真实循环约 6.19 FPS；Swift 不可用或流异常时仍回退到原 WindowServer Window ID 截图路径。置顶窗状态行显示 `R<revision>` 和 `F<frame>`，即使尚未产生新动作，也可以直接确认截图线程仍在持续刷新。
-
-等待斗地主窗口和稳定跟踪期间，重复的场面、状态与运行快照只按内容变化和每 20 帧心跳写入日志；真实出牌、过牌、重扫和决策仍会立即记录。每次点击“开始扫描”还会在 `data/live_game/evidence/<scan-session>/` 创建独立诊断会话，限量保留场面变化、动作、结算、心跳和异常关键帧，并写入配置快照、异常签名与会话级 JSONL。`configs/live_evidence_fixed_issues.json` 记录已修复签名；修复问题时递增注册表版本并登记对应签名，只有正常关闭的会话通过连续事件序号、封存计数及文件完整性验证后，才会自动清理与该问题精确关联的异常 PNG，不会连带删除同一会话的普通关键帧、事件日志或其他问题证据。受管证据默认限制为 20 个会话、512 MiB、30 天和每会话 180 帧；活动会话与手工 pin 是硬保护，最近及每种未修复问题的最新会话只在未超容量时优先保留，触及硬上限后仍按最旧优先清理。全局实时 JSONL 每个文件达到 64 MiB 后归档，最多保留 3 个归档。`make live-diagnostics` 默认分析最近一次受管会话。GUI 正常关闭或收到终止信号时都会显式停止识别子进程并回收队列资源，避免重启后残留多个采集器或积累 semaphore。
-
-每条 `play_observed` / `pass_observed` 同时记录 `round_id` 和来源 `frame_id`，便于按整局复核。识别子进程重启后帧号会从 1 重新开始，置顶窗会同步重置自己的帧游标；如果重启恰好发生在手动扫描期间，扫描按钮会恢复可点击，不会等待旧进程的高帧号。
-
-### 实时可靠性与证据留存
-
-- 桌面和无界面共用目标周期调度，扣除识别耗时；桌面等待可被停止事件打断。决策进程只实际执行一个任务，父端只保留最新待执行任务，旧结果仍必须通过 revision 校验。
-- 胜率区间区分有限终局样本和含截断的模拟评分；有限全赢/全输不表示必胜/必败，区间不覆盖对手模型偏差。置顶窗明确展示低样本、排序接近、预算和模型近似提示，内容可滚动且扫描按钮固定。
-- 每次扫描的普通 PNG 是有界滚动缓存，异常与结算帧优先保留；只允许淘汰当前进程自己新写且未被修改、未被 pin 的普通缓存帧。全为关键帧或受到保护时明确记录遗漏，不静默突破容量限制。旧录制和旧异常图不会被自动收编或删除。
-- `make live-diagnostics` 合并当前 JSONL 与仍保留的轮转归档，报告来源和保留范围。已经被历史保留策略淘汰的日志不能恢复；没有完整引用证明时，不能据此认定异常图片只属于已修复问题。建议结束扫描后再复盘，读取中变化的日志会被拒绝。
-- `make live-storage` 只读盘点旧录制、异常图和受管会话，输出体积及留存分类；不删除、不移动、不改标。正式录制、人工盲标和封印一同保留，未分类录制先确认来源，开发局在问题修复验证后再单独决定归档。
-
-本轮修复与尚缺实战证据见 [可靠性修复验收表](docs/RELIABILITY_REVIEW_20260905.md)。
-
-录制数据可以通过 `scripts.replay_live_game` 离线重放；正式 session 必须先有有效的盲标封印。replay 默认读取 session 内的配置快照，拒绝静默覆盖旧输出，并把 manifest、标注封印、配置、模型、模板和事件日志指纹写入 `replay.json`。`scripts.evaluate_live_replay` 生成事件 F1、牌点整组准确率、余牌准确率、54 张守恒和终局报告，同时绑定人工标注。`make phase6-acceptance` 只汇总代码冻结后新录制的 `acceptance` session，要求至少 5 个，并逐帧核对完整图/派生 ROI、采样间隔、盲标时间、录制封印、跨 session 泄漏、replay/评测输入和独立牌面 holdout；在数据不足时返回非零并把缺口写入 `runs/phase6-acceptance/report.json`。`make live-diagnostics` 可流式分析大型实时日志，给出有效 round、动作/决策覆盖、扫描成功率、延迟和错误类别。
+- **单皮肤绑定**：几何、颜色阈值、Joker 墨色、回合控件实体均针对当前 macOS 斗地主客户端的经典布局标定；换皮肤或平台需要重新标定并重新验证，不宣称跨皮肤泛化。
+- **对手模型是均匀基线**：未知牌均匀抽样，不建模对手行为；UI 会标出 `uniform_opponent_model` 风险，Top 候选置信区间重叠时标记排序不稳定。
+- **中途启动是近似模型**：看不见的历史牌只记 `hidden_played_count` 并进入未知采样池，不伪造牌点。
+- **真实准确率未独立验证**：所有现有数值均为本地评估或已参与调参的回归数据；`make phase6-acceptance` 在新独立数据齐全前预期返回非零。
+- 不做自动点击、强化学习、云部署或多平台适配。
 
 ## 配置与日志
-- 配置文件支持 YAML/JSON，示例见 `configs/app.example.yaml`。
-- `src/config/settings.py` 提供 Pydantic 校验与热重载轮询。
-- `src/config/logging_config.py` 提供文本/JSON 日志输出（控制台 + 可选文件）。
+
+- 配置支持 YAML / JSON，示例见 `configs/app.example.yaml`、`configs/live_game.example.json`；`src/config/settings.py` 提供 Pydantic 校验与热重载轮询。
+- `src/config/logging_config.py` 提供文本 / JSON 日志（控制台 + 可选文件）；实时 JSONL 按内容变化与每 20 帧心跳写入，单文件 64 MiB 后归档。
+- 本机桌面快捷方式 `斗地主助手.command` 转交 `scripts/launch_live_assistant_macos.command`，原子锁防重复实例。
