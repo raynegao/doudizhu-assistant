@@ -62,3 +62,6 @@ logs/
 # OS metadata
 .DS_Store
 Thumbs.db
+
+# Local fix/acceptance archives (frozen tarballs, large)
+work/
