@@ -12,7 +12,7 @@ from scripts.evaluate_live_replay import _evaluate_results, _same_action, evalua
 from src.state.round_result import infer_opening_landlord, parse_round_result
 
 
-@pytest.mark.parametrize(("landlord", "winner"), product(("self", "right", "left"), repeat=2))
+@pytest.mark.parametrize(("landlord", "winner"), list(product(("self", "right", "left"), repeat=2)))
 def test_team_result_all_seat_combinations(landlord: str, winner: str) -> None:
     outcome = "victory" if (landlord == winner) == (landlord == "self") else "defeat"
     row = {"landlord": landlord, "winner": winner, "outcome": outcome}
@@ -154,7 +154,7 @@ def test_literal_none_round_cannot_adopt_result_without_round(tmp_path):
     assert report["passed"] is False
 
 
-@pytest.mark.parametrize(("landlord", "winner"), product(("self", "right", "left"), repeat=2))
+@pytest.mark.parametrize(("landlord", "winner"), list(product(("self", "right", "left"), repeat=2)))
 def test_annotation_seals_team_result_without_human_rewrite(tmp_path, monkeypatch, landlord, winner):
     monkeypatch.setattr(annotate_live_session, "inspect_recording_session", lambda _: SimpleNamespace(
         valid=True, manifest_rows=[{"frame_id": 1}],
