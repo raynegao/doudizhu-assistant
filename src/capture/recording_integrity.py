@@ -21,6 +21,7 @@ from src.capture.lossless_video import (
     LosslessVideoError,
     iter_lossless_rgb_frames,
 )
+from src.capture.recording_lock import recording_session_lock
 from src.config.live_layout import NormalizedBox
 
 SESSION_SCHEMA_VERSION = "phase6-recording-session-v3"
@@ -98,6 +99,9 @@ def sha256_python_implementation(project_root: Path) -> str:
         *sorted((project_root / "src").rglob("*.py")),
         *sorted((project_root / "scripts").rglob("*.py")),
         *sorted((project_root / "native").rglob("*.swift")),
+        # Bundled glyph/title evidence changes real predictions just like
+        # implementation code; do not leave it outside acceptance seals.
+        *sorted((project_root / "src" / "vision" / "assets").rglob("*.json")),
         *(
             path
             for name in (
@@ -168,6 +172,8 @@ def inspect_recording_session(
     recording_state = metadata.get("recording_state")
     if recording_state not in {"recording", "interrupted", "failed", "captured", "complete"}:
         issues.append("session recording_state is missing or invalid")
+    if recording_state == "failed" or metadata.get("recording_error"):
+        issues.append("recording ended with an error; retained evidence is not eligible")
     if bool(metadata.get("complete_game")) != (recording_state == "complete"):
         issues.append("session complete_game and recording_state disagree")
     created_at = _number(metadata.get("created_at"))
@@ -417,12 +423,19 @@ def inspect_recording_session(
 
 
 def finalize_recording_session(session_dir: Path) -> RecordingInspection:
+    with recording_session_lock(session_dir):
+        return _finalize_stopped_session(session_dir)
+
+
+def _finalize_stopped_session(session_dir: Path) -> RecordingInspection:
     inspection = inspect_recording_session(
         session_dir,
         ignore_recorded_frame_count=True,
     )
     if not inspection.valid:
         raise ValueError("; ".join(inspection.issues))
+    if inspection.metadata.get("recording_state") not in {"interrupted", "captured", "complete"}:
+        raise ValueError("cannot finalize a recording that has not stopped safely")
     metadata = dict(inspection.metadata)
     metadata.update({
         "recorded_frames": len(inspection.manifest_rows),

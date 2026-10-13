@@ -3,7 +3,9 @@ from __future__ import annotations
 import hashlib
 import json
 import time
+from contextlib import contextmanager
 from pathlib import Path
+from threading import Event
 from types import SimpleNamespace
 
 import pytest
@@ -35,14 +37,29 @@ from src.capture.recording_integrity import (
     sha256_json_payload,
     sha256_python_implementation,
 )
+from src.capture.recording_lock import recording_session_lock
 from src.capture.screen_geometry import CapturedWindow, ScreenGeometry
 from src.config.live_layout import LiveLayoutConfig, save_live_layout
 from src.pipeline.calibration import WindowInfo
+from src.pipeline.recording_writer import RecordingBackpressure, RecordingWriterError
 from src.reporting.live_acceptance import (
     Phase6AcceptanceThresholds,
     audit_phase6_acceptance,
 )
 from src.reporting.live_diagnostics import analyze_live_log
+
+
+def test_implementation_fingerprint_covers_bundled_visual_evidence(tmp_path: Path) -> None:
+    source = tmp_path / "src" / "vision" / "assets"
+    source.mkdir(parents=True)
+    (tmp_path / "src" / "example.py").write_text("value = 1\n")
+    before = sha256_python_implementation(tmp_path)
+    asset = source / "round_result_signatures.json"
+    asset.write_text('{"outcomes": {"defeat": []}}')
+    created = sha256_python_implementation(tmp_path)
+    assert created != before
+    asset.write_text('{"outcomes": {"victory": []}}')
+    assert sha256_python_implementation(tmp_path) != created
 
 
 def _write_jsonl(path: Path, rows: list[dict[str, object]]) -> None:
@@ -132,6 +149,10 @@ class _FakeRecordingCapture:
         self.calls = 0
         self.interrupt_after = interrupt_after
         self.backend = backend
+        self.closed = False
+
+    def close(self) -> None:
+        self.closed = True
 
     def capture(self, frame_id: int) -> CapturedWindow:
         self.calls += 1
@@ -199,6 +220,152 @@ def test_live_recorder_writes_complete_integrity_chain(
     assert inspection.metadata["evidence_split"] == "development"
 
 
+def test_recorder_capture_continues_while_first_hash_is_blocked(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from scripts import record_live_game
+
+    entered, second_captured = Event(), Event()
+
+    class Capture(_FakeRecordingCapture):
+        def capture(self, frame_id: int) -> CapturedWindow:
+            if frame_id == 2:
+                assert entered.wait(2)
+                second_captured.set()
+            return super().capture(frame_id)
+
+    original_hash = record_live_game.sha256_image_pixels
+    first = True
+
+    def delayed_hash(image: Image.Image) -> str:
+        nonlocal first
+        if first:
+            first = False
+            entered.set()
+            assert second_captured.wait(2), "persistence still blocks acquisition"
+        return original_hash(image)
+
+    config = tmp_path / "config.json"
+    save_live_layout(config, LiveLayoutConfig(interval_seconds=0.05))
+    capture = Capture()
+    monkeypatch.setattr(record_live_game, "MacWindowCapture", lambda _: capture)
+    monkeypatch.setattr(record_live_game, "sha256_image_pixels", delayed_hash)
+    assert record_live_main([
+        "--config", str(config), "--session", "async", "--frames", "3",
+        "--evidence-split", "acceptance", "--output-root", str(tmp_path),
+    ]) == 0
+    inspection = inspect_recording_session(tmp_path / "async")
+    assert inspection.valid, inspection.issues
+    assert capture.closed
+    assert inspection.metadata["recording_diagnostics"]["written_frames"] == 3
+    assert inspection.manifest_rows[0]["recording_timing"]["hash_seconds"] > 0
+
+
+def test_queue_backpressure_stops_capture_and_retains_all_accepted_frames(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from scripts import record_live_game
+
+    entered, release = Event(), Event()
+
+    class Capture(_FakeRecordingCapture):
+        def capture(self, frame_id: int) -> CapturedWindow:
+            if frame_id == 2:
+                assert entered.wait(2)
+            return super().capture(frame_id)
+
+        def close(self) -> None:
+            super().close()
+            release.set()
+
+    original_hash = record_live_game.sha256_image_pixels
+    first = True
+
+    def delayed_hash(image: Image.Image) -> str:
+        nonlocal first
+        if first:
+            first = False
+            entered.set()
+            assert release.wait(3)
+        return original_hash(image)
+
+    config = tmp_path / "config.json"
+    save_live_layout(config, LiveLayoutConfig(interval_seconds=0.01, recording_queue_frames=1))
+    capture = Capture()
+    monkeypatch.setattr(record_live_game, "MacWindowCapture", lambda _: capture)
+    monkeypatch.setattr(record_live_game, "sha256_image_pixels", delayed_hash)
+    with pytest.raises(RecordingBackpressure, match="queue is full"):
+        record_live_main([
+            "--config", str(config), "--session", "full", "--frames", "6",
+            "--mark-complete", "--output-root", str(tmp_path),
+        ])
+    assert capture.calls == 3 and capture.closed
+    metadata = json.loads((tmp_path / "full" / "session.json").read_text())
+    assert metadata["recording_state"] == "failed"
+    assert metadata["recorded_frames"] == 2
+    assert metadata["recording_diagnostics"]["accepted_frames"] == 2
+    assert metadata["recording_diagnostics"]["unwritten_frames"] == 0
+    with pytest.raises(ValueError, match="ended with an error"):
+        finalize_recording_session(tmp_path / "full")
+
+
+@pytest.mark.parametrize("failure_stage", ["hash", "manifest-open", "capture-close", "seal"])
+def test_recorder_failure_still_closes_capture_and_records_failed_state(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, failure_stage: str,
+) -> None:
+    from scripts import record_live_game
+
+    capture = _FakeRecordingCapture()
+    config = tmp_path / "config.json"
+    save_live_layout(config, LiveLayoutConfig())
+    monkeypatch.setattr(record_live_game, "MacWindowCapture", lambda _: capture)
+
+    def fail(*_args: object, **_kwargs: object) -> None:
+        raise OSError(f"injected {failure_stage} failure")
+
+    if failure_stage == "hash":
+        monkeypatch.setattr(record_live_game, "sha256_image_pixels", fail)
+    elif failure_stage == "manifest-open":
+        original_open = Path.open
+
+        def failing_open(path: Path, *args, **kwargs):
+            if path.name == "manifest.jsonl" and args and args[0] == "a":
+                fail()
+            return original_open(path, *args, **kwargs)
+
+        monkeypatch.setattr(Path, "open", failing_open)
+    elif failure_stage == "capture-close":
+        def failing_close() -> None:
+            capture.closed = True
+            fail()
+
+        monkeypatch.setattr(capture, "close", failing_close)
+    else:
+        original_hash = record_live_game.sha256_file
+
+        def failing_seal(path: Path) -> str:
+            if path.suffix == ".mkv":
+                fail()
+            return original_hash(path)
+
+        monkeypatch.setattr(record_live_game, "sha256_file", failing_seal)
+
+    with pytest.raises((OSError, RecordingWriterError), match=f"injected {failure_stage}"):
+        record_live_main([
+            "--config", str(config), "--session", "failure", "--frames", "1",
+            "--mark-complete", "--evidence-split", "acceptance",
+            "--output-root", str(tmp_path),
+        ])
+    assert capture.closed
+    metadata = json.loads((tmp_path / "failure" / "session.json").read_text())
+    assert metadata["recording_state"] == "failed"
+    assert metadata["complete_game"] is False
+    assert f"injected {failure_stage}" in metadata["recording_error"]
+    if failure_stage == "capture-close":
+        assert metadata["recorded_frames"] == 1
+        assert metadata["frame_storage"]["segments"][0]["frame_count"] == 1
+
+
 def test_acceptance_recorder_uses_exact_lossless_video_frames(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
@@ -245,6 +412,183 @@ def test_acceptance_recorder_uses_exact_lossless_video_frames(
         ] == [(1, 20, 80), (2, 20, 80), (3, 20, 80)]
     finally:
         source.close()
+
+
+@pytest.mark.parametrize("change", ["interval", "implementation", "encoder", "recording", "failed"])
+def test_resume_rejects_changed_seals_or_unsafe_state_without_modifying_evidence(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, change: str,
+) -> None:
+    from scripts import record_live_game
+
+    config = tmp_path / "config.json"
+    save_live_layout(config, LiveLayoutConfig())
+    capture = _FakeRecordingCapture()
+    monkeypatch.setattr(record_live_game, "MacWindowCapture", lambda _: capture)
+    args = [
+        "--config", str(config), "--session", "resume-guard", "--frames", "1",
+        "--evidence-split", "acceptance", "--output-root", str(tmp_path),
+    ]
+    assert record_live_main(args) == 0
+    session = tmp_path / "resume-guard"
+    if change in {"recording", "failed"}:
+        metadata_path = session / "session.json"
+        metadata = json.loads(metadata_path.read_text())
+        metadata["recording_state"] = change
+        metadata_path.write_text(json.dumps(metadata))
+    elif change == "interval":
+        args += ["--interval", "0.05"]
+    elif change == "implementation":
+        monkeypatch.setattr(record_live_game, "_evidence_seal", lambda _: {"changed": True})
+    else:
+        monkeypatch.setattr(record_live_game, "_encoder_seal", lambda: {"changed": True})
+    before = {path: path.read_bytes() for path in session.rglob("*") if path.is_file()}
+    with pytest.raises(SystemExit, match="cannot resume"):
+        record_live_main([*args, "--resume"])
+    assert capture.calls == 1
+    assert all(path.read_bytes() == content for path, content in before.items())
+
+
+def test_session_lock_blocks_parallel_recording_and_finalize(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    config = tmp_path / "config.json"
+    save_live_layout(config, LiveLayoutConfig())
+    capture = _FakeRecordingCapture()
+    monkeypatch.setattr("scripts.record_live_game.MacWindowCapture", lambda _: capture)
+    session = tmp_path / "locked"
+    session.mkdir()
+    with recording_session_lock(session):
+        with pytest.raises(ValueError, match="session is busy"):
+            record_live_main([
+                "--config", str(config), "--session", "locked", "--frames", "1",
+                "--output-root", str(tmp_path),
+            ])
+        with pytest.raises(ValueError, match="session is busy"):
+            finalize_recording_session(session)
+    assert capture.calls == 0
+    assert not (session / "session.json").exists()
+    with recording_session_lock(session):
+        pass  # The previous owner released the kernel lock.
+
+
+def test_broken_stdout_does_not_change_committed_frame_counts(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    import sys
+
+    config = tmp_path / "config.json"
+    save_live_layout(config, LiveLayoutConfig())
+    monkeypatch.setattr(
+        "scripts.record_live_game.MacWindowCapture", lambda _: _FakeRecordingCapture(),
+    )
+
+    original_stdout = sys.stdout
+
+    class BrokenDescriptor:
+        def fileno(self) -> int:
+            raise BrokenPipeError("test closed terminal")
+
+        def __getattr__(self, name: str):
+            return getattr(original_stdout, name)
+
+    with monkeypatch.context() as local:
+        local.setattr(sys, "stdout", BrokenDescriptor())
+        result = record_live_main([
+            "--config", str(config), "--session", "stdout", "--frames", "1",
+            "--output-root", str(tmp_path),
+        ])
+    assert result == 0
+    inspection = inspect_recording_session(tmp_path / "stdout")
+    assert inspection.valid, inspection.issues
+    assert inspection.metadata["recorded_frames"] == 1
+    diagnostics = inspection.metadata["recording_diagnostics"]
+    assert diagnostics["written_frames"] == diagnostics["accepted_frames"] == 1
+    assert diagnostics["unwritten_frames"] == 0
+
+
+def test_failed_manifest_flush_is_not_counted_as_success_or_finalized(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    config = tmp_path / "config.json"
+    save_live_layout(config, LiveLayoutConfig())
+    capture = _FakeRecordingCapture()
+    monkeypatch.setattr("scripts.record_live_game.MacWindowCapture", lambda _: capture)
+    original_open = Path.open
+
+    class FailingFlush:
+        def __init__(self, stream):
+            self.stream = stream
+
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *args):
+            return self.stream.__exit__(*args)
+
+        def write(self, text):
+            return self.stream.write(text)
+
+        def flush(self):
+            self.stream.flush()
+            raise OSError("injected manifest flush failure")
+
+    def failing_open(path: Path, *args, **kwargs):
+        stream = original_open(path, *args, **kwargs)
+        if path.name == "manifest.jsonl" and args and args[0] == "a":
+            return FailingFlush(stream)
+        return stream
+
+    monkeypatch.setattr(Path, "open", failing_open)
+    with pytest.raises(RecordingWriterError, match="manifest flush failure"):
+        record_live_main([
+            "--config", str(config), "--session", "flush", "--frames", "1",
+            "--mark-complete", "--evidence-split", "acceptance",
+            "--output-root", str(tmp_path),
+        ])
+    metadata = json.loads((tmp_path / "flush" / "session.json").read_text())
+    assert capture.closed
+    assert metadata["recorded_frames"] == 0
+    assert metadata["recording_state"] == "failed"
+    assert metadata["frame_storage"]["segments"][0]["frame_count"] == 1
+    with pytest.raises(ValueError, match="ended with an error"):
+        finalize_recording_session(tmp_path / "flush")
+
+
+@pytest.mark.parametrize("capture_fails", [True, False])
+def test_stop_during_capture_does_not_reject_partial_unaccepted_frame(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capture_fails: bool,
+) -> None:
+    from scripts import record_live_game
+
+    received: list[int] = []
+
+    @contextmanager
+    def stop_signals(_stop):
+        yield received
+
+    class Capture(_FakeRecordingCapture):
+        def capture(self, frame_id: int) -> CapturedWindow:
+            if frame_id == 2:
+                received.append(2)  # Controlled signal flag, not a real process signal.
+                if capture_fails:
+                    raise OSError("capture child terminated during stop")
+                self.backend = "fallback"
+            return super().capture(frame_id)
+
+    config = tmp_path / "config.json"
+    save_live_layout(config, LiveLayoutConfig(interval_seconds=0.01))
+    capture = Capture()
+    monkeypatch.setattr(record_live_game, "MacWindowCapture", lambda _: capture)
+    monkeypatch.setattr(record_live_game, "_stop_on_signal", stop_signals)
+    assert record_live_main([
+        "--config", str(config), "--session", "stop", "--until-interrupt",
+        "--evidence-split", "acceptance", "--output-root", str(tmp_path),
+    ]) == 130
+    inspection = inspect_recording_session(tmp_path / "stop")
+    assert inspection.valid, inspection.issues
+    assert inspection.metadata["recorded_frames"] == 1
+    assert inspection.metadata["recording_state"] == "interrupted"
+    assert capture.closed
 
 
 def test_acceptance_lossless_video_detects_container_tampering(
@@ -659,6 +1003,7 @@ def test_live_replay_evaluator_reports_events_remaining_and_invariant(
             "event": "round_result_detected",
             "round_id": "round-001",
             "winner": "self",
+            "landlord": "self",
             "outcome": "victory",
         },
     ])
@@ -667,6 +1012,7 @@ def test_live_replay_evaluator_reports_events_remaining_and_invariant(
         {
             "event": "round_result_detected",
             "winner": "self",
+            "landlord": "self",
             "outcome": "victory",
         },
     ])
@@ -718,6 +1064,7 @@ def test_live_replay_requires_remaining_labels_for_every_expected_action(
         "event": "round_result_detected",
         "round_id": "round-001",
         "winner": "self",
+        "landlord": "self",
         "outcome": "victory",
     }
     _write_jsonl(predicted, [
@@ -766,6 +1113,7 @@ def _write_acceptance_session(
     session: str,
     *,
     color: tuple[int, int, int],
+    predicted_cards: list[str] | None = None,
 ) -> None:
     session_number = int(session.rsplit("-", 1)[-1])
     frame_timestamp = float(session_number * 1000)
@@ -824,6 +1172,7 @@ def _write_acceptance_session(
     result = {
         "event": "round_result_detected",
         "winner": "self",
+        "landlord": "self",
         "outcome": "victory",
     }
     _write_jsonl(expected_events, [action, result])
@@ -843,6 +1192,8 @@ def _write_acceptance_session(
     replay_dir.mkdir(parents=True)
     predicted = replay_dir / "events.jsonl"
     predicted_action = {**action, "round_id": f"runtime-{session}"}
+    if predicted_cards is not None:
+        predicted_action["cards"] = predicted_cards
     predicted_result = {**result, "round_id": f"runtime-{session}"}
     _write_jsonl(predicted, [
         predicted_action,
@@ -1236,6 +1587,22 @@ def test_phase6_acceptance_rejects_cross_session_frame_reuse(
     assert report["passed"] is False
 
 
+@pytest.mark.parametrize("state", ["recording", "failed"])
+def test_recording_finalize_rejects_unsafe_state(tmp_path: Path, state: str) -> None:
+    _write_acceptance_session(
+        tmp_path / "recordings", tmp_path / "replays", "game-001", color=(10, 20, 30),
+    )
+    session = tmp_path / "recordings" / "game-001"
+    metadata_path = session / "session.json"
+    metadata = json.loads(metadata_path.read_text())
+    metadata.update({"recording_state": state, "complete_game": False})
+    metadata_path.write_text(json.dumps(metadata))
+    before = metadata_path.read_bytes()
+    with pytest.raises(ValueError, match="not stopped safely|ended with an error"):
+        finalize_recording_session(session)
+    assert metadata_path.read_bytes() == before
+
+
 def test_recording_finalize_repairs_interrupted_frame_count(tmp_path: Path) -> None:
     recordings = tmp_path / "recordings"
     replays = tmp_path / "replays"
@@ -1460,3 +1827,34 @@ def test_live_log_diagnostics_groups_repeated_runtime_failures(
     }
     assert report["manual_scans"]["success_rate"] == 1.0
     assert report["warning_categories"]["remaining_count_unavailable"] == 2
+
+
+def test_aggregate_zero_event_matches_is_zero_not_missing(tmp_path: Path) -> None:
+    recordings, replays = tmp_path / "recordings", tmp_path / "replays"
+    _write_acceptance_session(
+        recordings, replays, "zero-match-001", color=(10, 20, 30), predicted_cards=["4"],
+    )
+    report = audit_phase6_acceptance(
+        recordings, replays, card_holdout_report=None, require_card_holdout=False,
+        thresholds=Phase6AcceptanceThresholds(min_sessions=1),
+    )
+    assert report["metrics"]["event_f1"] == 0.0
+    assert report["checks"]["all_evaluation_inputs_verified"] is True
+    assert report["passed"] is False
+
+
+def test_current_acceptance_rejects_legacy_result_semantics(tmp_path: Path) -> None:
+    recordings, replays = tmp_path / "recordings", tmp_path / "replays"
+    _write_acceptance_session(recordings, replays, "legacy-result-001", color=(10, 20, 30))
+    path = replays / "legacy-result-001" / "evaluation.json"
+    evaluation = json.loads(path.read_text())
+    evaluation.pop("report_sha256")
+    evaluation["schema_version"] = "phase6-live-replay-evaluation-v2"
+    evaluation["report_sha256"] = sha256_json_payload(evaluation)
+    path.write_text(json.dumps(evaluation))
+    report = audit_phase6_acceptance(
+        recordings, replays, card_holdout_report=None, require_card_holdout=False,
+        thresholds=Phase6AcceptanceThresholds(min_sessions=1),
+    )
+    assert "unsupported evaluation schema" in report["sessions"][0]["evidence_issues"]
+    assert report["passed"] is False

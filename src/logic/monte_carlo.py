@@ -75,6 +75,8 @@ class ActionEvaluation:
     win_rate_standard_error: float | None = None
     win_rate_ci95_low: float | None = None
     win_rate_ci95_high: float | None = None
+    win_rate_interval_method: str | None = None
+    win_rate_estimate_kind: str | None = None
 
     def to_log_payload(self) -> dict[str, object]:
         return {
@@ -83,6 +85,8 @@ class ActionEvaluation:
             "strategy_score": self.strategy_score,
             "estimated_win_rate": self.estimated_win_rate,
             "win_rate_standard_error": self.win_rate_standard_error,
+            "win_rate_interval_method": self.win_rate_interval_method,
+            "win_rate_estimate_kind": self.win_rate_estimate_kind,
             "win_rate_ci95": (
                 [self.win_rate_ci95_low, self.win_rate_ci95_high]
                 if self.win_rate_ci95_low is not None
@@ -112,7 +116,7 @@ class Phase4DecisionResult:
     reason: str
     warnings: tuple[str, ...]
     opponent_estimate: OpponentEstimate | None
-    model_version: str = "phase4-monte-carlo-v2"
+    model_version: str = "phase4-monte-carlo-v3"
     ruleset_version: str = RULESET_VERSION
 
     @property
@@ -306,6 +310,8 @@ class MonteCarloEvaluator:
         top = ordered[: min(settings.top_k, len(ordered))]
         if len(top) >= 2 and _confidence_intervals_overlap(top[0], top[1]):
             warnings.append("top_action_confidence_intervals_overlap")
+        if any(value.terminal_rate < 1.0 for value in top):
+            warnings.append("heuristic_score_not_win_probability")
         best = top[0]
         reason = _recommendation_reason(best, completed)
         estimate = self.opponent_model.summarize(state, tuple(completed_worlds))
@@ -508,6 +514,13 @@ def _aggregate_action(
 ) -> ActionEvaluation:
     if not outcomes:
         raise ValueError("cannot aggregate zero rollout outcomes")
+    if any(
+        not math.isfinite(value.expected_result)
+        or not 0.0 <= value.expected_result <= 1.0
+        or value.terminal_result not in (None, 0.0, 1.0)
+        for value in outcomes
+    ):
+        raise ValueError("rollout outcomes must be bounded scores and binary terminal results")
     simulations = len(outcomes)
     estimated_win_rate = sum(value.expected_result for value in outcomes) / simulations
     if simulations >= 2:
@@ -516,13 +529,8 @@ def _aggregate_action(
             for value in outcomes
         ) / (simulations - 1)
         standard_error = math.sqrt(variance / simulations)
-        confidence_margin = 1.96 * standard_error
-        ci95_low = max(0.0, estimated_win_rate - confidence_margin)
-        ci95_high = min(1.0, estimated_win_rate + confidence_margin)
     else:
         standard_error = None
-        ci95_low = None
-        ci95_high = None
     terminal_values = [
         value.terminal_result
         for value in outcomes
@@ -532,6 +540,35 @@ def _aggregate_action(
     terminal_win_rate = (
         sum(terminal_values) / len(terminal_values) if terminal_values else None
     )
+    exact_finish = (
+        bool(state.self_hand)
+        and not action.is_pass
+        and Counter(action.cards) == Counter(state.self_hand.cards)
+        and can_beat(action, Play.parse(state.trick_target.cards))
+    )
+    all_binary = all(
+        value.terminal_result in (0.0, 1.0)
+        and value.expected_result == value.terminal_result
+        for value in outcomes
+    )
+    if exact_finish:
+        # This is a rule proof, not certainty inferred from repeated wins.
+        estimated_win_rate = 1.0
+        standard_error = 0.0
+        ci95_low = ci95_high = 1.0
+        interval_method = "rule_proven_finish"
+        estimate_kind = "rule_proven_finish"
+    else:
+        timed_stop = any(risk.startswith("time_budget_") for risk in global_risks)
+        if all_binary and not timed_stop:
+            ci95_low, ci95_high = _wilson_interval(estimated_win_rate, simulations)
+            interval_method = "wilson"
+        else:
+            ci95_low, ci95_high = _bounded_mean_interval(estimated_win_rate, simulations)
+            interval_method = "hoeffding_anytime"
+        estimate_kind = (
+            "terminal_rollout_win_rate" if all_binary else "bounded_rollout_score"
+        )
     average_plies = sum(value.plies for value in outcomes) / simulations
     average_margin = sum(value.margin for value in outcomes) / simulations
 
@@ -546,9 +583,11 @@ def _aggregate_action(
         residual_actions = legal_actions(residual_hand, Play.parse(()))
         longest = max((len(candidate.cards) for candidate in residual_actions), default=0)
         structure_score = longest / len(residual_hand)
-    preserves_control = 0.0 if action.type in {PlayType.BOMB, PlayType.ROCKET} else 1.0
-    if not residual_hand:
-        preserves_control = 1.0
+    preserves_control, commits_control = _control_status(
+        state.self_hand,
+        residual_hand,
+    )
+    control_score = 1.0 if preserves_control else 0.0
     strategy_score = max(
         0.0,
         min(
@@ -556,12 +595,12 @@ def _aggregate_action(
             0.80 * estimated_win_rate
             + 0.10 * shed_score
             + 0.05 * structure_score
-            + 0.05 * preserves_control,
+            + 0.05 * control_score,
         ),
     )
 
     reasons: list[str] = []
-    if not residual_hand:
+    if exact_finish:
         reasons.append("exact_finish")
     if len(action.cards) >= max(1, len(state.self_hand) // 2):
         reasons.append("sheds_many_cards")
@@ -573,7 +612,8 @@ def _aggregate_action(
     }]
     if terminal_rate < 1.0:
         risks.append("depth_limit_reached")
-    if action.type in {PlayType.BOMB, PlayType.ROCKET} and residual_hand:
+        risks.append("heuristic_score_not_win_probability")
+    if commits_control and residual_hand:
         risks.append("bomb_commitment")
 
     return ActionEvaluation(
@@ -592,9 +632,42 @@ def _aggregate_action(
         win_rate_standard_error=(
             round(standard_error, 6) if standard_error is not None else None
         ),
-        win_rate_ci95_low=round(ci95_low, 6) if ci95_low is not None else None,
-        win_rate_ci95_high=round(ci95_high, 6) if ci95_high is not None else None,
+        # Round outward so serialization never makes a conservative bound tighter.
+        win_rate_ci95_low=math.floor(ci95_low * 1_000_000) / 1_000_000,
+        win_rate_ci95_high=math.ceil(ci95_high * 1_000_000) / 1_000_000,
+        win_rate_interval_method=interval_method,
+        win_rate_estimate_kind=estimate_kind,
     )
+
+
+def _wilson_interval(mean: float, count: int) -> tuple[float, float]:
+    """Approximate 95% binomial interval, including one-sample/extreme outcomes.
+
+    The scope is the fixed rollout policy and uniform deal model, not calibrated
+    real-opponent performance. Unlike a Wald interval this cannot collapse just
+    because a finite batch happened to contain only wins or only losses.
+    """
+
+    z_squared = 1.959963984540054**2
+    denominator = 1.0 + z_squared / count
+    center = (mean + z_squared / (2 * count)) / denominator
+    margin = math.sqrt(
+        z_squared * (mean * (1 - mean) / count + z_squared / (4 * count**2))
+    ) / denominator
+    return max(0.0, center - margin), min(1.0, center + margin)
+
+
+def _bounded_mean_interval(mean: float, count: int) -> tuple[float, float]:
+    """Conservative 95% interval for the mean of independent [0, 1] scores.
+
+    Hoeffding with delta_n = .05 / (n * (n + 1)) and a union bound over all n
+    remains valid when the loop stops at a wall-time budget. This bounds the
+    rollout-score expectation only: truncated heuristic scores are not observed
+    game wins, and neither this interval nor Wilson covers model bias.
+    """
+
+    margin = math.sqrt(math.log(40 * count * (count + 1)) / (2 * count))
+    return max(0.0, mean - margin), min(1.0, mean + margin)
 
 
 def _confidence_intervals_overlap(
@@ -677,8 +750,39 @@ def _candidate_prescore(state: ObservableGameState, action: Play) -> float:
         residual_actions = legal_actions(residual_hand, Play.parse(()))
         longest = max((len(play.cards) for play in residual_actions), default=0)
         structure_score = longest / len(residual_hand)
-    control_score = 0.0 if action.type in {PlayType.BOMB, PlayType.ROCKET} else 1.0
+    preserves_control, _ = _control_status(state.self_hand, residual_hand)
+    control_score = 1.0 if preserves_control else 0.0
     return 0.60 * shed_score + 0.30 * structure_score + 0.10 * control_score
+
+
+def _control_status(
+    hand: CardSet,
+    residual_hand: CardSet,
+) -> tuple[bool, bool]:
+    """Report whether an action preserves or consumes existing control assets.
+
+    An action can consume a four-of-a-kind without being classified as a bomb
+    (for example, four-with-two), or break a bomb/rocket by using only part of
+    it. Comparing the actual assets before and after the action covers those
+    cases instead of relying on the action's play type.
+    """
+
+    before = _control_assets(hand.cards)
+    after = _control_assets(residual_hand.cards)
+    consumed = bool(before - after)
+    return bool(before) and not consumed, consumed
+
+
+def _control_assets(cards: Sequence[str]) -> frozenset[str]:
+    counts = Counter(cards)
+    assets = {
+        f"bomb:{rank}"
+        for rank, count in counts.items()
+        if count == 4
+    }
+    if counts["SJ"] and counts["BJ"]:
+        assets.add("rocket")
+    return frozenset(assets)
 
 
 def _same_team(
@@ -715,8 +819,13 @@ def _recommendation_reason(evaluation: ActionEvaluation, simulations: int) -> st
     if evaluation.estimated_win_rate is None:
         raise ValueError("simulated recommendation must include an estimated win rate")
     action_text = str(evaluation.action)
+    estimate_label = (
+        "含截断启发式的己方模拟评分"
+        if evaluation.win_rate_estimate_kind == "bounded_rollout_score"
+        else "模型内估计己方胜率"
+    )
     reason = (
-        f"在每个候选共用的 {simulations} 组对手牌样本中，{action_text} 的估计己方胜率为 "
+        f"在每个候选共用的 {simulations} 组对手牌样本中，{action_text} 的{estimate_label}为 "
         f"{evaluation.estimated_win_rate:.1%}，策略分为 {evaluation.strategy_score:.3f}。"
     )
     if "exact_finish" in evaluation.reason_factors:

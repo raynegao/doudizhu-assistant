@@ -6,9 +6,13 @@ from dataclasses import replace
 import pytest
 
 from src.logic.monte_carlo import (
+    ActionEvaluation,
     HeuristicRolloutPolicy,
     MonteCarloEvaluator,
     MonteCarloSettings,
+    RolloutOutcome,
+    _aggregate_action,
+    _candidate_prescore,
     _simulate_candidate,
     recommend_phase4,
 )
@@ -42,7 +46,9 @@ def test_phase4_top_k_is_legal_unique_and_deterministic(
 
     assert first.action in legal
     assert [item.action for item in first.rankings] == [item.action for item in second.rankings]
-    assert [item.strategy_score for item in first.rankings] == [item.strategy_score for item in second.rankings]
+    assert [item.strategy_score for item in first.rankings] == [
+        item.strategy_score for item in second.rankings
+    ]
     assert len({item.action for item in first.rankings}) == len(first.rankings)
     assert all(item.action in legal for item in first.rankings)
     assert all(0.0 <= item.strategy_score <= 1.0 for item in first.rankings)
@@ -65,6 +71,9 @@ def test_phase4_exact_finish_is_preferred() -> None:
     assert str(result.action) == "3"
     assert result.rankings[0].estimated_win_rate == 1.0
     assert "exact_finish" in result.rankings[0].reason_factors
+    assert result.rankings[0].win_rate_ci95_low == 1.0
+    assert result.rankings[0].win_rate_ci95_high == 1.0
+    assert result.rankings[0].win_rate_interval_method == "rule_proven_finish"
 
 
 def test_phase4_incomplete_state_falls_back_without_fake_win_rate() -> None:
@@ -112,10 +121,12 @@ def test_rollout_counts_farmer_teammate_finish_as_team_win() -> None:
         last_play="2",
         last_player="left",
     )
-    deal = OpponentDeal((
-        (PlayerSeat.RIGHT, CardSet.parse("4")),
-        (PlayerSeat.LEFT, CardSet.parse("SJ")),
-    ))
+    deal = OpponentDeal(
+        (
+            (PlayerSeat.RIGHT, CardSet.parse("4")),
+            (PlayerSeat.LEFT, CardSet.parse("SJ")),
+        )
+    )
 
     outcome = _simulate_candidate(
         state,
@@ -134,10 +145,12 @@ def test_depth_limited_estimate_is_normalized_across_roles() -> None:
     pool = list(FULL_DECK)
     for card in known:
         pool.remove(card)
-    deal = OpponentDeal((
-        (PlayerSeat.RIGHT, CardSet.parse("5")),
-        (PlayerSeat.LEFT, CardSet.parse("6")),
-    ))
+    deal = OpponentDeal(
+        (
+            (PlayerSeat.RIGHT, CardSet.parse("5")),
+            (PlayerSeat.LEFT, CardSet.parse("6")),
+        )
+    )
     outcomes = []
     for landlord in (PlayerSeat.SELF, PlayerSeat.RIGHT):
         state = ObservableGameState.from_inputs(
@@ -146,13 +159,15 @@ def test_depth_limited_estimate_is_normalized_across_roles() -> None:
             remaining_cards={"self": 2, "right": 1, "left": 1},
             played_cards=pool,
         )
-        outcomes.append(_simulate_candidate(
-            state,
-            deal,
-            Play.parse("3"),
-            max_depth=1,
-            policy=HeuristicRolloutPolicy(),
-        ))
+        outcomes.append(
+            _simulate_candidate(
+                state,
+                deal,
+                Play.parse("3"),
+                max_depth=1,
+                policy=HeuristicRolloutPolicy(),
+            )
+        )
 
     assert outcomes[0].terminal_result is None
     assert outcomes[0].expected_result == pytest.approx(0.75)
@@ -237,3 +252,204 @@ def test_rollout_rejects_illegal_policy_action(
             max_depth=3,
             policy=IllegalPolicy(),
         )
+
+
+def _aggregate_for_control_test(hand: str, action: str) -> ActionEvaluation:
+    state = ObservableGameState.from_inputs(hand, landlord="self")
+    return _aggregate_action(
+        state,
+        Play.parse(action),
+        (RolloutOutcome(0.5, None, 1, 0.0),),
+        global_risks=(),
+    )
+
+
+@pytest.mark.parametrize("count", (1, 2, 8))
+@pytest.mark.parametrize("result", (0.0, 1.0))
+def test_finite_identical_terminal_samples_do_not_imply_certainty(
+    count: int, result: float,
+) -> None:
+    state = ObservableGameState.from_inputs("3 4", landlord="self")
+    evaluation = _aggregate_action(
+        state,
+        Play.parse("3"),
+        (RolloutOutcome(result, result, 2, 0.0),) * count,
+        global_risks=(),
+    )
+
+    assert evaluation.estimated_win_rate == result
+    assert evaluation.win_rate_interval_method == "wilson"
+    assert evaluation.win_rate_estimate_kind == "terminal_rollout_win_rate"
+    assert evaluation.win_rate_ci95_low is not None
+    assert evaluation.win_rate_ci95_high is not None
+    assert evaluation.win_rate_ci95_low < evaluation.win_rate_ci95_high
+    if result == 1.0:
+        assert 0.0 < evaluation.win_rate_ci95_low < 1.0
+        assert evaluation.win_rate_ci95_high == 1.0
+    else:
+        assert evaluation.win_rate_ci95_low == 0.0
+        assert 0.0 < evaluation.win_rate_ci95_high < 1.0
+
+
+def test_mixed_binary_samples_use_known_wilson_interval() -> None:
+    evaluation = _aggregate_action(
+        ObservableGameState.from_inputs("3 4", landlord="self"),
+        Play.parse("3"),
+        (RolloutOutcome(0.0, 0.0, 2, 0.0), RolloutOutcome(1.0, 1.0, 2, 0.0)),
+        global_risks=(),
+    )
+
+    assert evaluation.estimated_win_rate == 0.5
+    assert evaluation.win_rate_ci95_low == pytest.approx(0.094531, abs=1e-6)
+    assert evaluation.win_rate_ci95_high == pytest.approx(0.905469, abs=1e-6)
+
+
+@pytest.mark.parametrize(
+    "outcomes",
+    (
+        (RolloutOutcome(0.5, None, 1, 0.0),),
+        (RolloutOutcome(1.0, 1.0, 2, 0.0), RolloutOutcome(0.8, None, 1, 0.0)),
+        (RolloutOutcome(1.0, None, 1, 0.0),) * 8,
+        (RolloutOutcome(0.0, None, 1, 0.0),) * 8,
+    ),
+)
+def test_truncated_scores_use_non_degenerate_bounded_mean_interval(
+    outcomes: tuple[RolloutOutcome, ...],
+) -> None:
+    evaluation = _aggregate_action(
+        ObservableGameState.from_inputs("3 4", landlord="self"),
+        Play.parse("3"),
+        outcomes,
+        global_risks=(),
+    )
+
+    assert evaluation.estimated_win_rate == pytest.approx(
+        sum(value.expected_result for value in outcomes) / len(outcomes)
+    )
+    assert evaluation.win_rate_interval_method == "hoeffding_anytime"
+    assert evaluation.win_rate_estimate_kind == "bounded_rollout_score"
+    assert "heuristic_score_not_win_probability" in evaluation.risk_flags
+    assert evaluation.win_rate_ci95_low is not None
+    assert evaluation.win_rate_ci95_high is not None
+    assert evaluation.win_rate_ci95_low < evaluation.win_rate_ci95_high
+    payload = evaluation.to_log_payload()
+    assert payload["win_rate_estimate_kind"] == "bounded_rollout_score"
+
+
+def test_budget_stopping_uses_anytime_bound_even_for_terminal_outcomes() -> None:
+    evaluation = _aggregate_action(
+        ObservableGameState.from_inputs("3 4", landlord="self"),
+        Play.parse("3"),
+        (RolloutOutcome(1.0, 1.0, 2, 0.0),) * 8,
+        global_risks=("time_budget_exhausted: completed 8 of 200 sampled worlds",),
+    )
+
+    assert evaluation.win_rate_interval_method == "hoeffding_anytime"
+    assert evaluation.win_rate_ci95_low is not None
+    assert 0.0 < evaluation.win_rate_ci95_low < 1.0
+
+
+def test_only_a_legal_full_hand_finish_can_have_rule_proven_interval() -> None:
+    state = ObservableGameState.from_inputs(
+        "3", landlord="self", last_play="4", last_player="left",
+    )
+    evaluation = _aggregate_action(
+        state, Play.parse("3"), (RolloutOutcome(1.0, 1.0, 1, 0.0),), global_risks=(),
+    )
+
+    assert "exact_finish" not in evaluation.reason_factors
+    assert evaluation.win_rate_interval_method == "wilson"
+    assert evaluation.win_rate_ci95_low != 1.0
+
+
+def test_depth_limited_decision_exposes_score_warning(
+    phase4_ready_state: ObservableGameState,
+) -> None:
+    result = recommend_phase4(phase4_ready_state, _settings(max_depth=1))
+
+    assert "heuristic_score_not_win_probability" in result.warnings
+    assert "模拟评分" in result.reason
+    assert all(
+        item.win_rate_estimate_kind == "bounded_rollout_score" for item in result.rankings
+    )
+
+
+@pytest.mark.parametrize(
+    ("hand", "action"),
+    (
+        ("3 9 10 10 10 10 K", "3 9 10 10 10 10"),
+        ("3 4 7 7 7 7", "7"),
+        ("3 4 7 7 7 7", "7 7"),
+        ("3 4 7 7 7 7", "7 7 7"),
+        ("3 3 3 4 4 4 5 SJ BJ", "3 3 3 4 4 4 SJ BJ"),
+    ),
+    ids=(
+        "four-with-two-consumes-bomb",
+        "single-splits-bomb",
+        "pair-splits-bomb",
+        "triple-splits-bomb",
+        "jokers-used-as-plane-wings",
+    ),
+)
+def test_phase4_marks_control_commitment_from_residual_hand(
+    hand: str,
+    action: str,
+) -> None:
+    evaluation = _aggregate_for_control_test(hand, action)
+
+    assert "preserves_bomb_or_rocket" not in evaluation.reason_factors
+    assert "bomb_commitment" in evaluation.risk_flags
+
+
+@pytest.mark.parametrize(
+    ("hand", "action"),
+    (
+        ("3 4 7 7 7 7", "3"),
+        ("3 4 SJ BJ", "3"),
+    ),
+    ids=("preserves-bomb", "preserves-rocket"),
+)
+def test_phase4_marks_control_preserved_only_when_asset_remains(
+    hand: str,
+    action: str,
+) -> None:
+    evaluation = _aggregate_for_control_test(hand, action)
+
+    assert "preserves_bomb_or_rocket" in evaluation.reason_factors
+    assert "bomb_commitment" not in evaluation.risk_flags
+
+
+def test_phase4_does_not_claim_control_preservation_without_control_asset() -> None:
+    evaluation = _aggregate_for_control_test("3 4 5", "3")
+
+    assert evaluation.strategy_score == pytest.approx(0.458333)
+    assert "preserves_bomb_or_rocket" not in evaluation.reason_factors
+    assert "bomb_commitment" not in evaluation.risk_flags
+
+
+def test_phase4_four_with_two_does_not_receive_control_bonus() -> None:
+    evaluation = _aggregate_for_control_test(
+        "3 9 10 10 10 10 K",
+        "3 9 10 10 10 10",
+    )
+
+    assert evaluation.strategy_score == pytest.approx(0.535714)
+
+
+@pytest.mark.parametrize(
+    ("hand", "action", "expected"),
+    (
+        ("3 9 10 10 10 10 K", "3 9 10 10 10 10", 0.814286),
+        ("3 4 7 7 7 7", "3", 0.44),
+        ("3 4 5", "3", 0.35),
+    ),
+    ids=("consumes-control", "preserves-control", "no-control-to-preserve"),
+)
+def test_phase4_candidate_prescore_uses_residual_control_assets(
+    hand: str,
+    action: str,
+    expected: float,
+) -> None:
+    state = ObservableGameState.from_inputs(hand, landlord="self")
+
+    assert _candidate_prescore(state, Play.parse(action)) == pytest.approx(expected)

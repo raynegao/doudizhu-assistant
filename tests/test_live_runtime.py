@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+import queue
 import time
 from dataclasses import replace
 from pathlib import Path
@@ -24,12 +25,24 @@ from src.pipeline.live_runtime import (
     _round_state_path,
     _write_round_checkpoint,
 )
+from src.reporting.live_evidence import EvidenceSessionStatus, LiveEvidenceStore
 from src.state.cards import CardSet
 from src.state.events import ObservedAction, PlayerSeat, RoundPhase
 from src.state.observable_state import ObservableGameState
-from src.tracking.visual_events import VisualTrackerMode, VisualTrackerUpdate
-from src.ui.live_overlay import LiveOverlayViewModel, _advance_frame_cursor
+from src.tracking.visual_events import (
+    VisualEventTracker,
+    VisualTrackerMode,
+    VisualTrackerUpdate,
+)
+from src.ui.live_overlay import (
+    LiveAssistantOverlay,
+    LiveOverlayViewModel,
+    _advance_frame_cursor,
+    _format_state_warnings,
+)
 from src.vision.scene_recognizer import (
+    RoundResultObservation,
+    RoundResultOutcome,
     SceneObservation,
     SeatObservation,
     SeatRole,
@@ -37,12 +50,179 @@ from src.vision.scene_recognizer import (
     VisualSignal,
 )
 
+
+def test_overlay_condenses_midgame_approximation_warnings() -> None:
+    text, color = _format_state_warnings(
+        (
+            "automatic_current_game_scan",
+            "historical_played_cards_unknown=31",
+            "estimated_win_rate_uses_uniform_unknown_history",
+        )
+    )
+
+    assert text == "中途扫描：31 张历史牌未知，胜率为近似估计"
+    assert color == "#fdb022"
+
+
+def test_overlay_keeps_blocking_warning_red() -> None:
+    text, color = _format_state_warnings(
+        (
+            "automatic_current_game_scan",
+            "historical_played_cards_unknown=31",
+            "state rejected visual event",
+        )
+    )
+
+    assert "中途扫描：31 张历史牌未知，胜率为近似估计" in text
+    assert "state rejected visual event" in text
+    assert color == "#f97066"
+
+
+def test_overlay_reenables_recovery_scan_when_worker_fails_before_first_frame() -> None:
+    class Button:
+        values: dict[str, object]
+
+        def __init__(self) -> None:
+            self.values = {}
+
+        def configure(self, **kwargs: object) -> None:
+            self.values.update(kwargs)
+
+    class Root:
+        scheduled = False
+
+        def after(self, _delay: int, _callback: object) -> None:
+            self.scheduled = True
+
+    overlay = object.__new__(LiveAssistantOverlay)
+    overlay._closed = False
+    overlay._scanning = True
+    overlay._runtime_error = None
+    overlay._scan_after_frame_id = 0
+    overlay.health_check = lambda: "worker failed before first frame"
+    overlay.runtime_errors = None
+    overlay.snapshots = queue.Queue()
+    overlay.scan_button = Button()
+    overlay.on_scan = lambda: None
+    overlay.root = Root()
+    presented: list[LiveOverlayViewModel] = []
+    overlay.present = presented.append  # type: ignore[method-assign]
+
+    overlay._poll()
+
+    assert overlay._scan_after_frame_id is None
+    assert overlay.scan_button.values == {
+        "text": "重新扫描当前牌局",
+        "state": "normal",
+    }
+    assert presented[0].status == "识别线程异常停止"
+    assert overlay.root.scheduled is True
+
+
+def test_overlay_stays_open_when_capture_shutdown_cannot_be_confirmed() -> None:
+    class Variable:
+        value = ""
+
+        def set(self, value: str) -> None:
+            self.value = value
+
+    class WarningLabel:
+        color = ""
+
+        def configure(self, *, foreground: str) -> None:
+            self.color = foreground
+
+    class Root:
+        destroyed = False
+
+        def destroy(self) -> None:
+            self.destroyed = True
+
+    def fail_to_stop() -> None:
+        raise RuntimeError("worker still alive")
+
+    overlay = object.__new__(LiveAssistantOverlay)
+    overlay._closed = False
+    overlay.on_close = fail_to_stop
+    overlay.status = Variable()
+    overlay.warnings = Variable()
+    overlay.warning_label = WarningLabel()
+    overlay.root = Root()
+
+    overlay.close()
+
+    assert overlay._closed is False
+    assert overlay.root.destroyed is False
+    assert overlay.status.value == "无法确认扫描已经停止"
+    assert overlay.warnings.value == "worker still alive"
+    assert overlay.warning_label.color == "#f97066"
+
+
+def test_overlay_never_claims_no_capture_when_start_rollback_is_unconfirmed() -> None:
+    class Variable:
+        value = ""
+
+        def set(self, value: str) -> None:
+            self.value = value
+
+    class Button:
+        values: dict[str, object]
+
+        def __init__(self) -> None:
+            self.values = {}
+
+        def configure(self, **kwargs: object) -> None:
+            self.values.update(kwargs)
+
+    class UnconfirmedStartError(RuntimeError):
+        scan_state_unconfirmed = True
+
+    def fail_start() -> None:
+        raise UnconfirmedStartError("worker may still be alive")
+
+    overlay = object.__new__(LiveAssistantOverlay)
+    overlay._scanning = False
+    overlay._runtime_error = None
+    overlay._last_frame_id = 8
+    overlay._scan_after_frame_id = None
+    overlay.on_start = fail_start
+    overlay.status = Variable()
+    overlay.best = Variable()
+    overlay.warnings = Variable()
+    overlay.scan_toggle_button = Button()
+    overlay.scan_button = Button()
+
+    overlay._start_scanning()
+
+    assert overlay._scanning is True
+    assert "尚未确认" in overlay.status.value
+    assert "未获取屏幕" not in overlay.status.value
+    assert overlay.scan_toggle_button.values["text"] == "结束扫描"
+    assert overlay.scan_toggle_button.values["state"] == "normal"
+    assert overlay.scan_button.values["state"] == "disabled"
+
+
 POST_BIDDING_HAND = (
-    "3", "3", "3", "3",
-    "4", "4", "4", "4",
-    "5", "5", "5", "5",
-    "6", "6", "6", "6",
-    "7", "7", "7", "7",
+    "3",
+    "3",
+    "3",
+    "3",
+    "4",
+    "4",
+    "4",
+    "4",
+    "5",
+    "5",
+    "5",
+    "5",
+    "6",
+    "6",
+    "6",
+    "6",
+    "7",
+    "7",
+    "7",
+    "7",
 )
 
 
@@ -133,6 +313,17 @@ class _HandRecognizer(_Recognizer):
         )
 
 
+class _DefeatOverlayRecognizer(_Recognizer):
+    def observe(self, frame: CapturedWindow) -> SceneObservation:
+        return replace(
+            super().observe(frame),
+            round_result=RoundResultObservation(
+                outcome=RoundResultOutcome.DEFEAT,
+                confidence=0.995,
+            ),
+        )
+
+
 class _PostBiddingRecognizer:
     def observe(self, frame: CapturedWindow) -> SceneObservation:
         cards = tuple(
@@ -148,11 +339,7 @@ class _PostBiddingRecognizer:
                 seat=seat,
                 signal=VisualSignal.NEUTRAL,
                 remaining_count=20 if seat is PlayerSeat.SELF else 17,
-                role=(
-                    SeatRole.LANDLORD
-                    if seat is PlayerSeat.SELF
-                    else SeatRole.FARMER
-                ),
+                role=(SeatRole.LANDLORD if seat is PlayerSeat.SELF else SeatRole.FARMER),
                 confidence=0.99,
                 remaining_confidence=0.99,
                 role_confidence=0.99,
@@ -300,6 +487,190 @@ def test_live_runtime_closes_capture_source(
     assert source.closed is True
 
 
+def test_live_runtime_stops_capture_before_waiting_for_decision_worker(
+    tmp_path: Path,
+    phase4_ready_state,
+) -> None:
+    calls: list[str] = []
+
+    class ClosableFrameSource(_FrameSource):
+        def close(self) -> None:
+            calls.append("capture")
+
+    class Executor:
+        def close(self) -> None:
+            calls.append("decision")
+
+    runtime = LiveGameRuntime(
+        LiveLayoutConfig(
+            log_file=tmp_path / "live.jsonl",
+            error_frames_dir=tmp_path / "errors",
+        ),
+        frame_source=ClosableFrameSource(),
+        recognizer=_Recognizer(),
+        tracker=_Tracker(phase4_ready_state),
+        decision_executor=Executor(),  # type: ignore[arg-type]
+    )
+
+    runtime.close()
+
+    assert calls == ["capture", "decision"]
+
+
+def test_live_runtime_writes_bounded_managed_evidence_for_authorized_scan(
+    tmp_path: Path,
+    phase4_ready_state,
+) -> None:
+    evidence_root = tmp_path / "evidence"
+    config = LiveLayoutConfig(
+        log_file=tmp_path / "live.jsonl",
+        error_frames_dir=tmp_path / "legacy-errors",
+        evidence_dir=evidence_root,
+        fixed_issue_registry=tmp_path / "missing-fixed-issues.json",
+        evidence_max_frames_per_session=2,
+        error_frame_cooldown_seconds=0,
+    )
+    runtime = LiveGameRuntime(
+        config,
+        frame_source=_FrameSource(),
+        recognizer=_Recognizer(),
+        tracker=_Tracker(phase4_ready_state),
+        resume_session_id="authorized-ui-session",
+        diagnostic_evidence=True,
+    )
+    uncertain_state = replace(phase4_ready_state, phase=RoundPhase.UNCERTAIN)
+    session_id = runtime._evidence_session_id  # noqa: SLF001
+    assert session_id is not None
+    try:
+        runtime.run_once()
+        runtime._handle_uncertain_frame(  # noqa: SLF001
+            _FrameSource().capture(2),
+            VisualTrackerUpdate(
+                mode=VisualTrackerMode.UNCERTAIN,
+                message="right remaining count mismatch",
+                state=uncertain_state,
+                warnings=("right remaining count mismatch: screen=4, expected=5",),
+            ),
+        )
+        runtime._handle_uncertain_frame(  # noqa: SLF001
+            _FrameSource().capture(3),
+            VisualTrackerUpdate(
+                mode=VisualTrackerMode.UNCERTAIN,
+                message="left role unavailable",
+                state=uncertain_state,
+                warnings=("left role unavailable",),
+            ),
+        )
+        runtime.record_runtime_failure(RuntimeError("synthetic worker crash"))
+    finally:
+        runtime.close()
+
+    store = LiveEvidenceStore(evidence_root)
+    metadata = store.load_session(session_id)
+    pointer = json.loads((evidence_root / "latest-session.json").read_text(encoding="utf-8"))
+    events_path = store.session_path(session_id) / "events.jsonl"
+    events = [json.loads(line) for line in events_path.read_text(encoding="utf-8").splitlines()]
+
+    assert metadata.status is EvidenceSessionStatus.CLOSED
+    assert any(
+        issue.summary.startswith("right remaining count mismatch")
+        for issue in metadata.rounds[0].issues
+    )
+    assert any(issue.summary == "left role unavailable" for issue in metadata.rounds[0].issues)
+    assert pointer["session_id"] == session_id
+    assert pointer["status"] == "closed"
+    assert {row["event"] for row in events} >= {
+        "scan_session_started",
+        "diagnostic_frame_saved",
+        "diagnostic_frame_evicted",
+        "error_frame_saved",
+        "live_runtime_crash",
+        "scan_session_stopped",
+    }
+    assert len(tuple((store.session_path(session_id) / "frames").glob("*.png"))) == 2
+    assert len([row for row in events if row["event"] == "error_frame_saved"]) == 2
+    assert not config.error_frames_dir.exists()
+
+
+def test_live_runtime_can_disable_all_diagnostic_frame_persistence(
+    tmp_path: Path,
+    phase4_ready_state,
+) -> None:
+    config = LiveLayoutConfig(
+        log_file=tmp_path / "live.jsonl",
+        error_frames_dir=tmp_path / "legacy-errors",
+        evidence_dir=tmp_path / "evidence",
+        evidence_enabled=False,
+    )
+    runtime = LiveGameRuntime(
+        config,
+        frame_source=_FrameSource(),
+        recognizer=_Recognizer(),
+        tracker=_Tracker(phase4_ready_state),
+        resume_session_id="authorized-ui-session",
+        diagnostic_evidence=False,
+    )
+    try:
+        runtime._handle_uncertain_frame(  # noqa: SLF001
+            _FrameSource().capture(1),
+            VisualTrackerUpdate(
+                mode=VisualTrackerMode.UNCERTAIN,
+                message="diagnostic failure",
+                state=replace(phase4_ready_state, phase=RoundPhase.UNCERTAIN),
+                warnings=("diagnostic failure",),
+            ),
+        )
+    finally:
+        runtime.close()
+
+    assert not config.evidence_dir.exists()
+    assert not config.error_frames_dir.exists()
+    rows = [json.loads(line) for line in config.log_file.read_text(encoding="utf-8").splitlines()]
+    assert rows[-1]["event"] == "diagnostic_issue_recorded"
+    assert rows[-1]["frame_omitted"] == "evidence_persistence_disabled"
+
+
+def test_live_runtime_does_not_fallback_to_unbounded_legacy_frames_when_managed_evidence_fails(
+    tmp_path: Path,
+    phase4_ready_state,
+) -> None:
+    evidence_root = tmp_path / "evidence"
+    evidence_root.write_text("not a directory", encoding="utf-8")
+    config = LiveLayoutConfig(
+        log_file=tmp_path / "live.jsonl",
+        error_frames_dir=tmp_path / "legacy-errors",
+        evidence_dir=evidence_root,
+        fixed_issue_registry=tmp_path / "missing-fixed-issues.json",
+        error_frame_cooldown_seconds=0,
+    )
+    runtime = LiveGameRuntime(
+        config,
+        frame_source=_FrameSource(),
+        recognizer=_Recognizer(),
+        tracker=_Tracker(phase4_ready_state),
+        resume_session_id="authorized-ui-session",
+        diagnostic_evidence=True,
+    )
+    try:
+        runtime._handle_uncertain_frame(  # noqa: SLF001
+            _FrameSource().capture(1),
+            VisualTrackerUpdate(
+                mode=VisualTrackerMode.UNCERTAIN,
+                message="diagnostic failure",
+                state=replace(phase4_ready_state, phase=RoundPhase.UNCERTAIN),
+                warnings=("diagnostic failure",),
+            ),
+        )
+    finally:
+        runtime.close()
+
+    assert not config.error_frames_dir.exists()
+    rows = [json.loads(line) for line in config.log_file.read_text(encoding="utf-8").splitlines()]
+    issue = next(row for row in rows if row["event"] == "diagnostic_issue_recorded")
+    assert issue["path"] is None
+    assert issue["frame_omitted"] == "managed_evidence_unavailable"
+
+
 def test_live_runtime_schedules_and_logs_revision_scoped_decision(
     tmp_path: Path,
     phase4_ready_state,
@@ -307,6 +678,7 @@ def test_live_runtime_schedules_and_logs_revision_scoped_decision(
     config = LiveLayoutConfig(
         log_file=tmp_path / "live.jsonl",
         error_frames_dir=tmp_path / "errors",
+        evidence_dir=tmp_path / "evidence",
         simulations=2,
         max_depth=4,
         time_budget_ms=0,
@@ -390,10 +762,7 @@ def test_live_runtime_blocks_bad_hand_recommendation_then_recovers(
     try:
         blocked_snapshots = [runtime.run_once() for _ in range(4)]
         assert decision_calls == 0
-        assert all(
-            snapshot.decision is None
-            for snapshot in blocked_snapshots
-        )
+        assert all(snapshot.decision is None for snapshot in blocked_snapshots)
         recognizer.hand = phase4_ready_state.self_hand.cards
         recovered = runtime.run_once()
         for _ in range(20):
@@ -418,13 +787,9 @@ def test_live_runtime_blocks_bad_hand_recommendation_then_recovers(
     assert recovered.decision is not None
     assert stale_hidden.decision is None
     assert "手牌画面与牌局模型不一致" in stale_hidden.decision_block_reason
-    rows = [
-        json.loads(line)
-        for line in config.log_file.read_text(encoding="utf-8").splitlines()
-    ]
+    rows = [json.loads(line) for line in config.log_file.read_text(encoding="utf-8").splitlines()]
     assert any(
-        "手牌画面与牌局模型不一致"
-        in row.get("decision_block_reason", "")
+        "手牌画面与牌局模型不一致" in row.get("decision_block_reason", "")
         for row in rows
         if row["event"] == "live_runtime_snapshot"
     )
@@ -464,25 +829,16 @@ def test_live_runtime_rejects_impossible_decision_action(
             snapshots.append(runtime.run_once())
             events = [
                 json.loads(line)
-                for line in config.log_file.read_text(
-                    encoding="utf-8"
-                ).splitlines()
+                for line in config.log_file.read_text(encoding="utf-8").splitlines()
             ]
-            if any(
-                event["event"] == "live_decision_rejected"
-                for event in events
-            ):
+            if any(event["event"] == "live_decision_rejected" for event in events):
                 break
             time.sleep(0.01)
     finally:
         runtime.close()
 
     assert all(snapshot.decision is None for snapshot in snapshots)
-    rejected = [
-        event
-        for event in events
-        if event["event"] == "live_decision_rejected"
-    ]
+    rejected = [event for event in events if event["event"] == "live_decision_rejected"]
     assert len(rejected) == 1
     assert "not legal" in str(rejected[0]["error"])
 
@@ -494,6 +850,7 @@ def test_live_runtime_logs_observed_action_without_crashing(
     config = LiveLayoutConfig(
         log_file=tmp_path / "live.jsonl",
         error_frames_dir=tmp_path / "errors",
+        evidence_dir=tmp_path / "evidence",
     )
     runtime = LiveGameRuntime(
         config,
@@ -508,21 +865,12 @@ def test_live_runtime_logs_observed_action_without_crashing(
         runtime.close()
 
     assert snapshot.tracker_update.event is not None
-    rows = [
-        json.loads(line)
-        for line in config.log_file.read_text(encoding="utf-8").splitlines()
-    ]
+    rows = [json.loads(line) for line in config.log_file.read_text(encoding="utf-8").splitlines()]
     assert [row["event"] for row in rows].count("play_observed") == 1
-    observed_action = next(
-        row for row in rows
-        if row["event"] == "play_observed"
-    )
+    observed_action = next(row for row in rows if row["event"] == "play_observed")
     assert observed_action["round_id"] == phase4_ready_state.round_id
     assert observed_action["frame_id"] == 1
-    state_updates = [
-        row for row in rows
-        if row["event"] == "state_update"
-    ]
+    state_updates = [row for row in rows if row["event"] == "state_update"]
     assert state_updates[0]["frame_id"] == 1
     assert state_updates[0]["observed_action"]["cards"] == ["3"]
 
@@ -556,15 +904,8 @@ def test_live_runtime_waits_for_window_and_recovers(tmp_path: Path) -> None:
 
     assert recovered.window_status is WindowCaptureStatus.AVAILABLE
     assert recovered.window_available is True
-    events = [
-        json.loads(line)
-        for line in config.log_file.read_text(encoding="utf-8").splitlines()
-    ]
-    transitions = [
-        event["status"]
-        for event in events
-        if event["event"] == "live_window_status"
-    ]
+    events = [json.loads(line) for line in config.log_file.read_text(encoding="utf-8").splitlines()]
+    transitions = [event["status"] for event in events if event["event"] == "live_window_status"]
     assert transitions == ["not_open", "available"]
 
 
@@ -652,14 +993,8 @@ def test_live_runtime_throttles_repeated_unavailable_snapshots(
     finally:
         runtime.close()
 
-    rows = [
-        json.loads(line)
-        for line in config.log_file.read_text(encoding="utf-8").splitlines()
-    ]
-    snapshots = [
-        row for row in rows
-        if row["event"] == "live_runtime_snapshot"
-    ]
+    rows = [json.loads(line) for line in config.log_file.read_text(encoding="utf-8").splitlines()]
+    snapshots = [row for row in rows if row["event"] == "live_runtime_snapshot"]
     assert [row["frame_id"] for row in snapshots] == [1, 20]
 
 
@@ -683,20 +1018,13 @@ def test_live_runtime_throttles_repeated_available_telemetry(
     finally:
         runtime.close()
 
-    rows = [
-        json.loads(line)
-        for line in config.log_file.read_text(encoding="utf-8").splitlines()
-    ]
+    rows = [json.loads(line) for line in config.log_file.read_text(encoding="utf-8").splitlines()]
     for event in (
         "scene_observation",
         "state_update",
         "live_runtime_snapshot",
     ):
-        assert [
-            row["frame_id"]
-            for row in rows
-            if row["event"] == event
-        ] == [1, 20]
+        assert [row["frame_id"] for row in rows if row["event"] == event] == [1, 20]
 
 
 def test_live_replay_mode_logs_every_scene_frame(tmp_path: Path) -> None:
@@ -718,15 +1046,8 @@ def test_live_replay_mode_logs_every_scene_frame(tmp_path: Path) -> None:
     finally:
         runtime.close()
 
-    rows = [
-        json.loads(line)
-        for line in config.log_file.read_text(encoding="utf-8").splitlines()
-    ]
-    assert [
-        row["frame_id"]
-        for row in rows
-        if row["event"] == "scene_observation"
-    ] == [1, 2, 3]
+    rows = [json.loads(line) for line in config.log_file.read_text(encoding="utf-8").splitlines()]
+    assert [row["frame_id"] for row in rows if row["event"] == "scene_observation"] == [1, 2, 3]
 
 
 def test_live_runtime_archives_oversized_log_without_deleting_it(
@@ -747,10 +1068,126 @@ def test_live_runtime_archives_oversized_log_without_deleting_it(
     assert not path.exists()
 
 
-def test_live_overlay_exposes_background_runtime_error() -> None:
-    view = LiveOverlayViewModel.from_runtime_error(
-        "ScreenGeometryError: capture failed"
+def test_live_runtime_keeps_only_bounded_log_archives(tmp_path: Path) -> None:
+    path = tmp_path / "live.jsonl"
+    unrelated = tmp_path / "live.jsonl.user-notes"
+    unrelated.write_text("keep me\n", encoding="utf-8")
+
+    for index in range(5):
+        path.write_text(f"historical evidence {index}\n", encoding="utf-8")
+        _rotate_jsonl_log(
+            path,
+            max_bytes=4,
+            timestamp=1_785_000_000.0 + index,
+            archive_limit=3,
+        )
+
+    archives = sorted(
+        item
+        for item in tmp_path.glob("live.jsonl.*")
+        if item.name != unrelated.name
     )
+    assert len(archives) == 3
+    assert [item.read_text(encoding="utf-8") for item in archives] == [
+        "historical evidence 2\n",
+        "historical evidence 3\n",
+        "historical evidence 4\n",
+    ]
+    assert unrelated.read_text(encoding="utf-8") == "keep me\n"
+
+
+def test_live_runtime_rotation_same_second_keeps_newest_numeric_slices(tmp_path: Path) -> None:
+    from src.reporting.live_log_reader import list_live_log_sources
+
+    path = tmp_path / "events.jsonl"
+    for index in range(15):
+        path.write_text(f"{index}\n")
+        _rotate_jsonl_log(path, max_bytes=1, timestamp=1_785_000_000.0, archive_limit=3)
+    sources = list_live_log_sources(path, include_current=False)
+    assert [source.path.read_text() for source in sources] == ["12\n", "13\n", "14\n"]
+
+
+def test_live_runtime_rotation_rejects_symlinks_without_touching_evidence(tmp_path: Path) -> None:
+    import pytest
+
+    path = tmp_path / "events.jsonl"
+    path.write_text("current data\n")
+    outside = tmp_path / "outside.jsonl"
+    outside.write_text("outside data\n")
+    alias = tmp_path / "events.jsonl.20260905-120000"
+    alias.symlink_to(outside)
+    with pytest.raises(OSError, match="plain file"):
+        _rotate_jsonl_log(path, max_bytes=1)
+    assert path.read_text() == "current data\n"
+    assert outside.read_text() == "outside data\n" and alias.is_symlink()
+
+
+def test_live_runtime_honors_pin_before_recycling_its_own_cache(tmp_path: Path) -> None:
+    runtime = LiveGameRuntime(
+        LiveLayoutConfig(
+            log_file=tmp_path / "live.jsonl", evidence_dir=tmp_path / "evidence",
+            evidence_max_frames_per_session=1, fixed_issue_registry=tmp_path / "missing.json",
+        ),
+        frame_source=_FrameSource(), recognizer=_Recognizer(), tracker=_Tracker(None),
+        resume_session_id="synthetic-pinned", diagnostic_evidence=True,
+    )
+    try:
+        saved = runtime._save_evidence_frame(_FrameSource().capture(1), kind="heartbeat", round_id="r1")
+        runtime._evidence_store.set_pinned(runtime._evidence_session_id, True)
+        assert runtime._save_evidence_frame(
+            _FrameSource().capture(2), kind="uncertain", round_id="r2"
+        ) is None
+        assert saved.is_file()
+    finally:
+        runtime.close()
+    rows = [json.loads(line) for line in (tmp_path / "live.jsonl").read_text().splitlines()]
+    assert any(row.get("frame_omitted") == "session_protected" for row in rows)
+
+
+def test_live_runtime_evidence_keeps_errors_and_results_across_multiple_rounds(
+    tmp_path: Path, phase4_ready_state,
+) -> None:
+    config = LiveLayoutConfig(
+        log_file=tmp_path / "live.jsonl", evidence_dir=tmp_path / "evidence",
+        error_frames_dir=tmp_path / "legacy", evidence_max_frames_per_session=4,
+        fixed_issue_registry=tmp_path / "no-registry.json", error_frame_cooldown_seconds=0,
+        max_error_frames_per_round=1,
+    )
+    runtime = LiveGameRuntime(
+        config, frame_source=_FrameSource(), recognizer=_Recognizer(),
+        tracker=_Tracker(phase4_ready_state), resume_session_id="only-synthetic",
+        diagnostic_evidence=True,
+    )
+    try:
+        for frame_id in range(1, 10):
+            runtime._save_evidence_frame(_FrameSource().capture(frame_id), kind="heartbeat", round_id="r1")
+        for frame_id, round_id in [(10, "r1"), (20, "r2")]:
+            state = replace(phase4_ready_state, round_id=round_id, phase=RoundPhase.UNCERTAIN)
+            update = VisualTrackerUpdate(
+                mode=VisualTrackerMode.UNCERTAIN, message="synthetic failure", state=state,
+                warnings=("synthetic failure",),
+            )
+            runtime._handle_uncertain_frame(_FrameSource().capture(frame_id), update)
+            runtime._handle_uncertain_frame(_FrameSource().capture(frame_id + 1), update)
+            runtime._save_evidence_frame(
+                _FrameSource().capture(frame_id + 2), kind="result-defeat", round_id=round_id
+            )
+        runtime._save_evidence_frame(_FrameSource().capture(30), kind="result-defeat", round_id="r3")
+        retained = dict(runtime._evidence_frame_paths)
+    finally:
+        runtime.close()
+    assert set(retained) == {10, 12, 20, 22}
+    assert all(path.is_file() for path in retained.values())
+    rows = [json.loads(line) for line in config.log_file.read_text().splitlines()]
+    assert len([row for row in rows if row["event"] == "error_frame_saved"]) == 2
+    omissions = [row for row in rows if row.get("frame_omitted")]
+    assert {row["frame_omitted"] for row in omissions} >= {
+        "error_frame_round_limit_reached", "critical_or_modified_frames_fill_limit",
+    }
+
+
+def test_live_overlay_exposes_background_runtime_error() -> None:
+    view = LiveOverlayViewModel.from_runtime_error("ScreenGeometryError: capture failed")
 
     assert view.status == "识别线程异常停止"
     assert "已暂停" in view.best
@@ -854,6 +1291,7 @@ def test_live_runtime_rejects_checkpoint_from_previous_ui_session(
     config = LiveLayoutConfig(
         log_file=tmp_path / "live.jsonl",
         error_frames_dir=tmp_path / "errors",
+        evidence_dir=tmp_path / "evidence",
     )
     _write_round_checkpoint(
         _round_state_path(config),
@@ -877,6 +1315,7 @@ def test_live_runtime_rejects_checkpoint_from_previous_ui_session(
         runtime.close()
 
     assert restored is None
+    assert not config.evidence_dir.exists()
 
 
 def test_live_runtime_clears_checkpoint_when_round_finishes(
@@ -956,21 +1395,89 @@ def test_live_runtime_logs_victory_and_overlay_displays_result(
     finally:
         runtime.close()
 
-    rows = [
-        json.loads(line)
-        for line in config.log_file.read_text(encoding="utf-8").splitlines()
-    ]
-    result = next(
-        row for row in rows
-        if row["event"] == "round_result_detected"
-    )
+    rows = [json.loads(line) for line in config.log_file.read_text(encoding="utf-8").splitlines()]
+    result = next(row for row in rows if row["event"] == "round_result_detected")
     assert result["round_id"] == "victory-round"
     assert result["winner"] == "self"
+    assert result["landlord"] == "self"
+    assert result["winning_side"] == "landlord"
     assert result["outcome"] == "victory"
     assert result["source"] == "live_hand_diff"
     view = LiveOverlayViewModel.from_snapshot(snapshot)
     assert view.best == "结果：胜利"
     assert "断点已自动清除" in view.warnings
+
+
+def test_live_runtime_ends_uncertain_round_from_defeat_overlay(
+    tmp_path: Path,
+    phase4_ready_state: ObservableGameState,
+) -> None:
+    config = LiveLayoutConfig(
+        log_file=tmp_path / "live.jsonl",
+        error_frames_dir=tmp_path / "errors",
+        evidence_dir=tmp_path / "evidence",
+        fixed_issue_registry=tmp_path / "missing-fixed-issues.json",
+    )
+    state = replace(
+        phase4_ready_state,
+        round_id="defeat-overlay-round",
+        landlord=PlayerSeat.SELF,
+    )
+    state_path = _round_state_path(config)
+    seed_path = _round_seed_path(config)
+    _write_round_checkpoint(state_path, state)
+    seed_path.parent.mkdir(parents=True)
+    Image.new("RGB", (20, 10), "navy").save(seed_path)
+    runtime = LiveGameRuntime(
+        config,
+        frame_source=_FrameSource(),
+        recognizer=_DefeatOverlayRecognizer(),
+        tracker=VisualEventTracker(initial_state=state),
+        sleeper=lambda _: None,
+        resume_session_id="result-overlay-session",
+        diagnostic_evidence=True,
+    )
+    evidence_session_id = runtime._evidence_session_id  # noqa: SLF001
+    assert evidence_session_id is not None
+    runtime.request_current_scan()
+    try:
+        candidate = runtime.run_once()
+        snapshot = runtime.run_once()
+        repeated = runtime.run_once()
+    finally:
+        runtime.close()
+
+    rows = [json.loads(line) for line in config.log_file.read_text(encoding="utf-8").splitlines()]
+    result = next(row for row in rows if row["event"] == "round_result_detected")
+    assert result["round_id"] == "defeat-overlay-round"
+    assert result["winner"] is None
+    assert result["landlord"] == "self"
+    assert result["winning_side"] == "farmers"
+    assert result["outcome"] == "defeat"
+    assert result["source"] == "visual_result_overlay"
+    assert candidate.state is not None
+    assert candidate.tracker_update.round_result is None
+    assert candidate.current_scan_pending is True
+    assert snapshot.state is None
+    assert snapshot.tracker_update.round_result is not None
+    assert snapshot.current_scan_pending is False
+    assert repeated.tracker_update.round_result is not None
+    assert not state_path.exists()
+    assert not seed_path.exists()
+    assert LiveOverlayViewModel.from_snapshot(snapshot).best == "结果：失败"
+    evidence_events = [
+        json.loads(line)
+        for line in (
+            config.evidence_dir / evidence_session_id / "events.jsonl"
+        ).read_text(encoding="utf-8").splitlines()
+    ]
+    result_frames = [
+        row
+        for row in evidence_events
+        if row.get("event") == "diagnostic_frame_saved"
+        and row.get("kind") == "result-defeat"
+    ]
+    assert len(result_frames) == 1
 
 
 def test_live_runtime_manual_scan_initializes_without_stability_wait(
@@ -1005,14 +1512,8 @@ def test_live_runtime_manual_scan_initializes_without_stability_wait(
     assert scanned.state.current_actor is PlayerSeat.SELF
     assert scanned.state.decision_ready is True
     assert "已扫描当前牌局" in scanned.tracker_update.message
-    events = [
-        json.loads(line)
-        for line in config.log_file.read_text(encoding="utf-8").splitlines()
-    ]
-    scan_events = [
-        event for event in events
-        if event["event"] == "manual_current_scan"
-    ]
+    events = [json.loads(line) for line in config.log_file.read_text(encoding="utf-8").splitlines()]
+    scan_events = [event for event in events if event["event"] == "manual_current_scan"]
     assert len(scan_events) == 1
     assert scan_events[0]["success"] is True
 
@@ -1157,8 +1658,5 @@ def test_live_runtime_caps_error_frames_per_round_and_session(
 
     saved = tuple(config.error_frames_dir.glob("*.png"))
     assert len(saved) == 3
-    rows = [
-        json.loads(line)
-        for line in config.log_file.read_text(encoding="utf-8").splitlines()
-    ]
+    rows = [json.loads(line) for line in config.log_file.read_text(encoding="utf-8").splitlines()]
     assert len([row for row in rows if row["event"] == "error_frame_saved"]) == 3
