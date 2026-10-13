@@ -10,19 +10,23 @@ from src.config.live_layout import LiveLayoutConfig
 from src.state.cards import RANKS
 from src.state.events import PlayerSeat
 from src.vision.card_classifier import CardPrediction
+from src.vision.rank_glyph import extract_rank_glyph, read_joker_color
 from src.vision.scene_recognizer import (
     CvRemainingReader,
     RemainingTextMatch,
+    RoundResultOutcome,
     SceneRecognizer,
     SeatRole,
     TemplateMatcher,
     _classify_role_badge,
+    _classify_round_result,
     _classify_turn_controls,
     _decode_glyph_signature,
     _encode_glyph_signature,
     _glyph_similarity,
     _load_builtin_rank_references,
     _load_builtin_remaining_references,
+    _load_builtin_round_result_references,
     _rank_glyph_signature,
     _regularize_overlapping_hand_boxes,
     _remaining_glyph_signature,
@@ -82,9 +86,7 @@ def test_role_badge_classifier_is_independent_of_seat_background() -> None:
 
 
 def test_role_badge_classifier_rejects_background_without_glyphs() -> None:
-    role, confidence = _classify_role_badge(
-        Image.new("RGB", (223, 115), (43, 73, 145))
-    )
+    role, confidence = _classify_role_badge(Image.new("RGB", (223, 115), (43, 73, 145)))
 
     assert role is SeatRole.UNKNOWN
     assert confidence == 0.0
@@ -95,13 +97,13 @@ def test_turn_control_classifier_uses_yellow_buttons_not_blue_background() -> No
     active = inactive.copy()
     draw = ImageDraw.Draw(active)
     draw.rounded_rectangle(
-        (45, 55, 225, 205),
-        radius=20,
+        (30, 85, 215, 145),
+        radius=30,
         fill=(242, 166, 31),
     )
     draw.rounded_rectangle(
-        (275, 55, 455, 205),
-        radius=20,
+        (285, 85, 470, 145),
+        radius=30,
         fill=(242, 166, 31),
     )
 
@@ -112,6 +114,55 @@ def test_turn_control_classifier_uses_yellow_buttons_not_blue_background() -> No
     assert active_confidence >= 0.94
     assert inactive_value is False
     assert inactive_confidence >= 0.95
+
+
+def test_yellow_area_without_button_entity_remains_unknown() -> None:
+    # Original tall-block fixture only proved yellow area, not real controls.
+    image = Image.new("RGB", (500, 240), (43, 73, 145))
+    draw = ImageDraw.Draw(image)
+    for box in ((45, 55, 225, 205), (275, 55, 455, 205)):
+        draw.rounded_rectangle(box, radius=20, fill=(242, 166, 31))
+    assert _classify_turn_controls(image) == (None, 0.0)
+
+
+def _synthetic_defeat_overlay() -> Image.Image:
+    reference = _load_builtin_round_result_references()[RoundResultOutcome.DEFEAT][0]
+    mask = np.zeros((48, 96), dtype=np.uint8)
+    for index in reference:
+        mask[index // 96, index % 96] = 255
+    image = Image.new("RGB", (960, 640), (20, 30, 55))
+    glyph = Image.fromarray(mask, mode="L").resize(
+        (250, 125),
+        Image.Resampling.NEAREST,
+    )
+    image.paste(Image.new("RGB", glyph.size, "white"), (355, 68), glyph)
+    ImageDraw.Draw(image).rounded_rectangle(
+        (360, 410, 600, 510),
+        radius=30,
+        fill=(220, 150, 35),
+    )
+    return image
+
+
+def test_round_result_classifier_recognizes_defeat_modal() -> None:
+    result = _classify_round_result(_synthetic_defeat_overlay())
+
+    assert result is not None
+    assert result.outcome is RoundResultOutcome.DEFEAT
+    assert result.confidence >= 0.99
+
+
+def test_round_result_classifier_rejects_ordinary_cards_and_play_button() -> None:
+    image = Image.new("RGB", (960, 640), (45, 75, 145))
+    draw = ImageDraw.Draw(image)
+    draw.rectangle((380, 80, 610, 250), fill="white")
+    draw.rounded_rectangle(
+        (360, 410, 600, 510),
+        radius=30,
+        fill=(220, 150, 35),
+    )
+
+    assert _classify_round_result(image) is None
 
 
 def test_segment_card_boxes_finds_separated_face_up_cards() -> None:
@@ -165,6 +216,35 @@ def test_segment_card_boxes_splits_tight_pair_in_single_white_region() -> None:
     assert abs(boxes[1][0] - 88) <= 2
 
 
+def test_segment_card_boxes_recovers_card_wrapped_below_last_slot() -> None:
+    image = Image.new("RGB", (780, 420), (45, 75, 145))
+    draw = ImageDraw.Draw(image)
+    starts = tuple(14 + index * 74 for index in range(9))
+    for left in starts:
+        draw.rounded_rectangle(
+            (left, 84, left + 168, 324),
+            radius=8,
+            fill="white",
+            outline=(75, 75, 75),
+            width=2,
+        )
+    draw.rounded_rectangle(
+        (starts[-1], 194, starts[-1] + 168, 414),
+        radius=8,
+        fill="white",
+        outline=(75, 75, 75),
+        width=2,
+    )
+
+    boxes = segment_card_boxes(image)
+
+    assert len(boxes) == 10
+    assert [box[0] for box in boxes].count(starts[-1]) == 2
+    stacked = [box for box in boxes if box[0] == starts[-1]]
+    assert stacked[0][1] < stacked[1][1]
+    assert abs(stacked[1][1] - 194) <= 3
+
+
 def test_segment_card_boxes_ignores_separate_button_below_landlord_card() -> None:
     image = Image.new("RGB", (420, 500), (45, 75, 145))
     draw = ImageDraw.Draw(image)
@@ -211,10 +291,7 @@ def test_infer_overlapping_hand_boxes_accepts_centered_short_hand() -> None:
     boxes = infer_overlapping_hand_boxes(image, 3)
 
     assert len(boxes) == 3
-    assert all(
-        abs(box[0] - expected) <= 3
-        for box, expected in zip(boxes, starts, strict=True)
-    )
+    assert all(abs(box[0] - expected) <= 3 for box, expected in zip(boxes, starts, strict=True))
 
 
 def test_infer_overlapping_hand_boxes_accepts_one_and_two_card_endgames() -> None:
@@ -234,10 +311,7 @@ def test_infer_overlapping_hand_boxes_accepts_one_and_two_card_endgames() -> Non
         boxes = infer_overlapping_hand_boxes(image, len(starts))
 
         assert len(boxes) == len(starts)
-        assert all(
-            abs(box[0] - expected) <= 3
-            for box, expected in zip(boxes, starts, strict=True)
-        )
+        assert all(abs(box[0] - expected) <= 3 for box, expected in zip(boxes, starts, strict=True))
 
 
 def test_visible_count_rejects_two_internal_edges_inside_one_card(
@@ -390,12 +464,8 @@ def test_hand_grid_removes_joker_glyph_edge_before_and_after_play() -> None:
     initial_card_starts = [0, *range(102, 2040, 102)]
     after_play_card_starts = [0, *range(107, 2033, 107)]
 
-    initial = _regularize_overlapping_hand_boxes(
-        boxes([0, 26, *initial_card_starts[1:]])
-    )
-    after_play = _regularize_overlapping_hand_boxes(
-        boxes([0, 27, *after_play_card_starts[1:]])
-    )
+    initial = _regularize_overlapping_hand_boxes(boxes([0, 26, *initial_card_starts[1:]]))
+    after_play = _regularize_overlapping_hand_boxes(boxes([0, 27, *after_play_card_starts[1:]]))
 
     assert len(initial) == 20
     assert [box[0] for box in initial] == initial_card_starts
@@ -413,7 +483,31 @@ def test_confident_cnn_joker_is_not_overridden_by_normal_j_reference() -> None:
     assert _resolve_card_prediction(
         prediction,
         ("J", 0.997),
+        joker_color=read_joker_color(
+            _joker_card(), extract_rank_glyph(_joker_card()), LiveLayoutConfig().joker_color,
+        ),
     ) == ("BJ", 0.999)
+
+
+def _joker_card() -> Image.Image:
+    image = Image.new("RGB", (126, 210), "white")
+    draw = ImageDraw.Draw(image)
+    draw.line((28, 18, 76, 18), fill=(160, 25, 20), width=7)
+    draw.line((66, 18, 66, 82, 56, 98, 35, 98, 24, 84), fill=(160, 25, 20), width=7)
+    return image
+
+
+def test_strong_rank_reference_corrects_confident_false_joker() -> None:
+    prediction = CardPrediction(
+        rank="BJ",
+        confidence=0.972,
+        probabilities={"BJ": 0.972},
+    )
+
+    assert _resolve_card_prediction(
+        prediction,
+        ("A", 0.950),
+    ) == ("A", 0.950)
 
 
 def test_low_confidence_joker_can_still_be_corrected_by_reference() -> None:
@@ -442,21 +536,60 @@ def test_rank_reference_still_corrects_non_joker_prediction() -> None:
     ) == ("K", 0.97)
 
 
+def test_rank_reference_can_restrict_match_to_joker_classes(
+    monkeypatch,
+) -> None:
+    recognizer = object.__new__(SceneRecognizer)
+    recognizer.config = LiveLayoutConfig()
+    recognizer._rank_references = {
+        "J": [frozenset({1, 2, 3, 4})],
+        "SJ": [frozenset({1, 2, 3})],
+        "BJ": [frozenset({1})],
+    }
+    monkeypatch.setattr(
+        scene_recognizer_module,
+        "_rank_glyph_signature",
+        lambda _image: frozenset({1, 2, 3, 4}),
+    )
+
+    match = recognizer._match_rank_reference(
+        Image.new("RGB", (10, 10)),
+        minimum_similarity=0.70,
+        minimum_margin=0.025,
+        allowed_ranks={"SJ", "BJ"},
+    )
+
+    assert match is not None
+    assert match[0] == "SJ"
+
+
+def test_reset_rank_references_discards_cross_round_dynamic_glyphs() -> None:
+    recognizer = object.__new__(SceneRecognizer)
+    baseline = frozenset({1, 2})
+    recognizer._base_rank_references = {"5": [baseline]}
+    recognizer._rank_references = {
+        "5": [baseline, frozenset({3, 4})],
+        "K": [frozenset({5, 6})],
+    }
+    recognizer._reference_hand_fingerprint = ("5", "K")
+
+    recognizer._reset_rank_references()
+
+    assert recognizer._rank_references == {"5": [baseline]}
+    assert recognizer._reference_hand_fingerprint is None
+
+
 def test_seed_hand_references_accepts_safe_midgame_scan(
     monkeypatch,
 ) -> None:
     ranks = ("BJ", "2", "A", "K", "K", "K", "J", "9", "5")
     monkeypatch.setattr(
         scene_recognizer_module,
-        "infer_visible_hand_count",
-        lambda _image, maximum: len(ranks),
-    )
-    monkeypatch.setattr(
-        scene_recognizer_module,
-        "infer_overlapping_hand_boxes",
-        lambda _image, count: tuple(
-            (index * 10, 0, index * 10 + 9, 20)
-            for index in range(count)
+        "infer_hand_geometry",
+        lambda _image, **_kwargs: scene_recognizer_module.HandGeometry(
+            len(ranks),
+            tuple((index * 126, 0, (index + 1) * 126, 210) for index in range(len(ranks))),
+            True,
         ),
     )
     recognizer = SceneRecognizer(
@@ -472,11 +605,13 @@ def test_seed_hand_references_accepts_safe_midgame_scan(
         remaining_reader=lambda _: {},
     )
 
-    cards = recognizer.seed_hand_references(
-        Image.new("RGB", (1000, 600), "navy")
-    )
+    frame = Image.new("RGB", (1600, 1000), "white")
+    left, top, _, _ = recognizer.config.roi("self_hand").to_pixel_box(frame.size)
+    frame.paste(_joker_card(), (left, top))
+    cards = recognizer.seed_hand_references(frame)
 
     assert tuple(card.rank for card in cards) == ranks
+    assert all(card.confidence >= recognizer.config.confidence_threshold for card in cards)
 
 
 def test_twenty_visible_cards_override_misleading_role_templates() -> None:
@@ -586,9 +721,7 @@ def test_builtin_rank_glyph_asset_is_complete_and_decodable() -> None:
     assert set(references) == set(RANKS)
     assert all(references[rank] for rank in RANKS)
     sample = references["Q"][0]
-    assert _decode_glyph_signature(
-        _encode_glyph_signature(sample)
-    ) == sample
+    assert _decode_glyph_signature(_encode_glyph_signature(sample)) == sample
 
 
 def test_native_text_count_overrides_unverified_whole_roi_template() -> None:
@@ -656,12 +789,8 @@ def test_remaining_digit_topology_distinguishes_five_from_six() -> None:
         width=4,
     )
 
-    five_signature = _remaining_glyph_signature(
-        np.asarray(open_five, dtype=np.uint8) > 0
-    )
-    six_signature = _remaining_glyph_signature(
-        np.asarray(closed_six, dtype=np.uint8) > 0
-    )
+    five_signature = _remaining_glyph_signature(np.asarray(open_five, dtype=np.uint8) > 0)
+    six_signature = _remaining_glyph_signature(np.asarray(closed_six, dtype=np.uint8) > 0)
 
     assert _remaining_signature_hole_count(five_signature) == 0
     assert _remaining_signature_hole_count(six_signature) == 1

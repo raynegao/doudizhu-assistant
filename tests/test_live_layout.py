@@ -18,12 +18,33 @@ from src.capture.screen_geometry import (
 from src.config.live_layout import (
     LiveLayoutConfig,
     NormalizedBox,
+    live_layout_from_dict,
     load_live_layout,
     render_layout_preview,
     render_roi_contact_sheet,
     save_live_layout,
 )
 from src.pipeline.calibration import WindowInfo
+
+
+def test_recording_buffer_and_timeout_config_round_trip() -> None:
+    config = LiveLayoutConfig(recording_queue_frames=2, recording_io_timeout_seconds=5.0)
+    loaded = live_layout_from_dict(config.to_payload())
+    assert loaded.recording_queue_frames == 2
+    assert loaded.recording_io_timeout_seconds == 5.0
+    assert live_layout_from_dict({}).recording_queue_frames == 4
+
+
+@pytest.mark.parametrize("capacity", [0, -1, True, 1.5])
+def test_recording_queue_rejects_invalid_capacity(capacity) -> None:
+    with pytest.raises(ValueError, match="recording_queue_frames"):
+        LiveLayoutConfig(recording_queue_frames=capacity)
+
+
+@pytest.mark.parametrize("seconds", [0.0, -1.0, float("inf"), float("nan")])
+def test_recording_timeout_rejects_invalid_seconds(seconds: float) -> None:
+    with pytest.raises(ValueError, match="recording_io_timeout_seconds"):
+        LiveLayoutConfig(recording_io_timeout_seconds=seconds)
 
 
 def test_retina_geometry_maps_logical_window_to_pixels() -> None:
@@ -247,6 +268,14 @@ def test_live_layout_roundtrip_and_preview(tmp_path: Path) -> None:
     assert loaded.error_frame_cooldown_seconds == 60.0
     assert loaded.max_error_frames_per_round == 4
     assert loaded.max_error_frames_per_session == 25
+    assert loaded.evidence_enabled is True
+    assert loaded.evidence_max_sessions == 20
+    assert loaded.evidence_max_frames_per_session == 180
     assert preview.size == image.size
     assert contact.width == 360
     assert contact.height > 80
+
+
+def test_live_layout_rejects_string_evidence_toggle() -> None:
+    with pytest.raises(ValueError, match="evidence_enabled must be a boolean"):
+        live_layout_from_dict({"evidence_enabled": "false"})
