@@ -10,6 +10,8 @@ from src.tracking.visual_events import (
     VisualTrackerMode,
 )
 from src.vision.scene_recognizer import (
+    RoundResultObservation,
+    RoundResultOutcome,
     SceneObservation,
     SeatObservation,
     SeatRole,
@@ -64,6 +66,7 @@ def _scene(
     left_remaining: int = 17,
     visible_hand: tuple[str, ...] | None = None,
     self_turn: bool | None = None,
+    round_result: RoundResultObservation | None = None,
 ) -> SceneObservation:
     hand = LANDLORD_HAND if visible_hand is None else visible_hand
     seats = (
@@ -111,6 +114,7 @@ def _scene(
         self_turn=self_turn,
         self_turn_confidence=0.99 if self_turn is not None else 0.0,
         confidence=0.99,
+        round_result=round_result,
     )
 
 
@@ -1162,6 +1166,86 @@ def test_visual_tracker_blocks_remaining_count_mismatch() -> None:
     assert update.state is not None
     assert update.state.phase.value == "uncertain"
     assert "remaining count mismatch" in update.message
+
+
+def test_visual_tracker_clears_uncertain_round_on_result_overlay() -> None:
+    tracker = VisualEventTracker(
+        stability_frames=1,
+        round_id_factory=lambda _: "round-overlay-result",
+    )
+    tracker.update(_scene(frame_id=1))
+    tracker.update(_scene(
+        frame_id=2,
+        self_signal=VisualSignal.PLAY,
+        self_cards=("3",),
+    ))
+    uncertain = tracker.update(_scene(
+        frame_id=3,
+        right_signal=VisualSignal.PLAY,
+        right_cards=("8",),
+        right_remaining=15,
+    ))
+
+    candidate = tracker.update(_scene(
+        frame_id=4,
+        round_result=RoundResultObservation(
+            outcome=RoundResultOutcome.DEFEAT,
+            confidence=0.995,
+        ),
+    ))
+    result = tracker.update(_scene(
+        frame_id=5,
+        round_result=RoundResultObservation(
+            outcome=RoundResultOutcome.DEFEAT,
+            confidence=0.995,
+        ),
+    ))
+    repeated = tracker.update(_scene(
+        frame_id=6,
+        round_result=RoundResultObservation(
+            outcome=RoundResultOutcome.DEFEAT,
+            confidence=0.995,
+        ),
+    ))
+
+    assert uncertain.mode is VisualTrackerMode.UNCERTAIN
+    assert candidate.mode is VisualTrackerMode.UNCERTAIN
+    assert candidate.state is not None
+    assert candidate.completed_round_id is None
+    assert candidate.round_result is None
+    assert result.mode is VisualTrackerMode.WAITING_FOR_ROUND
+    assert result.state is None
+    assert result.completed_round_id == "round-overlay-result"
+    assert result.round_result is not None
+    assert result.round_result.outcome is RoundResultOutcome.DEFEAT
+    assert repeated.completed_round_id is None
+
+
+def test_visual_tracker_does_not_clear_round_for_single_unknown_result_frame() -> None:
+    tracker = VisualEventTracker(
+        stability_frames=1,
+        round_id_factory=lambda _: "round-transient-result",
+    )
+    initialized = tracker.update(_scene(frame_id=1))
+
+    candidate = tracker.update(_scene(
+        frame_id=2,
+        round_result=RoundResultObservation(
+            outcome=RoundResultOutcome.UNKNOWN,
+            confidence=0.86,
+        ),
+    ))
+    recovered = tracker.update(_scene(frame_id=3))
+
+    assert initialized.state is not None
+    assert candidate.mode is VisualTrackerMode.TRACKING
+    assert candidate.state is not None
+    assert candidate.state.round_id == "round-transient-result"
+    assert candidate.round_result is None
+    assert candidate.completed_round_id is None
+    assert recovered.mode is VisualTrackerMode.TRACKING
+    assert recovered.state is not None
+    assert recovered.state.round_id == "round-transient-result"
 
 
 def test_visual_tracker_ignores_false_play_when_verified_count_is_unchanged() -> None:

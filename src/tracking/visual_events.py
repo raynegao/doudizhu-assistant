@@ -9,15 +9,38 @@ from src.logic.action_validation import validate_observed_action
 from src.logic.rules import Play, PlayType, legal_actions
 from src.state.cards import FULL_DECK, CardSet
 from src.state.events import ObservedAction, PlayerSeat, RoundPhase
-from src.state.game_tracker import GameStateTracker, StateUpdateStatus
+from src.state.game_tracker import (
+    GameStateTracker,
+    GameStateTransitionError,
+    StateUpdateStatus,
+    reduce_observed_action,
+)
 from src.state.observable_state import ObservableGameState
-from src.vision.scene_recognizer import (
+from src.vision.scene_types import (
+    RoundResultObservation,
+    RoundResultOutcome,
     SceneObservation,
     SeatObservation,
     SeatRole,
-    VisualCard,
     VisualSignal,
 )
+
+from .observation_evidence import (
+    _action_confidence as _action_confidence,
+)
+from .observation_evidence import (
+    _initial_observation_confidence as _initial_observation_confidence,
+)
+from .observation_evidence import (
+    _seat_fingerprint as _seat_fingerprint,
+)
+from .observation_evidence import (
+    _stable_hand_confidence as _stable_hand_confidence,
+)
+from .self_terminal_evidence import SelfTerminalEvidenceGate
+
+_RESULT_STABILITY_FRAMES = 2
+_FOLLOWING_PLAY_PASS_SOURCE = "live_following_play_inferred_pass"
 
 
 class VisualTrackerMode(str, Enum):
@@ -35,6 +58,8 @@ class VisualTrackerUpdate:
     event: ObservedAction | None = None
     initialized: bool = False
     warnings: tuple[str, ...] = ()
+    round_result: RoundResultObservation | None = None
+    completed_round_id: str | None = None
 
     def to_log_payload(self) -> dict[str, object]:
         return {
@@ -47,6 +72,12 @@ class VisualTrackerUpdate:
             ),
             "state": self.state.to_log_payload() if self.state is not None else None,
             "warnings": list(self.warnings),
+            "round_result": (
+                self.round_result.to_log_payload()
+                if self.round_result is not None
+                else None
+            ),
+            "completed_round_id": self.completed_round_id,
         }
 
 
@@ -65,6 +96,105 @@ class _StableValue:
 
 
 RoundIdFactory = Callable[[SceneObservation], str]
+
+
+@dataclass
+class _InvalidPlayEvidence:
+    context: tuple[str, int, PlayerSeat]
+    fingerprint: tuple[object, ...] | None = None
+    count: int = 0
+    last_source_frame_id: int = -1
+    last_scene_frame_id: int = -1
+
+
+class _SelfTurnEvidence:
+    """Small, actor-scoped memory of observed control and pass transitions."""
+
+    def __init__(self, key: tuple[object, ...]) -> None:
+        self.key = key
+        self.controls_seen = False
+        self.last_frame_id: int | None = None
+        self.hand_key: tuple[object, ...] | None = None
+        self.signals: dict[PlayerSeat, VisualSignal] = {}
+        self.fresh_passes: set[PlayerSeat] = set()
+
+    def observe(
+        self, state: ObservableGameState, scene: SceneObservation,
+        *, confidence_threshold: float,
+    ) -> None:
+        if self.last_frame_id is not None and scene.frame_id <= self.last_frame_id:
+            return
+        self.last_frame_id = scene.frame_id
+        hand_confidence, _ = _stable_hand_confidence(
+            scene.self_hand, confidence_threshold=confidence_threshold,
+        )
+        hand_key = (
+            len(scene.self_hand),
+            tuple(
+                (card.rank, card.confidence >= confidence_threshold)
+                for card in scene.self_hand
+            ),
+            hand_confidence >= confidence_threshold,
+        )
+        if hand_key != self.hand_key:
+            # A pass seen before this post-hand appeared cannot prove that
+            # both opponents acted after this candidate self play.
+            self.fresh_passes.clear()
+            self.hand_key = hand_key
+        if scene.self_turn is True and scene.self_turn_confidence >= confidence_threshold:
+            self.controls_seen = True
+        for observation in scene.seats:
+            signal = observation.signal
+            if signal is VisualSignal.UNKNOWN:
+                continue
+            if _action_confidence(observation) < confidence_threshold:
+                continue
+            if signal is VisualSignal.PASS:
+                if observation.seat is not PlayerSeat.SELF and (
+                    not observation.remaining_verified
+                    or observation.remaining_confidence < confidence_threshold
+                    or observation.remaining_count != state.remaining_for(observation.seat)
+                ):
+                    continue
+                if self.signals.get(observation.seat) in {
+                    VisualSignal.NEUTRAL, VisualSignal.PLAY,
+                }:
+                    self.fresh_passes.add(observation.seat)
+            self.signals[observation.seat] = signal
+
+    def opponents_completed_cycle(
+        self, state: ObservableGameState, scene: SceneObservation,
+        *, confidence_threshold: float,
+    ) -> bool:
+        return all(
+            seat in self.fresh_passes
+            and scene.seat(seat).signal is VisualSignal.PASS
+            and scene.seat(seat).pass_confidence >= confidence_threshold
+            and scene.seat(seat).remaining_verified
+            and scene.seat(seat).remaining_confidence >= confidence_threshold
+            and scene.seat(seat).remaining_count == state.remaining_for(seat)
+            for seat in (PlayerSeat.RIGHT, PlayerSeat.LEFT)
+        )
+
+
+def _observe_current_self_turn(
+    evidence: _SelfTurnEvidence | None,
+    state: ObservableGameState,
+    recent_scenes: Sequence[SceneObservation],
+    *,
+    min_frame_id: int | None,
+    confidence_threshold: float,
+) -> _SelfTurnEvidence | None:
+    if state.current_actor is not PlayerSeat.SELF:
+        return None
+    key = (state.round_id, state.revision, state.current_actor, min_frame_id)
+    if evidence is None or evidence.key != key:
+        evidence = _SelfTurnEvidence(key)
+    for scene in recent_scenes:
+        if min_frame_id is not None and scene.frame_id < min_frame_id:
+            continue
+        evidence.observe(state, scene, confidence_threshold=confidence_threshold)
+    return evidence
 
 
 class VisualEventTracker:
@@ -117,12 +247,19 @@ class VisualEventTracker:
         self._active_scan_stable = _StableValue()
         self._role_stable = _StableValue()
         self._seat_stable = {seat: _StableValue() for seat in PlayerSeat}
+        self._result_stable = _StableValue()
         self._armed = {seat: False for seat in PlayerSeat}
-        self._recent_scenes: deque[SceneObservation] = deque(maxlen=6)
+        self._scene_buffer_capacity = max(6, 2 * stability_frames)
+        self._recent_scenes: deque[SceneObservation] = deque(maxlen=self._scene_buffer_capacity)
+        self._scene_evidence_start_frame_id: int | None = None
+        self._self_turn_evidence: _SelfTurnEvidence | None = None
         self._actor_entry_frame_id: int | None = None
         self._self_actor_entry_hand_count: int | None = None
         self._self_actor_entry_frame_id: int | None = None
         self._uncertain_reason: str | None = None
+        self._result_overlay_active = False
+        self._invalid_play_evidence: _InvalidPlayEvidence | None = None
+        self._self_terminal_gate = SelfTerminalEvidenceGate()
 
     @property
     def state(self) -> ObservableGameState | None:
@@ -139,6 +276,34 @@ class VisualEventTracker:
         return state
 
     def update(self, scene: SceneObservation) -> VisualTrackerUpdate:
+        if scene.round_result is not None:
+            self._self_terminal_gate.discard_through(scene.frame_id)
+            result_fingerprint = ("round_result", scene.round_result.outcome.value)
+            stable_count = self._result_stable.update(result_fingerprint)
+            if stable_count < _RESULT_STABILITY_FRAMES:
+                label = {
+                    RoundResultOutcome.VICTORY: "胜利",
+                    RoundResultOutcome.DEFEAT: "失败",
+                    RoundResultOutcome.UNKNOWN: "疑似结算界面",
+                }[scene.round_result.outcome]
+                return VisualTrackerUpdate(
+                    mode=self.mode,
+                    message=(
+                        f"检测到{label}，正在确认 "
+                        f"{stable_count}/{_RESULT_STABILITY_FRAMES}"
+                    ),
+                    state=self.state,
+                    warnings=scene.warnings,
+                )
+            return self._handle_round_result(scene.round_result)
+        geometry_warnings = tuple(
+            warning for warning in scene.warnings
+            if warning.startswith("self_hand_geometry_unavailable:")
+        )
+        if geometry_warnings:
+            return self._pause_unknown_hand_geometry(scene, geometry_warnings)
+        self._result_stable.update(("no_round_result",))
+        self._result_overlay_active = False
         initial = _initial_state_payload(
             scene,
             confidence_threshold=self.confidence_threshold,
@@ -158,6 +323,7 @@ class VisualEventTracker:
             if should_initialize and stable_count >= self.initial_stability_frames:
                 return self._initialize(scene, initial)
             if should_initialize:
+                self._self_terminal_gate.discard_through(scene.frame_id)
                 return VisualTrackerUpdate(
                     mode=VisualTrackerMode.WAITING_FOR_ROUND,
                     message=(
@@ -173,6 +339,7 @@ class VisualEventTracker:
             self._initial_stable.update(("not_initial",))
 
         if self._tracker is None or self.mode is VisualTrackerMode.UNCERTAIN:
+            self._self_terminal_gate.discard_through(scene.frame_id)
             auto_payload, auto_error = _current_scan_payload(
                 scene,
                 confidence_threshold=self.confidence_threshold,
@@ -224,6 +391,7 @@ class VisualEventTracker:
                 warnings=(self._uncertain_reason or "uncertain",),
             )
         if self.mode is VisualTrackerMode.FINISHED:
+            self._self_terminal_gate.discard_through(scene.frame_id)
             finished_state = self._tracker.state
             outcome = (
                 "胜利"
@@ -265,6 +433,7 @@ class VisualEventTracker:
                 "检测到地主位置已变化："
                 f"状态={state.landlord.value}，画面={observed_landlord.value}"
             )
+            self._self_terminal_gate.discard_through(scene.frame_id)
             if role_stable_count >= self.stability_frames:
                 return self._mark_uncertain(
                     f"{reason}；判定已进入新牌局，等待完整开局重新建模"
@@ -286,9 +455,43 @@ class VisualEventTracker:
                 warnings=(reason,),
             )
 
+        watermarks = [value for value in (
+            self._scene_evidence_start_frame_id, self._self_actor_entry_frame_id,
+        ) if value is not None]
+        table = scene.self_table
+        terminal_event = self._self_terminal_gate.observe(
+            state=state, scene=scene,
+            cards=table.cards if table is not None else (),
+            complete=table.complete if table is not None else False,
+            empty_hand_verified=scene.self_hand_empty_verified,
+            epoch=max(watermarks) if watermarks else None,
+            stability_frames=self.stability_frames,
+            confidence_threshold=self.confidence_threshold,
+        )
+        if terminal_event is not None:
+            return self._apply_event(scene, scene.seat(PlayerSeat.SELF), terminal_event)
         self._recent_scenes.append(scene)
+        self._self_turn_evidence = _observe_current_self_turn(
+            self._self_turn_evidence, state, self._recent_scenes,
+            min_frame_id=self._self_actor_entry_frame_id,
+            confidence_threshold=self.confidence_threshold,
+        )
         expected = state.current_actor
         current_observation = scene.seat(expected)
+        invalid = self._invalid_play_evidence
+        if invalid is not None:
+            if invalid.context != (state.round_id, state.revision, expected):
+                self._invalid_play_evidence = None
+            elif scene.frame_id > invalid.last_scene_frame_id:
+                if (
+                    invalid.fingerprint != _invalid_play_fingerprint(
+                        current_observation, self.confidence_threshold,
+                    )
+                    or not _usable_play_evidence(current_observation, self.confidence_threshold)
+                ):
+                    invalid.fingerprint = None
+                    invalid.count = 0
+                invalid.last_scene_frame_id = scene.frame_id
         buffered_evidence = _buffered_play_evidence(
             state,
             expected,
@@ -339,25 +542,18 @@ class VisualEventTracker:
                 scene,
                 confidence_threshold=self.confidence_threshold,
             )
-            for candidate_scene in self._recent_scenes:
-                if (
-                    self._self_actor_entry_frame_id is not None
-                    and candidate_scene.frame_id
-                    < self._self_actor_entry_frame_id
-                ):
-                    continue
-                candidate_change = _self_hand_change(
+            if hand_change is not None and hand_change.error is None:
+                # An older crop cannot supply a different post-hand or borrow
+                # the latest scene's unrelated stable counter. Keep the latest
+                # interpretation/confidence, and only consult matching evidence.
+                hand_change_scene, stable_count = _current_self_hand_evidence(
                     state,
-                    candidate_scene,
+                    scene,
+                    hand_change,
+                    self._recent_scenes,
                     confidence_threshold=self.confidence_threshold,
+                    min_frame_id=self._self_actor_entry_frame_id,
                 )
-                if (
-                    candidate_change is not None
-                    and candidate_change.error is None
-                ):
-                    hand_change_scene = candidate_scene
-                    hand_change = candidate_change
-                    break
         if (
             expected is PlayerSeat.SELF
             and hand_change is not None
@@ -417,7 +613,24 @@ class VisualEventTracker:
         # first opportunity to advance the reducer. The generic drift recovery
         # previously ran first and could replace a known self play plus two
         # fast opponent passes with a fresh approximate round.
-        if hand_change is None:
+        opponent_candidate = (
+            expected is not PlayerSeat.SELF
+            and observation.cards
+            and _remaining_proves_play(
+                state, observation, confidence_threshold=self.confidence_threshold,
+            )
+        )
+        if (
+            self._invalid_play_evidence is not None
+            and self._invalid_play_evidence.count > 0
+        ) or opponent_candidate:
+            # Give an in-flight opponent action priority over rebuilding the
+            # same revision from its changed counter. Invalid ranks need fresh
+            # evidence, not an approximate round that bypasses the reducer.
+            # A reset counter keeps only the source watermark; it must not
+            # prevent stable recovery after a real action was missed entirely.
+            self._active_scan_stable = _StableValue()
+        elif hand_change is None:
             recovery = self._recover_drifted_state(scene, state)
             if recovery is not None:
                 return recovery
@@ -482,9 +695,12 @@ class VisualEventTracker:
                         )
                     return self._mark_uncertain(hand_change.error)
                 assert hand_change.cards is not None
-                opponent_cycle_complete = all(
-                    scene.seat(seat).signal is VisualSignal.PASS
-                    for seat in (PlayerSeat.RIGHT, PlayerSeat.LEFT)
+                opponent_cycle_complete = bool(
+                    self._self_turn_evidence is not None
+                    and self._self_turn_evidence.opponents_completed_cycle(
+                        state, scene,
+                        confidence_threshold=self.confidence_threshold,
+                    )
                 )
                 if (
                     scene.self_turn is True
@@ -498,9 +714,15 @@ class VisualEventTracker:
                     )
                     and not opponent_cycle_complete
                 ):
-                    recovery = self._recover_drifted_state(scene, state)
-                    if recovery is not None:
-                        return recovery
+                    # Persistent old PASS labels cannot prove a new cycle;
+                    # do not bypass that ambiguity through automatic rescan.
+                    if not all(
+                        scene.seat(seat).signal is VisualSignal.PASS
+                        for seat in (PlayerSeat.RIGHT, PlayerSeat.LEFT)
+                    ):
+                        recovery = self._recover_drifted_state(scene, state)
+                        if recovery is not None:
+                            return recovery
                     return _paused_visual_update(
                         state,
                         message=(
@@ -536,6 +758,21 @@ class VisualEventTracker:
             else state.next_player(expected)
         )
         assert pass_successor is not None
+        following_pass = _following_play_pass_evidence(
+            state, self._recent_scenes,
+            confidence_threshold=self.confidence_threshold,
+            stability_frames=self.stability_frames,
+            min_frame_id=self._actor_entry_frame_id,
+            terminal_armed=self._armed.get(state.trick_leader, False),
+            evidence_start_frame_id=self._scene_evidence_start_frame_id,
+        )
+        if _continues_following_play_pass(state) and following_pass is None:
+            # The first inferred pass does not authorize another one after
+            # the latest hand, count or following play stops being trustworthy.
+            return VisualTrackerUpdate(
+                mode=self.mode, message="等待后续出牌与完整手牌重新确认过牌链",
+                state=state, warnings=scene.warnings,
+            )
         buffered_successor_play = _buffered_play_evidence(
             state,
             pass_successor,
@@ -550,16 +787,34 @@ class VisualEventTracker:
             confidence_threshold=self.confidence_threshold,
             min_frame_id=self._actor_entry_frame_id,
         )
-        if _can_infer_pass(
+        if following_pass is not None or _can_infer_pass(
             state,
             scene,
             observation,
             confidence_threshold=self.confidence_threshold,
             stable_count=stable_count,
             stability_frames=self.stability_frames,
-            successor_action_armed=self._armed.get(pass_successor, False),
+            successor_action_armed=(
+                pass_successor in self._self_turn_evidence.fresh_passes
+                if self._self_turn_evidence is not None
+                else self._armed.get(pass_successor, False)
+            ),
             buffered_successor_play=buffered_successor_play is not None,
-            buffered_successor_pass=buffered_successor_pass is not None,
+            buffered_successor_pass=(
+                buffered_successor_pass is not None
+                and (
+                    self._self_turn_evidence is None
+                    or pass_successor in self._self_turn_evidence.fresh_passes
+                )
+            ),
+            self_turn_was_active=(
+                self._self_turn_evidence is not None
+                and self._self_turn_evidence.controls_seen
+            ),
+            fresh_self_pass=(
+                self._self_turn_evidence is not None
+                and PlayerSeat.SELF in self._self_turn_evidence.fresh_passes
+            ),
         ):
             event = ObservedAction(
                 event_id=(
@@ -569,10 +824,12 @@ class VisualEventTracker:
                 sequence_no=state.last_sequence_no + 1,
                 actor=expected,
                 cards=CardSet(()),
-                confidence=_inferred_pass_confidence(scene, observation),
-                source="live_turn_inferred_pass",
+                confidence=(following_pass[1] if following_pass is not None
+                            else _inferred_pass_confidence(scene, observation)),
+                source=(_FOLLOWING_PLAY_PASS_SOURCE if following_pass is not None
+                        else "live_turn_inferred_pass"),
             )
-            transition_evidence = (
+            transition_evidence = following_pass[0] if following_pass is not None else (
                 buffered_successor_play[0]
                 if buffered_successor_play is not None
                 else buffered_successor_pass
@@ -604,6 +861,13 @@ class VisualEventTracker:
             confidence_threshold=self.confidence_threshold,
         )
         if corroborated_confidence is not None:
+            if expected is not PlayerSeat.SELF and not _usable_play_evidence(
+                observation, self.confidence_threshold,
+            ):
+                return self._pause_invalid_opponent_play(
+                    scene, observation, "opponent play evidence is unavailable",
+                    source_frame_id=(buffered_evidence[0].frame_id if buffered_evidence else scene.frame_id),
+                )
             # A verified counter drop equal to the visible card count is an
             # independent second signal.  Waiting for three identical frames
             # here loses normal one-second table animations and makes the
@@ -621,6 +885,11 @@ class VisualEventTracker:
             try:
                 cards = observation.card_set
             except ValueError as exc:
+                if expected is not PlayerSeat.SELF:
+                    return self._pause_invalid_opponent_play(
+                        scene, observation, str(exc),
+                        source_frame_id=(buffered_evidence[0].frame_id if buffered_evidence else scene.frame_id),
+                    )
                 return self._mark_uncertain(
                     f"{expected.value} low-confidence cards are invalid: {exc}"
                 )
@@ -727,9 +996,22 @@ class VisualEventTracker:
                 state=state,
             )
 
-        cards = observation.card_set
+        try:
+            cards = observation.card_set
+        except ValueError as exc:
+            if expected is not PlayerSeat.SELF:
+                return self._pause_invalid_opponent_play(
+                    scene, observation, str(exc),
+                    source_frame_id=(buffered_evidence[0].frame_id if buffered_evidence else scene.frame_id),
+                )
+            return self._mark_uncertain(f"self cards are invalid: {exc}")
         confidence = _action_confidence(observation)
-        if confidence < self.confidence_threshold:
+        if not 0.0 <= confidence <= 1.0 or confidence < self.confidence_threshold:
+            if expected is not PlayerSeat.SELF and observation.cards:
+                return self._pause_invalid_opponent_play(
+                    scene, observation, "opponent play confidence is unavailable",
+                    source_frame_id=(buffered_evidence[0].frame_id if buffered_evidence else scene.frame_id),
+                )
             return self._mark_uncertain(
                 f"{expected.value} action confidence {confidence:.3f} is below "
                 f"{self.confidence_threshold:.3f}"
@@ -757,12 +1039,67 @@ class VisualEventTracker:
             ),
         )
 
+    def _pause_unknown_hand_geometry(
+        self,
+        scene: SceneObservation,
+        geometry_warnings: tuple[str, ...],
+    ) -> VisualTrackerUpdate:
+        # An unavailable crop is not a physical empty hand. Discard evidence
+        # spanning this gap without changing the reducer or guessing a play.
+        self._self_terminal_gate.discard_through(scene.frame_id)
+        self._recent_scenes.clear()
+        self._scene_evidence_start_frame_id = max(
+            scene.frame_id + 1,
+            self._scene_evidence_start_frame_id if self._scene_evidence_start_frame_id is not None
+            else scene.frame_id + 1,
+        )
+        self._invalid_play_evidence = None
+        self._self_turn_evidence = None
+        self._initial_stable = _StableValue()
+        self._auto_scan_stable = _StableValue()
+        self._active_scan_stable = _StableValue()
+        self._role_stable = _StableValue()
+        self._result_stable = _StableValue()
+        self._seat_stable = {seat: _StableValue() for seat in PlayerSeat}
+        self._armed = {seat: False for seat in PlayerSeat}
+        self._actor_entry_frame_id = scene.frame_id + 1
+        self._self_actor_entry_hand_count = None
+        state = self.state
+        self._self_actor_entry_frame_id = (
+            scene.frame_id + 1
+            if state is not None and state.current_actor is PlayerSeat.SELF
+            else None
+        )
+        message = "手牌几何暂不可用；已清除跨帧动作证据，等待可信画面恢复"
+        if state is not None and state.phase is not RoundPhase.FINISHED:
+            paused = _paused_visual_update(
+                state,
+                message=message,
+                warning=geometry_warnings[0],
+                scene_warnings=scene.warnings,
+            )
+            return replace(paused, mode=self.mode)
+        return VisualTrackerUpdate(
+            mode=self.mode,
+            message=message,
+            state=state,
+            warnings=scene.warnings,
+        )
+
     def scan_current_scene(
         self,
         scene: SceneObservation,
     ) -> VisualTrackerUpdate:
         """Build a safe approximate state from a user-requested current scan."""
 
+        self._self_terminal_gate.discard_through(scene.frame_id)
+
+        geometry_warnings = tuple(
+            warning for warning in scene.warnings
+            if warning.startswith("self_hand_geometry_unavailable:")
+        )
+        if geometry_warnings:
+            return self._pause_unknown_hand_geometry(scene, geometry_warnings)
         payload, error = _current_scan_payload(
             scene,
             confidence_threshold=self.confidence_threshold,
@@ -789,6 +1126,7 @@ class VisualEventTracker:
         *,
         automatic: bool,
     ) -> VisualTrackerUpdate:
+        self._self_terminal_gate.discard_through(scene.frame_id)
         prefix = "auto-scan" if automatic else "scan"
         round_id = f"{prefix}-{int(scene.timestamp * 1000)}"
         try:
@@ -825,6 +1163,7 @@ class VisualEventTracker:
             confidence_threshold=self.confidence_threshold,
         )
         self.mode = VisualTrackerMode.TRACKING
+        self._invalid_play_evidence = None
         self._uncertain_reason = None
         self._initial_stable = _StableValue()
         self._auto_scan_stable = _StableValue()
@@ -835,7 +1174,8 @@ class VisualEventTracker:
             seat: scene.seat(seat).signal is VisualSignal.NEUTRAL
             for seat in PlayerSeat
         }
-        self._recent_scenes = deque((scene,), maxlen=6)
+        self._recent_scenes = deque((scene,), maxlen=self._scene_buffer_capacity)
+        self._scene_evidence_start_frame_id = scene.frame_id
         self._actor_entry_frame_id = scene.frame_id
         self._self_actor_entry_hand_count = len(scene.self_hand)
         self._self_actor_entry_frame_id = scene.frame_id
@@ -948,6 +1288,36 @@ class VisualEventTracker:
         state = self._tracker.state
         expected = event.actor
         count_error = _remaining_count_error(state, observation, event)
+        if expected is not PlayerSeat.SELF and not event.is_pass:
+            # Metadata failures are not rank-recognition transients. Check
+            # them before the pure reducer so they retain the hard stop.
+            if (
+                state.phase is not RoundPhase.PLAYING
+                or expected is not state.current_actor
+                or observation.seat is not expected
+                or event.sequence_no != state.last_sequence_no + 1
+                or event.event_id in dict(state.processed_events)
+            ):
+                return self._mark_uncertain("visual event metadata conflicts with state", event=event)
+            error = count_error
+            if not _usable_play_evidence(observation, self.confidence_threshold):
+                error = error or "opponent play evidence is unavailable"
+            if error is None:
+                try:
+                    preview = reduce_observed_action(
+                        state, event, validator=validate_observed_action,
+                        confidence_threshold=self.confidence_threshold,
+                    )
+                except GameStateTransitionError as exc:
+                    error = str(exc)
+                else:
+                    if preview.status is not StateUpdateStatus.APPLIED:
+                        error = preview.message
+            if error is not None:
+                return self._pause_invalid_opponent_play(
+                    scene, observation, error,
+                    source_frame_id=(actor_transition_scene or scene).frame_id,
+                )
         if count_error is not None:
             return self._mark_uncertain(count_error, event=event)
 
@@ -959,6 +1329,8 @@ class VisualEventTracker:
             )
 
         self._armed[expected] = False
+        self._self_terminal_gate.reset()
+        self._invalid_play_evidence = None
         self._active_scan_stable = _StableValue()
         next_actor = result.state.current_actor
         transition_scene = actor_transition_scene or scene
@@ -1000,7 +1372,78 @@ class VisualEventTracker:
             warnings=result.warnings,
         )
 
+    def _pause_invalid_opponent_play(
+        self,
+        scene: SceneObservation,
+        observation: SeatObservation,
+        reason: str,
+        *,
+        source_frame_id: int,
+    ) -> VisualTrackerUpdate:
+        assert self._tracker is not None
+        state = self._tracker.state
+        context = (state.round_id, state.revision, state.current_actor)
+        evidence = self._invalid_play_evidence
+        if evidence is None or evidence.context != context:
+            evidence = _InvalidPlayEvidence(context)
+            self._invalid_play_evidence = evidence
+        fingerprint = _invalid_play_fingerprint(observation, self.confidence_threshold)
+        if source_frame_id > evidence.last_source_frame_id:
+            if _usable_play_evidence(observation, self.confidence_threshold):
+                evidence.count = evidence.count + 1 if evidence.fingerprint == fingerprint else 1
+                evidence.fingerprint = fingerprint
+            else:
+                evidence.count = 0
+                evidence.fingerprint = None
+            evidence.last_source_frame_id = source_frame_id
+        evidence.last_scene_frame_id = max(evidence.last_scene_frame_id, scene.frame_id)
+        self._active_scan_stable = _StableValue()
+        warning = f"transient_invalid_opponent_play: {observation.seat.value}: {reason}"
+        if evidence.count >= self.stability_frames:
+            return self._mark_uncertain(warning)
+        # event=None is essential: TRACKING + event is logged as an accepted
+        # action by the runtime, even when the returned state is paused.
+        return _paused_visual_update(
+            state,
+            message=(f"等待 {observation.seat.value} 非法候选视觉恢复 "
+                     f"{evidence.count}/{self.stability_frames}"),
+            warning=warning,
+            scene_warnings=scene.warnings,
+        )
+
+    def _handle_round_result(
+        self,
+        result: RoundResultObservation,
+    ) -> VisualTrackerUpdate:
+        state = self.state
+        completed_round_id = (
+            state.round_id
+            if state is not None and not self._result_overlay_active
+            else None
+        )
+        label = {
+            RoundResultOutcome.VICTORY: "胜利",
+            RoundResultOutcome.DEFEAT: "失败",
+            RoundResultOutcome.UNKNOWN: "牌局结束",
+        }[result.outcome]
+        self._clear_round()
+        # Preserve one confirmed sample after clearing the round. A still
+        # visible overlay remains recognized on the next frame, while a
+        # different outcome must again pass the two-frame gate.
+        self._result_stable.update(("round_result", result.outcome.value))
+        self._result_overlay_active = True
+        return VisualTrackerUpdate(
+            mode=VisualTrackerMode.WAITING_FOR_ROUND,
+            message=f"检测到结算界面：{label}；已结束当前牌局并等待下一局",
+            state=None,
+            warnings=(),
+            round_result=result,
+            completed_round_id=completed_round_id,
+        )
+
     def handle_window_unavailable(self, reason: str) -> VisualTrackerUpdate:
+        self._self_terminal_gate.reset()
+        self._invalid_play_evidence = None
         if self._tracker is not None and self.mode is VisualTrackerMode.TRACKING:
             return self._mark_uncertain(
                 f"{reason}；可能漏过场上事件，等待下一局完整初始化"
@@ -1013,6 +1456,8 @@ class VisualEventTracker:
         )
 
     def _clear_round(self) -> None:
+        self._self_terminal_gate.reset()
+        self._invalid_play_evidence = None
         self._tracker = None
         self.mode = VisualTrackerMode.WAITING_FOR_ROUND
         self._uncertain_reason = None
@@ -1021,8 +1466,11 @@ class VisualEventTracker:
         self._active_scan_stable = _StableValue()
         self._role_stable = _StableValue()
         self._seat_stable = {seat: _StableValue() for seat in PlayerSeat}
+        self._result_stable = _StableValue()
         self._armed = {seat: False for seat in PlayerSeat}
-        self._recent_scenes = deque(maxlen=6)
+        self._recent_scenes = deque(maxlen=self._scene_buffer_capacity)
+        self._scene_evidence_start_frame_id = None
+        self._self_turn_evidence = None
         self._actor_entry_frame_id = None
         self._self_actor_entry_hand_count = None
         self._self_actor_entry_frame_id = None
@@ -1032,6 +1480,7 @@ class VisualEventTracker:
         scene: SceneObservation,
         initial: _InitialStatePayload,
     ) -> VisualTrackerUpdate:
+        self._self_terminal_gate.discard_through(scene.frame_id)
         round_id = self.round_id_factory(scene)
         try:
             state = ObservableGameState.from_inputs(
@@ -1074,6 +1523,7 @@ class VisualEventTracker:
                 )
             state = result.state
         self._tracker = tracker
+        self._invalid_play_evidence = None
         self.mode = VisualTrackerMode.TRACKING
         self._uncertain_reason = None
         self._auto_scan_stable = _StableValue()
@@ -1084,7 +1534,8 @@ class VisualEventTracker:
             seat: scene.seat(seat).signal is VisualSignal.NEUTRAL
             for seat in PlayerSeat
         }
-        self._recent_scenes = deque((scene,), maxlen=6)
+        self._recent_scenes = deque((scene,), maxlen=self._scene_buffer_capacity)
+        self._scene_evidence_start_frame_id = scene.frame_id
         self._actor_entry_frame_id = scene.frame_id
         self._self_actor_entry_hand_count = (
             len(scene.self_hand)
@@ -1113,6 +1564,8 @@ class VisualEventTracker:
         *,
         event: ObservedAction | None = None,
     ) -> VisualTrackerUpdate:
+        self._self_terminal_gate.reset()
+        self._invalid_play_evidence = None
         self.mode = VisualTrackerMode.UNCERTAIN
         self._uncertain_reason = reason
         return VisualTrackerUpdate(
@@ -1529,6 +1982,23 @@ def _current_scan_payload(
         right,
         confidence_threshold=confidence_threshold,
     )
+
+    def clear_confidence(observation: SeatObservation) -> float | None:
+        # An unresolved candidate (including an empty UNKNOWN) is not proof
+        # that this seat has no current play. Keep supported UNKNOWN targets.
+        if observation.cards:
+            return None
+        if observation.signal is VisualSignal.NEUTRAL:
+            value = observation.confidence
+        elif observation.signal is VisualSignal.PASS:
+            value = observation.pass_confidence
+        else:
+            return None
+        # The closed range also rejects NaN and either infinity.
+        if not 0.0 <= value <= 1.0 or value < confidence_threshold:
+            return None
+        return value
+
     if left_play_confidence is not None:
         trick_target = tuple(card.rank for card in left.cards)
         trick_leader = PlayerSeat.LEFT
@@ -1538,9 +2008,13 @@ def _current_scan_payload(
                 "current_scan_accepted_left_play_from_verified_remaining"
             )
     elif right_play_confidence is not None:
+        left_clear_confidence = clear_confidence(left)
+        if left_clear_confidence is None:
+            return None, "left 场上牌尚未确认为空或不出，不能推断已过牌"
         trick_target = tuple(card.rank for card in right.cards)
         trick_leader = PlayerSeat.RIGHT
         consecutive_passes = 1
+        confidence_values.append(left_clear_confidence)
         confidence_values.append(right_play_confidence)
         if right.signal is VisualSignal.UNKNOWN:
             inference_warnings.append(
@@ -1550,6 +2024,14 @@ def _current_scan_payload(
             "manual_scan_inferred_left_pass_after_right_play"
         )
     else:
+        for observation in (left, right):
+            evidence_confidence = clear_confidence(observation)
+            if evidence_confidence is None:
+                return None, (
+                    f"{observation.seat.value} 场上牌尚未确认为空或不出，"
+                    "不能确认自由出牌"
+                )
+            confidence_values.append(evidence_confidence)
         inference_warnings.append(
             "manual_scan_assumed_free_lead_no_visible_opponent_play"
         )
@@ -1689,52 +2171,8 @@ def _opening_state_payload(
     )
 
 
-def _stable_hand_confidence(
-    cards: Sequence[VisualCard],
-    *,
-    confidence_threshold: float,
-) -> tuple[float, tuple[str, ...]]:
-    values = sorted(card.confidence for card in cards)
-    if not values:
-        return 0.0, ()
-    below = [card for card in cards if card.confidence < confidence_threshold]
-    if not below:
-        return values[0], ()
-    outlier_floor = max(0.55, confidence_threshold - 0.15)
-    if (
-        len(below) == 1
-        and below[0].confidence >= outlier_floor
-        and len(values) >= 2
-    ):
-        warning = (
-            f"accepted_single_hand_confidence_outlier:"
-            f"{below[0].rank}={below[0].confidence:.3f}"
-        )
-        return values[1], (warning,)
-    return values[0], ()
 
 
-def _initial_observation_confidence(
-    scene: SceneObservation,
-    *,
-    hand_confidence: float,
-    include_action: SeatObservation | None,
-) -> float:
-    confidences = [
-        hand_confidence,
-        *(seat.role_confidence for seat in scene.seats),
-    ]
-    for seat in scene.seats:
-        if seat.seat is PlayerSeat.SELF:
-            continue
-        if seat.remaining_count is not None:
-            confidences.append(seat.remaining_confidence)
-    if include_action is not None:
-        confidences.append(_action_confidence(include_action))
-    if scene.self_turn is not None:
-        confidences.append(scene.self_turn_confidence)
-    positive = [value for value in confidences if value > 0]
-    return min(positive) if positive else 0.0
 
 
 def _initialization_message(
@@ -1753,18 +2191,103 @@ def _initialization_message(
     )
 
 
-def _seat_fingerprint(
-    observation: SeatObservation,
+
+
+def _self_hand_evidence_key(
+    state: ObservableGameState,
+    scene: SceneObservation,
+    change: _SelfHandChange,
     *,
-    self_hand: Sequence[VisualCard] = (),
-    self_turn: bool | None = None,
+    confidence_threshold: float,
+    min_frame_id: int | None,
 ) -> tuple[object, ...]:
+    assert change.cards is not None and change.error is None
+    post_hand = Counter(state.self_hand.cards) - Counter(change.cards.cards)
     return (
-        observation.signal.value,
-        tuple(card.rank for card in observation.cards),
-        tuple(card.rank for card in self_hand),
-        self_turn,
+        state.round_id,
+        state.revision,
+        state.current_actor,
+        min_frame_id,
+        state.self_hand.cards,
+        change.cards.cards,
+        CardSet.parse(post_hand.elements()).cards,
+        len(scene.self_hand),
+        # Every physical slot participates, including low-confidence slots.
+        # Compare confidence eligibility, not jittering floating-point values;
+        # _self_hand_change still enforces the existing aggregate/outlier rule.
+        tuple(
+            (card.rank, card.confidence >= confidence_threshold)
+            for card in scene.self_hand
+        ),
+        scene.seat(PlayerSeat.SELF).signal,
+        tuple(card.rank for card in scene.seat(PlayerSeat.SELF).cards),
+        scene.self_turn,
+        scene.self_turn_confidence >= confidence_threshold,
     )
+
+
+def _current_self_hand_evidence(
+    state: ObservableGameState,
+    latest: SceneObservation,
+    latest_change: _SelfHandChange,
+    recent_scenes: Sequence[SceneObservation],
+    *,
+    confidence_threshold: float,
+    min_frame_id: int | None,
+) -> tuple[SceneObservation, int]:
+    """Count the contiguous matching suffix, anchored to a valid latest hand.
+
+    Historical evidence is usable only for this exact current interpretation.
+    A restored slot, changed rank, ineligible frame or actor boundary breaks
+    the suffix. The latest action and confidence are never replaced.
+    """
+    expected_key = _self_hand_evidence_key(
+        state, latest, latest_change,
+        confidence_threshold=confidence_threshold,
+        min_frame_id=min_frame_id,
+    )
+    evidence_scene = latest
+    support_count = 0
+    seen_frame_ids: set[int] = set()
+    successor = state.next_player(PlayerSeat.SELF)
+    for candidate in reversed(recent_scenes):
+        if min_frame_id is not None and candidate.frame_id < min_frame_id:
+            break
+        if candidate.frame_id in seen_frame_ids:
+            continue
+        seen_frame_ids.add(candidate.frame_id)
+        change = (
+            latest_change
+            if candidate is latest
+            else _self_hand_change(
+                state, candidate,
+                confidence_threshold=confidence_threshold,
+            )
+        )
+        if change is None or change.error is not None:
+            break
+        candidate_key = _self_hand_evidence_key(
+            state, candidate, change,
+            confidence_threshold=confidence_threshold,
+            min_frame_id=min_frame_id,
+        )
+        if candidate_key != expected_key:
+            break
+        support_count += 1
+        # Preserve short-lived successor-play corroboration, but only after
+        # matching the entire post-hand evidence to the current scene.
+        if (
+            not _remaining_proves_play(
+                state, evidence_scene.seat(successor),
+                confidence_threshold=confidence_threshold,
+            )
+            and _remaining_proves_play(
+                state, candidate.seat(successor),
+                confidence_threshold=confidence_threshold,
+            )
+        ):
+            evidence_scene = candidate
+    return evidence_scene, support_count
 
 
 def _self_hand_change(
@@ -1912,6 +2435,36 @@ def _infer_self_play_from_legal_actions(
     ):
         return None
     return best[0]
+
+
+def _invalid_play_fingerprint(
+    observation: SeatObservation, confidence_threshold: float,
+) -> tuple[object, ...]:
+    return (
+        observation.seat,
+        observation.signal,
+        tuple(sorted(card.rank for card in observation.cards)),
+        observation.remaining_count,
+        observation.remaining_verified,
+        0.0 <= observation.remaining_confidence <= 1.0
+        and observation.remaining_confidence >= confidence_threshold,
+    )
+
+
+def _usable_play_evidence(observation: SeatObservation, threshold: float) -> bool:
+    if not observation.cards or observation.signal not in (VisualSignal.PLAY, VisualSignal.UNKNOWN):
+        return False
+    scores = (observation.confidence, *(card.confidence for card in observation.cards))
+    if any(not 0.0 <= score <= 1.0 for score in scores):
+        return False
+    if observation.signal is VisualSignal.UNKNOWN:
+        return (
+            min(scores) >= max(0.55, threshold - 0.05)
+            and observation.remaining_verified
+            and 0.0 <= observation.remaining_confidence <= 1.0
+            and observation.remaining_confidence >= threshold
+        )
+    return min(card.confidence for card in observation.cards) >= threshold
 
 
 def _remaining_confirms_play(
@@ -2118,6 +2671,157 @@ def _remaining_disproves_play(
     )
 
 
+def _continues_following_play_pass(state: ObservableGameState) -> bool:
+    return bool(
+        state.current_actor is PlayerSeat.SELF
+        and state.consecutive_passes == 1
+        and state.history
+        and state.history[-1].source == _FOLLOWING_PLAY_PASS_SOURCE
+    )
+
+
+def _following_play_pass_evidence(
+    state: ObservableGameState,
+    scenes: Sequence[SceneObservation],
+    *,
+    confidence_threshold: float,
+    stability_frames: int,
+    min_frame_id: int | None,
+    terminal_armed: bool,
+    evidence_start_frame_id: int | None = None,
+) -> tuple[SceneObservation, float] | None:
+    """Prove the missing opponent -> self passes from a new leader play.
+
+    Use only a fresh, contiguous suffix after the actor/geometry watermark.
+    Preflight the entire chain before emitting its first event; never borrow
+    a control hint, stale PASS label or a state-derived visual zero.
+    """
+    continuing = _continues_following_play_pass(state)
+    if (
+        state.phase is not RoundPhase.PLAYING
+        or not state.trick_target
+        or state.trick_leader in {None, PlayerSeat.SELF}
+        or not (
+            (state.consecutive_passes == 0
+             and state.current_actor is not PlayerSeat.SELF
+             and state.next_player(state.current_actor) is PlayerSeat.SELF)
+            or continuing
+        )
+    ):
+        return None
+    if continuing and (
+        state.history[-1].sequence_no != state.last_sequence_no
+        or state.history[-1].event_id
+        != f"{state.round_id}:{state.last_sequence_no}:{state.history[-1].actor.value}"
+    ):
+        return None
+    following = state.trick_leader
+    passing_opponent = state.next_player(following)
+    if state.next_player(passing_opponent) is not PlayerSeat.SELF:
+        return None
+    recent = list(scenes)[-stability_frames:]
+    if len(recent) < stability_frames:
+        return None
+    if continuing and min_frame_id is not None and recent[-1].frame_id <= min_frame_id:
+        return None
+    # The legacy armed bit accepts any neutral signal. This stricter terminal
+    # proof needs an actually trusted blank/counter before the new card group.
+    terminal_blank_confidence = max((
+        min(item.seat(following).confidence, item.seat(following).remaining_confidence)
+        for item in scenes
+        if item.frame_id < recent[0].frame_id
+        and (evidence_start_frame_id is None or item.frame_id >= evidence_start_frame_id)
+        and item.seat(following).signal is VisualSignal.NEUTRAL
+        and not item.seat(following).cards
+        and confidence_threshold <= item.seat(following).confidence <= 1.0
+        and item.seat(following).remaining_verified
+        and item.seat(following).remaining_count == state.remaining_for(following)
+        and confidence_threshold <= item.seat(following).remaining_confidence <= 1.0
+    ), default=0.0)
+    confidence = 1.0
+    previous_frame: int | None = None
+    candidate: CardSet | None = None
+    for scene in recent:
+        if (
+            (min_frame_id is not None and scene.frame_id < min_frame_id)
+            or (evidence_start_frame_id is not None and scene.frame_id < evidence_start_frame_id)
+            or (previous_frame is not None and scene.frame_id <= previous_frame)
+            or scene.self_turn is True
+            or scene.round_result is not None
+            or any(warning.startswith("self_hand_geometry_unavailable:") for warning in scene.warnings)
+            or not all(confidence_threshold <= seat.role_confidence <= 1.0 for seat in scene.seats)
+            or _observed_landlord(scene, confidence_threshold=confidence_threshold) is not state.landlord
+            or not all(0.0 <= card.confidence <= 1.0 for card in scene.self_hand)
+            or not scene.seat(PlayerSeat.SELF).remaining_verified
+            or scene.seat(PlayerSeat.SELF).remaining_count != len(state.self_hand)
+        ):
+            return None
+        previous_frame = scene.frame_id
+        hand_confidence, _ = _stable_hand_confidence(
+            scene.self_hand, confidence_threshold=confidence_threshold,
+        )
+        try:
+            if scene.self_hand_set != state.self_hand or hand_confidence < confidence_threshold:
+                return None
+            play = scene.seat(following)
+            cards = play.card_set
+        except ValueError:
+            return None
+        opponent = scene.seat(passing_opponent)
+        if (
+            opponent.signal not in {VisualSignal.NEUTRAL, VisualSignal.PASS}
+            or opponent.cards
+            or not opponent.remaining_verified
+            or opponent.remaining_count != state.remaining_for(passing_opponent)
+            or not confidence_threshold <= opponent.remaining_confidence <= 1.0
+            or not confidence_threshold <= _action_confidence(opponent) <= 1.0
+            or scene.seat(PlayerSeat.SELF).cards
+            or play.signal is not VisualSignal.PLAY
+            or not cards
+            or not all(confidence_threshold <= card.confidence <= 1.0 for card in play.cards)
+            or (candidate is not None and cards != candidate)
+        ):
+            return None
+        count_proven = bool(
+            _remaining_confirms_play(state, play)
+            and confidence_threshold <= play.remaining_confidence <= 1.0
+        )
+        terminal_proven = bool(
+            terminal_armed and terminal_blank_confidence >= confidence_threshold
+            and _terminal_play_confirms_round(state, play)
+        )
+        if not count_proven and not terminal_proven:
+            return None
+        candidate = cards
+        confidence = min(confidence, hand_confidence, opponent.remaining_confidence,
+                         _action_confidence(opponent), _action_confidence(play),
+                         play.remaining_confidence if count_proven else terminal_blank_confidence,
+                         *(seat.role_confidence for seat in scene.seats))
+    assert candidate is not None
+    preview = state
+    # Reuse the real reducer for sequence, deck conservation and legal lead.
+    # No mutable tracker/pending queue is involved in this preflight.
+    for cards in ([CardSet(())] if continuing else [CardSet(()), CardSet(())]) + [candidate]:
+        event = ObservedAction(
+            event_id=f"{preview.round_id}:{preview.last_sequence_no + 1}:{preview.current_actor.value}",
+            sequence_no=preview.last_sequence_no + 1, actor=preview.current_actor,
+            cards=cards, confidence=confidence, source=_FOLLOWING_PLAY_PASS_SOURCE,
+        )
+        try:
+            result = reduce_observed_action(
+                preview, event, validator=validate_observed_action,
+                confidence_threshold=confidence_threshold,
+            )
+        except ValueError:
+            return None
+        if result.status is not StateUpdateStatus.APPLIED:
+            return None
+        preview = result.state
+    # Advancing the actor at the actual commit frame prevents a replayed
+    # pre-commit suffix from authorizing the second pass a second time.
+    return recent[-1], confidence
+
+
 def _can_infer_pass(
     state: ObservableGameState,
     scene: SceneObservation,
@@ -2129,6 +2833,8 @@ def _can_infer_pass(
     successor_action_armed: bool = False,
     buffered_successor_play: bool = False,
     buffered_successor_pass: bool = False,
+    self_turn_was_active: bool = False,
+    fresh_self_pass: bool = False,
 ) -> bool:
     # A visible card group always gets the first opportunity to become a play.
     # The self-turn indicator describes the end of the whole opponent cycle;
@@ -2200,6 +2906,7 @@ def _can_infer_pass(
                 )
             )
         )
+        exact_hand = False
         try:
             exact_hand = scene.self_hand_set == state.self_hand
             same_physical_count = len(scene.self_hand) == len(state.self_hand)
@@ -2220,16 +2927,23 @@ def _can_infer_pass(
                 or successor_pass_proves_pass
             ):
                 return False
-        # The local client does not always keep a visible "不出" label for
-        # our own seat. A stable disappearance of the turn controls while the
-        # complete hand remains unchanged proves a pass. self_turn participates
-        # in the seat fingerprint, so a single missed-control frame cannot use
-        # stability accumulated before the UI transition.
+        hand_confidence, _ = _stable_hand_confidence(
+            scene.self_hand, confidence_threshold=confidence_threshold,
+        )
+        # Continuous absence does not prove disappearance. Require controls
+        # observed in this actor epoch (or a fresh explicit self-pass edge),
+        # plus a stable inactive hint and a trustworthy unchanged whole hand.
+        # A strict successor action remains independent corroborating evidence.
         if (
             scene.self_turn is False
             and scene.self_turn_confidence >= confidence_threshold
             and (
-                stable_count >= stability_frames
+                (
+                    stable_count >= stability_frames
+                    and (self_turn_was_active or fresh_self_pass)
+                    and exact_hand
+                    and hand_confidence >= confidence_threshold
+                )
                 or successor_play_proves_pass
                 or successor_pass_proves_pass
             )
@@ -2312,15 +3026,6 @@ def _inferred_pass_confidence(
     return min(value for value in confidences if value > 0)
 
 
-def _action_confidence(observation: SeatObservation) -> float:
-    if observation.signal is VisualSignal.PASS:
-        return observation.pass_confidence
-    if observation.signal is VisualSignal.PLAY:
-        return min(
-            (card.confidence for card in observation.cards),
-            default=observation.confidence,
-        )
-    return observation.confidence
 
 
 def _remaining_count_error(
