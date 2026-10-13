@@ -50,6 +50,10 @@ from src.vision.scene_recognizer import (
     VisualSignal,
 )
 
+# Async decisions complete in a few ms locally, but CI runners under coverage
+# can take far longer. Poll generously; every loop breaks as soon as it succeeds.
+_DECISION_POLL_ATTEMPTS = 500
+
 
 def test_overlay_condenses_midgame_approximation_warnings() -> None:
     text, color = _format_state_warnings(
@@ -702,7 +706,7 @@ def test_live_runtime_schedules_and_logs_revision_scoped_decision(
         first = runtime.run_once()
         assert first.decision_pending or first.decision is None
         snapshot = first
-        for _ in range(20):
+        for _ in range(_DECISION_POLL_ATTEMPTS):
             time.sleep(0.01)
             snapshot = runtime.run_once()
             if snapshot.decision is not None:
@@ -765,7 +769,7 @@ def test_live_runtime_blocks_bad_hand_recommendation_then_recovers(
         assert all(snapshot.decision is None for snapshot in blocked_snapshots)
         recognizer.hand = phase4_ready_state.self_hand.cards
         recovered = runtime.run_once()
-        for _ in range(20):
+        for _ in range(_DECISION_POLL_ATTEMPTS):
             if recovered.decision is not None:
                 break
             time.sleep(0.01)
@@ -825,7 +829,7 @@ def test_live_runtime_rejects_impossible_decision_action(
     events: list[dict[str, object]] = []
     snapshots = []
     try:
-        for _ in range(20):
+        for _ in range(_DECISION_POLL_ATTEMPTS):
             snapshots.append(runtime.run_once())
             events = [
                 json.loads(line)
@@ -1228,7 +1232,7 @@ def test_live_runtime_bootstraps_after_switching_to_post_bidding_table(
         stabilizing = runtime.run_once()
         initialized = runtime.run_once()
         decided = initialized
-        for _ in range(20):
+        for _ in range(_DECISION_POLL_ATTEMPTS):
             time.sleep(0.01)
             decided = runtime.run_once()
             if decided.decision is not None:

@@ -68,6 +68,8 @@ jobs:
             requirements-core.txt
             requirements-vision.txt
             requirements-dev.txt
+      - name: Install ffmpeg for lossless recording tests
+        run: sudo apt-get update && sudo apt-get install -y --no-install-recommends ffmpeg
       - name: Install full development dependencies
         run: python -m pip install -r requirements-dev.txt
       - name: Run shared quality gate

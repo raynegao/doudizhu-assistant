@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import hashlib
 import json
+import shutil
 import time
 from contextlib import contextmanager
 from pathlib import Path
@@ -60,6 +61,11 @@ def test_implementation_fingerprint_covers_bundled_visual_evidence(tmp_path: Pat
     assert created != before
     asset.write_text('{"outcomes": {"victory": []}}')
     assert sha256_python_implementation(tmp_path) != created
+
+
+requires_ffmpeg = pytest.mark.skipif(
+    shutil.which("ffmpeg") is None, reason="requires real ffmpeg"
+)
 
 
 def _write_jsonl(path: Path, rows: list[dict[str, object]]) -> None:
@@ -220,6 +226,7 @@ def test_live_recorder_writes_complete_integrity_chain(
     assert inspection.metadata["evidence_split"] == "development"
 
 
+@requires_ffmpeg
 def test_recorder_capture_continues_while_first_hash_is_blocked(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
 ) -> None:
@@ -310,6 +317,7 @@ def test_queue_backpressure_stops_capture_and_retains_all_accepted_frames(
 
 
 @pytest.mark.parametrize("failure_stage", ["hash", "manifest-open", "capture-close", "seal"])
+@requires_ffmpeg
 def test_recorder_failure_still_closes_capture_and_records_failed_state(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch, failure_stage: str,
 ) -> None:
@@ -366,6 +374,7 @@ def test_recorder_failure_still_closes_capture_and_records_failed_state(
         assert metadata["frame_storage"]["segments"][0]["frame_count"] == 1
 
 
+@requires_ffmpeg
 def test_acceptance_recorder_uses_exact_lossless_video_frames(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
@@ -415,6 +424,7 @@ def test_acceptance_recorder_uses_exact_lossless_video_frames(
 
 
 @pytest.mark.parametrize("change", ["interval", "implementation", "encoder", "recording", "failed"])
+@requires_ffmpeg
 def test_resume_rejects_changed_seals_or_unsafe_state_without_modifying_evidence(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch, change: str,
 ) -> None:
@@ -506,6 +516,7 @@ def test_broken_stdout_does_not_change_committed_frame_counts(
     assert diagnostics["unwritten_frames"] == 0
 
 
+@requires_ffmpeg
 def test_failed_manifest_flush_is_not_counted_as_success_or_finalized(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
 ) -> None:
@@ -555,6 +566,7 @@ def test_failed_manifest_flush_is_not_counted_as_success_or_finalized(
 
 
 @pytest.mark.parametrize("capture_fails", [True, False])
+@requires_ffmpeg
 def test_stop_during_capture_does_not_reject_partial_unaccepted_frame(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capture_fails: bool,
 ) -> None:
@@ -591,6 +603,7 @@ def test_stop_during_capture_does_not_reject_partial_unaccepted_frame(
     assert capture.closed
 
 
+@requires_ffmpeg
 def test_acceptance_lossless_video_detects_container_tampering(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
@@ -661,6 +674,7 @@ def test_live_recorder_persists_interrupted_progress(
     assert inspection.metadata["complete_game"] is False
 
 
+@requires_ffmpeg
 def test_acceptance_recorder_resumes_into_a_new_lossless_segment(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
@@ -714,6 +728,7 @@ def test_acceptance_recorder_resumes_into_a_new_lossless_segment(
     ] == [0, 1, 0, 1]
 
 
+@requires_ffmpeg
 def test_acceptance_recorder_defaults_to_ten_fps_gate(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
@@ -748,6 +763,7 @@ def test_acceptance_recorder_defaults_to_ten_fps_gate(
     assert inspection.metadata["capture_cadence"]["effective_fps"] >= 9.0
 
 
+@requires_ffmpeg
 def test_acceptance_recorder_refuses_fallback_capture(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
@@ -786,6 +802,7 @@ def test_acceptance_recorder_refuses_fallback_capture(
     assert metadata["complete_game"] is False
 
 
+@requires_ffmpeg
 def test_acceptance_integrity_rejects_slow_capture_cadence(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
@@ -932,6 +949,7 @@ def test_live_replay_uses_snapshot_and_writes_provenance(
         ])
 
 
+@requires_ffmpeg
 def test_acceptance_replay_requires_blind_annotation_seal(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
