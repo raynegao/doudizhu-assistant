@@ -1,0 +1,30 @@
+{
+  "schema_version": "phase6-live-fixed-issues-v1",
+  "version": 1,
+  "issues": [
+    {
+      "signature": "live:right-remaining-count-mismatch:e6446a89d4f833d6",
+      "fixed_in_registry_version": 1,
+      "fixed_in_runtime_version": "phase6-live-v1",
+      "note": "opponent vertical wrap segmentation"
+    },
+    {
+      "signature": "live:round-result-overlay-not-detected:a831625122579928",
+      "fixed_in_registry_version": 1,
+      "fixed_in_runtime_version": "phase6-live-v1",
+      "note": "visual result overlay recovery"
+    },
+    {
+      "signature": "live:decision-thread-gil-capture-stall:74db3f8cfad8fad6",
+      "fixed_in_registry_version": 1,
+      "fixed_in_runtime_version": "phase6-live-v1",
+      "note": "spawned decision worker"
+    },
+    {
+      "signature": "live:control-asset-scoring-misclassified:d6be91c6124d60d5",
+      "fixed_in_registry_version": 1,
+      "fixed_in_runtime_version": "phase6-live-v1",
+      "note": "residual control asset scoring"
+    }
+  ]
+}

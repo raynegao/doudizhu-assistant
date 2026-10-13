@@ -32,7 +32,7 @@ on run argv
       repeat with terminalTab in tabs of terminalWindow
         if (tty of terminalTab) is not targetTTY and not (busy of terminalTab) then
           set terminalHistory to history of terminalTab
-          if terminalHistory contains "助手可以先启动并等待斗地主窗口。" then
+          if terminalHistory contains "助手可以先启动并等待斗地主窗口。" or terminalHistory contains "小窗默认不扫描；点击“开始扫描”后才会读取斗地主窗口。" then
             set end of staleLauncherTTYs to tty of terminalTab
           end if
         end if
@@ -182,9 +182,9 @@ cd "$PROJECT_DIR" || {
 clear
 print -n $'\e]0;斗地主助手启动器\a'
 print "正在启动斗地主助手..."
-print "助手可以先启动并等待斗地主窗口。"
+print "小窗默认不扫描；点击“开始扫描”后才会读取斗地主窗口。"
 print "启动成功后，本终端窗口会自动关闭。"
-print "关闭左侧助手小窗即可停止运行。"
+print "点击“结束扫描”可停止读取屏幕；关闭小窗可退出助手。"
 print ""
 
 /usr/bin/nohup "$PYTHON_PATH" -m scripts.run_live_assistant \
@@ -202,5 +202,5 @@ if ! kill -0 "$assistant_pid" >/dev/null 2>&1; then
   exit 1
 fi
 /usr/bin/osascript -e \
-  'display notification "实时识别小窗已经启动" with title "斗地主助手"'
+  'display notification "助手小窗已启动，当前尚未扫描" with title "斗地主助手"'
 exit 0

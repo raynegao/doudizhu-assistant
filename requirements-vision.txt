@@ -1,5 +1,7 @@
 Pillow>=10.0.0,<13.0.0
-numpy>=1.26.0,<3.0.0
+# NumPy 2.5+ type stubs use Python 3.12-only syntax, while Mypy intentionally
+# checks this project against its Python 3.10 compatibility floor.
+numpy>=1.26.0,<2.5.0
 torch>=2.2.0,<3.0.0
 onnx>=1.15.0,<2.0.0
 onnxruntime>=1.17.0,<2.0.0

@@ -1,11 +1,12 @@
 from __future__ import annotations
 
-import json
 import math
 import re
 from collections import Counter
 from collections.abc import Iterable
 from pathlib import Path
+
+from src.reporting.live_log_reader import iter_live_log_records, list_live_log_sources
 
 
 def analyze_live_log(path: Path) -> dict[str, object]:
@@ -26,61 +27,67 @@ def analyze_live_log(path: Path) -> dict[str, object]:
     manual_scan_successes = 0
     line_count = 0
 
-    with path.open("r", encoding="utf-8") as source:
-        for line_number, line in enumerate(source, start=1):
-            if not line.strip():
-                continue
-            payload = json.loads(line)
-            if not isinstance(payload, dict):
-                raise ValueError(f"{path}:{line_number} must be a JSON object")
-            line_count += 1
-            event = str(payload.get("event", "<missing>"))
-            event_counts[event] += 1
-            round_id = payload.get("round_id")
-            if round_id is not None:
-                round_ids.add(str(round_id))
-                if event in {"play_observed", "pass_observed"}:
-                    action_round_ids.add(str(round_id))
-                elif event == "live_decision":
-                    decision_round_ids.add(str(round_id))
-                elif event == "round_result_detected":
-                    completed_round_ids.add(str(round_id))
-            if event == "manual_current_scan":
-                manual_scan_attempts += 1
-                manual_scan_successes += int(payload.get("success") is True)
-            mode = payload.get("tracker_mode") or payload.get("mode")
-            if mode is not None:
-                tracker_modes[str(mode)] += 1
-            window_status = payload.get("window_status") or payload.get("status")
-            if window_status is not None and event in {
-                "live_runtime_snapshot",
-                "live_window_status",
-            }:
-                window_statuses[str(window_status)] += 1
-            _append_number(capture_latencies, payload.get("capture_latency_ms"))
-            _append_number(total_latencies, payload.get("total_latency_ms"))
-            timestamp = payload.get("timestamp")
-            if isinstance(timestamp, (int, float)) and math.isfinite(timestamp):
-                first_timestamp = (
-                    float(timestamp)
-                    if first_timestamp is None
-                    else min(first_timestamp, float(timestamp))
-                )
-                last_timestamp = (
-                    float(timestamp)
-                    if last_timestamp is None
-                    else max(last_timestamp, float(timestamp))
-                )
-            warnings = payload.get("warnings", [])
-            if isinstance(warnings, list):
-                for warning in warnings:
-                    value = str(warning)
-                    warning_counts[value] += 1
-                    warning_categories[categorize_live_warning(value)] += 1
+    sources = list_live_log_sources(path)
+    if not sources:
+        raise FileNotFoundError(f"no retained live log slices: {path}")
+    source_counts: Counter[str] = Counter()
+    for record in iter_live_log_records(sources):
+        payload = record.payload
+        source_counts[record.source.as_posix()] += 1
+        line_count += 1
+        event = str(payload.get("event", "<missing>"))
+        event_counts[event] += 1
+        round_id = payload.get("round_id")
+        if round_id is not None:
+            round_ids.add(str(round_id))
+            if event in {"play_observed", "pass_observed"}:
+                action_round_ids.add(str(round_id))
+            elif event == "live_decision":
+                decision_round_ids.add(str(round_id))
+            elif event == "round_result_detected":
+                completed_round_ids.add(str(round_id))
+        if event == "manual_current_scan":
+            manual_scan_attempts += 1
+            manual_scan_successes += int(payload.get("success") is True)
+        mode = payload.get("tracker_mode") or payload.get("mode")
+        if mode is not None:
+            tracker_modes[str(mode)] += 1
+        window_status = payload.get("window_status") or payload.get("status")
+        if window_status is not None and event in {
+            "live_runtime_snapshot",
+            "live_window_status",
+        }:
+            window_statuses[str(window_status)] += 1
+        _append_number(capture_latencies, payload.get("capture_latency_ms"))
+        _append_number(total_latencies, payload.get("total_latency_ms"))
+        timestamp = payload.get("timestamp")
+        if isinstance(timestamp, (int, float)) and math.isfinite(timestamp):
+            first_timestamp = (
+                float(timestamp)
+                if first_timestamp is None
+                else min(first_timestamp, float(timestamp))
+            )
+            last_timestamp = (
+                float(timestamp)
+                if last_timestamp is None
+                else max(last_timestamp, float(timestamp))
+            )
+        warnings = payload.get("warnings", [])
+        if isinstance(warnings, list):
+            for warning in warnings:
+                value = str(warning)
+                warning_counts[value] += 1
+                warning_categories[categorize_live_warning(value)] += 1
 
     return {
         "schema_version": "phase6-live-log-diagnostics-v1",
         "source": path.as_posix(),
+        "sources": [
+            {"path": source.path.as_posix(), "line_count": source_counts[source.path.as_posix()]}
+            for source in sources
+        ],
+        "history_scope": "retained_log_slices_only",
+        "history_known_pruned": event_counts["live_log_history_pruned"] > 0,
         "line_count": line_count,
         "first_timestamp": first_timestamp,
         "last_timestamp": last_timestamp,

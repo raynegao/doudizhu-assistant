@@ -70,22 +70,28 @@ jobs:
             requirements-dev.txt
       - name: Install full development dependencies
         run: python -m pip install -r requirements-dev.txt
-      - name: Lint
-        run: python -m ruff check src scripts tests
-      - name: Type check core and reporting layers
-        run: >-
-          python -m mypy
-          src/state
-          src/logic
-          src/config/live_layout.py
-          src/capture/recording_integrity.py
-          src/reporting
-      - name: Run full test suite
+      - name: Run shared quality gate
         env:
           PYTHONWARNINGS: error
-        run: >-
-          python -m pytest -q
-          --cov=src
-          --cov=scripts
-          --cov-report=term-missing
-          --cov-fail-under=65
+        run: make quality PYTHON=python
+
+  macos:
+    name: macOS / Tk, spawn and Swift (no capture)
+    runs-on: macos-latest
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+          cache: pip
+          cache-dependency-path: |
+            requirements-core.txt
+            requirements-vision.txt
+            requirements-dev.txt
+      - name: Install development dependencies
+        run: python -m pip install -r requirements-dev.txt
+      - name: Check desktop lifecycle without screen capture
+        env:
+          PYTHONWARNINGS: error
+        run: make macos-smoke PYTHON=python

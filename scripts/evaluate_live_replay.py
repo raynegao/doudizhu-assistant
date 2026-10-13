@@ -2,10 +2,19 @@ from __future__ import annotations
 
 import argparse
 import json
+from collections import Counter
 from collections.abc import Iterable
 from pathlib import Path
 
 from src.capture.recording_integrity import sha256_file, sha256_json_payload
+from src.logic.rules import Play, PlayType
+from src.state.cards import RANKS
+from src.state.round_result import (
+    SEATS,
+    RoundResultFacts,
+    infer_opening_landlord,
+    parse_round_result,
+)
 
 ACTION_EVENTS = {"play_observed", "pass_observed"}
 
@@ -51,15 +60,23 @@ def evaluate_live_replay(
         raise ValueError("expected action sequence_no must be contiguous and start at 1")
     predicted_round_ids = {
         str(row["round_id"])
-        for row in predicted_actions
-        if row.get("round_id") is not None
+        for row in predicted_rows
+        if row.get("event") in ACTION_EVENTS | {"round_result_detected"}
+        if _valid_round_id(row.get("round_id"))
     }
+    predicted_round_ids.update(
+        str(state["round_id"])
+        for row in predicted_rows
+        if row.get("event") == "state_update"
+        and isinstance(state := row.get("state"), dict)
+        and _valid_round_id(state.get("round_id"))
+    )
     expected_default_round = (
         next(iter(predicted_round_ids)) if len(predicted_round_ids) == 1 else ""
     )
     expected_round_ids = {
         str(row["round_id"])
-        for row in expected_actions
+        for row in expected_rows
         if row.get("round_id") is not None
     }
     expected_round_alias = (
@@ -67,7 +84,9 @@ def evaluate_live_replay(
         if expected_default_round and len(expected_round_ids) <= 1
         else None
     )
-    predicted_by_key, predicted_duplicate_keys = _index_actions(predicted_actions)
+    predicted_by_key, predicted_duplicate_keys = _index_actions(
+        row for row in predicted_actions if _valid_round_id(row.get("round_id"))
+    )
     expected_by_key, expected_duplicate_keys = _index_actions(
         expected_actions,
         default_round_id=expected_default_round,
@@ -130,9 +149,10 @@ def evaluate_live_replay(
     remaining_correct = 0
     remaining_total = 0
     annotated_action_sequences: set[int] = set()
+    scene_labels = _read_jsonl(expected_scenes) if expected_scenes is not None else []
     if expected_scenes is not None:
         expected_scene_rows: dict[int, dict[str, object]] = {}
-        for row in _read_jsonl(expected_scenes):
+        for row in scene_labels:
             frame_id = int(row["frame_id"])
             after_sequence_no = int(row["after_sequence_no"])
             if frame_id in expected_scene_rows:
@@ -191,30 +211,22 @@ def evaluate_live_replay(
     expected_results = [
         row for row in expected_rows if row.get("event") == "round_result_detected"
     ]
-    predicted_results_by_round = {
-        str(row.get("round_id")): row for row in predicted_results
-    }
-    result_round_alias = (
-        next(iter(predicted_results_by_round))
-        if len(predicted_results_by_round) == 1
-        else None
+    result_counts = _evaluate_results(
+        predicted_rows, predicted_results, expected_results,
+        expected_landlord=infer_opening_landlord(expected_actions, scene_labels),
+        # Reuse the action mapping: never stitch auto-scanned rounds or create
+        # a separate, more permissive alias merely because one result exists.
+        round_alias=expected_round_alias,
     )
-    exact_results = sum(
-        _same_round_result(
-            expected,
-            predicted_results_by_round.get(
-                result_round_alias or str(expected.get("round_id"))
-            ),
-            override_round_id=result_round_alias,
-        )
-        for expected in expected_results
-    )
+    exact_results = result_counts["exact"]
     round_result_accuracy = (
         exact_results / len(expected_results) if expected_results else None
     )
     complete_round_passed = bool(
         expected_results
+        and expected_round_alias is not None
         and len(predicted_results) == len(expected_results)
+        and not result_counts["duplicate_rounds"]
         and exact_results == len(expected_results)
     )
 
@@ -249,7 +261,7 @@ def evaluate_live_replay(
             "session_success requires an expected round_result_detected annotation"
         )
     report: dict[str, object] = {
-        "schema_version": "phase6-live-replay-evaluation-v2",
+        "schema_version": "phase6-live-replay-evaluation-v3",
         "inputs": {
             "predicted_log": _input_fingerprint(predicted_log),
             "expected_events": _input_fingerprint(expected_events),
@@ -287,12 +299,18 @@ def evaluate_live_replay(
         "round_result_counts": {
             "expected": len(expected_results),
             "predicted": len(predicted_results),
-            "exact": exact_results,
+            **result_counts,
         },
         "round_result_accuracy": (
             round(round_result_accuracy, 6)
             if round_result_accuracy is not None
             else None
+        ),
+        "round_team_accuracy": (
+            round(result_counts["team"] / len(expected_results), 6) if expected_results else None
+        ),
+        "round_winner_accuracy": (
+            round(result_counts["winner"] / len(expected_results), 6) if expected_results else None
         ),
         "exact_event_sequence": exact_event_sequence,
         "session_success": session_success,
@@ -368,27 +386,120 @@ def _same_action(
 ) -> bool:
     if predicted is None:
         return False
+    actor = expected.get("actor")
+    if not isinstance(actor, str) or actor not in SEATS:
+        return False
+    expected_cards = _action_card_counts(expected)
+    predicted_cards = _action_card_counts(predicted)
     return (
         expected.get("event") == predicted.get("event")
-        and str(expected.get("actor")) == str(predicted.get("actor"))
-        and list(expected.get("cards", [])) == list(predicted.get("cards", []))
+        and actor == predicted.get("actor")
+        and expected_cards is not None
+        and predicted_cards is not None
+        and expected_cards == predicted_cards
     )
 
 
-def _same_round_result(
-    expected: dict[str, object],
-    predicted: dict[str, object] | None,
+def _action_card_counts(row: dict[str, object]) -> Counter[str] | None:
+    cards, event = row.get("cards"), row.get("event")
+    if not isinstance(cards, list) or not isinstance(event, str) or event not in ACTION_EVENTS:
+        return None
+    if any(not isinstance(rank, str) or rank not in RANKS for rank in cards):
+        return None
+    if (event == "play_observed") != bool(cards):
+        return None
+    counts = Counter(cards)
+    if any(count > (1 if rank in {"SJ", "BJ"} else 4) for rank, count in counts.items()):
+        return None
+    if cards and Play.parse(cards).type is PlayType.INVALID:
+        return None
+    return counts
+
+
+def _prediction_result_context(
+    rows: list[dict[str, object]], result: dict[str, object],
+) -> str | None:
+    roles: set[str] = set()
+    for row in rows:
+        if row is result:
+            break
+        state = row.get("state")
+        if row.get("event") != "state_update" or not isinstance(state, dict):
+            continue
+        if state.get("round_id") != result.get("round_id"):
+            continue
+        result_frame, row_frame = result.get("frame_id"), row.get("frame_id")
+        if isinstance(result_frame, int) and isinstance(row_frame, int):
+            if row_frame > result_frame:
+                continue
+        role = state.get("landlord")
+        if role is None:
+            continue
+        if not isinstance(role, str) or role not in SEATS:
+            raise ValueError("invalid predicted round role context")
+        roles.add(role)
+    if len(roles) > 1:
+        raise ValueError("conflicting predicted round role context")
+    return next(iter(roles)) if roles else None
+
+
+def _valid_round_id(value: object) -> bool:
+    return isinstance(value, str) and bool(value.strip())
+
+
+def _evaluate_results(
+    predicted_rows: list[dict[str, object]],
+    predicted_results: list[dict[str, object]],
+    expected_results: list[dict[str, object]],
     *,
-    override_round_id: str | None = None,
-) -> bool:
-    if predicted is None:
-        return False
-    return (
-        str(override_round_id or expected.get("round_id"))
-        == str(predicted.get("round_id"))
-        and str(expected.get("winner")) == str(predicted.get("winner"))
-        and str(expected.get("outcome")) == str(predicted.get("outcome"))
+    expected_landlord: str | None,
+    round_alias: str | None,
+) -> dict[str, int]:
+    counts = dict.fromkeys((
+        "exact", "team", "winner", "unknown_winner", "invalid", "unverified_role",
+        "duplicate_rounds",
+    ), 0)
+    frequencies = Counter(
+        str(row["round_id"]) for row in predicted_results if _valid_round_id(row.get("round_id"))
     )
+    counts["duplicate_rounds"] = sum(count > 1 for count in frequencies.values())
+    predicted: dict[str, RoundResultFacts] = {}
+    for row in predicted_results:
+        key = row.get("round_id")
+        if not isinstance(key, str) or not key.strip():
+            counts["invalid"] += 1
+            continue
+        try:
+            facts = parse_round_result(
+                row, own_landlord_context=_prediction_result_context(predicted_rows, row),
+            )
+        except ValueError:
+            counts["invalid"] += 1
+            continue
+        counts["unknown_winner"] += facts.winner is None
+        counts["unverified_role"] += facts.landlord is None
+        if frequencies[key] == 1:
+            predicted[key] = facts
+    expected_keys: set[str] = set()
+    for row in expected_results:
+        key = str(row.get("round_id"))
+        if key in expected_keys:
+            raise ValueError("expected events contain duplicate round results")
+        expected_keys.add(key)
+        facts = parse_round_result(row, own_landlord_context=expected_landlord)
+        match = predicted.get(round_alias) if round_alias is not None else None
+        if match is None:
+            continue
+        team_match = (
+            facts.team_verified and match.team_verified
+            and facts.landlord == match.landlord
+            and facts.winning_side == match.winning_side and facts.outcome == match.outcome
+        )
+        winner_match = facts.winner is not None and facts.winner == match.winner
+        counts["team"] += team_match
+        counts["winner"] += winner_match
+        counts["exact"] += team_match and winner_match
+    return counts
 
 
 def _scene_remaining(row: dict[str, object]) -> dict[str, int]:

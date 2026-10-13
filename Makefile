@@ -1,6 +1,6 @@
 PYTHON ?= $(if $(wildcard .venv/bin/python),.venv/bin/python,python)
 
-.PHONY: test coverage lint typecheck quality demo benchmark docker-demo web-demo demo-gif holdout-seal holdout-evaluate live-calibrate live-assistant live-finalize live-annotate-prepare live-annotate-seal live-diagnostics phase6-acceptance
+.PHONY: test coverage lint typecheck quality macos-smoke demo benchmark docker-demo web-demo demo-gif holdout-seal holdout-evaluate live-calibrate live-assistant live-finalize live-annotate-prepare live-annotate-seal live-diagnostics phase6-acceptance
 
 test:
 	$(PYTHON) -m pytest -q
@@ -14,8 +14,17 @@ lint:
 typecheck:
 	$(PYTHON) -m mypy src/state src/logic src/config/live_layout.py src/capture/recording_integrity.py src/reporting
 	$(PYTHON) -m mypy --follow-imports=skip src/capture/macos_stream.py src/capture/recorded_window.py
+	$(PYTHON) -m mypy --follow-imports=skip src/pipeline/decision_executor.py src/pipeline/frame_schedule.py src/pipeline/recording_writer.py src/vision/scene_types.py src/tracking/observation_evidence.py src/ui/live_overlay.py scripts/record_live_game.py
 
 quality: lint typecheck coverage
+
+macos-smoke:
+	$(PYTHON) -c 'import sys; sys.exit(0 if sys.platform == "darwin" else "macos-smoke requires macOS")'
+	$(PYTHON) -m pytest -q tests/test_macos_smoke.py tests/test_live_scheduling.py tests/test_decision_executor.py tests/test_run_live_assistant.py tests/test_recording_signals.py tests/test_lossless_video_writer.py
+
+.PHONY: live-storage
+live-storage:
+	$(PYTHON) -m scripts.inventory_live_storage
 
 demo:
 	$(PYTHON) -m scripts.run_phase5_showcase --output-dir runs/showcase --repeats 1 --simulations 8 --max-depth 12
@@ -69,7 +78,7 @@ live-annotate-seal:
 		--seal
 
 live-diagnostics:
-	$(PYTHON) -m scripts.analyze_live_log
+	$(PYTHON) -m scripts.analyze_live_log --latest-evidence
 
 phase6-acceptance:
 	$(PYTHON) -m scripts.audit_phase6_acceptance --require-thresholds

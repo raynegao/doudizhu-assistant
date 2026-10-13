@@ -245,10 +245,12 @@ def audit_phase6_acceptance(
         aggregate["expected_events"],
     )
     event_f1 = (
-        2 * event_precision * event_recall / (event_precision + event_recall)
+        (
+            2 * event_precision * event_recall / (event_precision + event_recall)
+            if event_precision + event_recall else 0.0
+        )
         if event_precision is not None
         and event_recall is not None
-        and event_precision + event_recall
         else None
     )
     card_exact_accuracy = _ratio(
@@ -332,7 +334,7 @@ def audit_phase6_acceptance(
 
     remaining_work = [name for name, passed in checks.items() if not passed]
     return {
-        "schema_version": "phase6-acceptance-audit-v2",
+        "schema_version": "phase6-acceptance-audit-v3",
         "recordings_root": recordings_root.as_posix(),
         "replays_root": replays_root.as_posix(),
         "threshold_values": {
@@ -394,7 +396,7 @@ def _evaluation_evidence_issues(
     if not evaluation:
         return ["evaluation report is missing"]
     issues: list[str] = []
-    if evaluation.get("schema_version") != "phase6-live-replay-evaluation-v2":
+    if evaluation.get("schema_version") != "phase6-live-replay-evaluation-v3":
         issues.append("unsupported evaluation schema")
     sealed_payload = dict(evaluation)
     report_sha256 = sealed_payload.pop("report_sha256", None)

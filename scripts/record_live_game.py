@@ -2,11 +2,20 @@ from __future__ import annotations
 
 import argparse
 import json
+import math
+import os
 import re
+import signal
 import statistics
+import sys
 import time
+from collections.abc import Iterator
+from contextlib import contextmanager
+from dataclasses import dataclass
 from itertools import count
 from pathlib import Path
+from threading import Event, current_thread, main_thread
+from types import FrameType
 
 from src.capture.lossless_video import (
     LOSSLESS_VIDEO_CODEC,
@@ -14,7 +23,6 @@ from src.capture.lossless_video import (
     LOSSLESS_VIDEO_PIXEL_FORMAT,
     LOSSLESS_VIDEO_SCHEMA_VERSION,
     LosslessRGBVideoWriter,
-    LosslessVideoError,
     ffmpeg_path,
     ffmpeg_version,
 )
@@ -32,8 +40,11 @@ from src.capture.recording_integrity import (
     write_bytes_atomic,
     write_json_atomic,
 )
-from src.capture.screen_geometry import MacWindowCapture
-from src.config.live_layout import load_live_layout
+from src.capture.recording_lock import recording_session_lock
+from src.capture.screen_geometry import CapturedWindow, MacWindowCapture
+from src.config.live_layout import LiveLayoutConfig, load_live_layout
+from src.pipeline.frame_schedule import FrameSchedule
+from src.pipeline.recording_writer import RecordingWriter
 
 _DEFAULT_RECORDING_INTERVAL_SECONDS = 0.1
 _PNG_STORAGE_MODE = "png_frames"
@@ -138,9 +149,27 @@ def main(argv: list[str] | None = None) -> int:
         if args.interval is None
         else args.interval
     )
-    if interval <= 0:
-        raise SystemExit("--interval must be positive")
+    if not math.isfinite(interval) or interval <= 0:
+        raise SystemExit("--interval must be finite and positive")
     session_dir = args.output_root / session_name
+    session_dir.mkdir(parents=True, exist_ok=True)
+    with recording_session_lock(session_dir):
+        return _prepare_session(
+            args, config=config, config_sha256=config_sha256, interval=interval,
+            frame_limit=frame_limit, session_dir=session_dir,
+        )
+
+
+def _prepare_session(
+    args: argparse.Namespace,
+    *,
+    config: LiveLayoutConfig,
+    config_sha256: str,
+    interval: float,
+    frame_limit: int | None,
+    session_dir: Path,
+) -> int:
+    session_name = session_dir.name
     frames_dir = session_dir / "frames"
     video_dir = session_dir / "video"
     manifest_path = session_dir / "manifest.jsonl"
@@ -165,16 +194,31 @@ def main(argv: list[str] | None = None) -> int:
         existing_split = str(metadata.get("evidence_split") or "development")
         if existing_split != args.evidence_split:
             raise SystemExit("cannot resume with a different evidence split")
+        if metadata.get("recording_state") not in {"interrupted", "captured"}:
+            raise SystemExit("cannot resume a session that has not stopped safely")
+        if metadata.get("interval_seconds") != interval:
+            raise SystemExit("cannot resume with a different recording interval")
+        if metadata.get("recording_error"):
+            raise SystemExit("cannot resume a failed persistence run; start a fresh session")
+        if metadata.get("evidence_seal") != _evidence_seal(config):
+            raise SystemExit("cannot resume with changed implementation, model, or templates")
         frame_storage = metadata.get("frame_storage")
         if isinstance(frame_storage, dict):
             storage_mode = str(frame_storage.get("mode") or "")
         else:
             storage_mode = _PNG_STORAGE_MODE
+        if storage_mode not in {_PNG_STORAGE_MODE, _VIDEO_STORAGE_MODE}:
+            raise SystemExit("recording session uses an unsupported storage mode")
         if args.evidence_split == "acceptance" and storage_mode != _VIDEO_STORAGE_MODE:
             raise SystemExit(
                 "legacy PNG acceptance recordings cannot be resumed; start a fresh "
                 "session with lossless video storage"
             )
+        if storage_mode == _VIDEO_STORAGE_MODE and (
+            not isinstance(frame_storage, dict)
+            or frame_storage.get("encoder") != _encoder_seal()
+        ):
+            raise SystemExit("cannot resume with a changed encoder")
         if bool(metadata.get("complete_game")):
             raise SystemExit("cannot resume a session already marked complete")
         if existing_rows:
@@ -200,9 +244,6 @@ def main(argv: list[str] | None = None) -> int:
             else _PNG_STORAGE_MODE
         )
         write_bytes_atomic(config_snapshot_path, args.config.read_bytes())
-        project_root = Path(__file__).resolve().parents[1]
-        model_path = config.model_path.resolve()
-        templates_path = config.templates_dir.resolve()
         metadata = {
             "schema_version": SESSION_SCHEMA_VERSION,
             "session": session_name,
@@ -218,32 +259,19 @@ def main(argv: list[str] | None = None) -> int:
                 else max(0.75, interval * 3.0)
             ),
             "evidence_split": args.evidence_split,
-            "evidence_seal": {
-                "implementation_sha256": sha256_python_implementation(
-                    project_root
-                ),
-                "model_sha256": (
-                    sha256_file(model_path) if model_path.is_file() else None
-                ),
-                "templates_sha256": sha256_directory(templates_path),
-            },
+            "evidence_seal": _evidence_seal(config),
             "complete_game": False,
             "recorded_frames": 0,
             "recording_state": "recording",
         }
         if storage_mode == _VIDEO_STORAGE_MODE:
-            encoder_path = ffmpeg_path()
             metadata["frame_storage"] = {
                 "schema_version": LOSSLESS_VIDEO_SCHEMA_VERSION,
                 "mode": _VIDEO_STORAGE_MODE,
                 "codec": LOSSLESS_VIDEO_CODEC,
                 "container": LOSSLESS_VIDEO_CONTAINER,
                 "decoded_pixel_format": LOSSLESS_VIDEO_PIXEL_FORMAT,
-                "encoder": {
-                    "path": encoder_path.as_posix(),
-                    "sha256": sha256_file(encoder_path),
-                    "version": ffmpeg_version(),
-                },
+                "encoder": _encoder_seal(),
                 "segments": [],
             }
     if storage_mode == _VIDEO_STORAGE_MODE:
@@ -256,11 +284,111 @@ def main(argv: list[str] | None = None) -> int:
         "updated_at": time.time(),
     })
     write_json_atomic(metadata_path, metadata)
-    capture = MacWindowCapture(config.app_name)
+    stop = Event()
+    with _stop_on_signal(stop) as received_signals:
+        return _record_frames(
+            config=config,
+            config_sha256=config_sha256,
+            session_dir=session_dir,
+            metadata=metadata,
+            existing_rows=existing_rows,
+            interval=interval,
+            frame_limit=frame_limit,
+            mark_complete=args.mark_complete,
+            stop=stop,
+            received_signals=received_signals,
+        )
+
+
+def _evidence_seal(config: LiveLayoutConfig) -> dict[str, object]:
+    model_path = config.model_path.resolve()
+    return {
+        "implementation_sha256": sha256_python_implementation(Path(__file__).resolve().parents[1]),
+        "model_sha256": sha256_file(model_path) if model_path.is_file() else None,
+        "templates_sha256": sha256_directory(config.templates_dir.resolve()),
+    }
+
+
+def _encoder_seal() -> dict[str, object]:
+    encoder_path = ffmpeg_path()
+    return {
+        "path": encoder_path.as_posix(),
+        "sha256": sha256_file(encoder_path),
+        "version": ffmpeg_version(),
+    }
+
+
+@contextmanager
+def _stop_on_signal(stop: Event) -> Iterator[list[int]]:
+    """Keep Ctrl-C (including repeats during drain) out of persistence writes."""
+    received: list[int] = []
+
+    def request_stop(signum: int, _frame: FrameType | None) -> None:
+        if not received:
+            received.append(signum)
+        # A signal can interrupt Event.wait while its non-reentrant lock is
+        # held. Never call Event.set (or acquire any lock) in this handler.
+
+    previous = {}
+    if current_thread() is main_thread():
+        for signum in (signal.SIGINT, signal.SIGTERM):
+            previous[signum] = signal.signal(signum, request_stop)
+    try:
+        yield received
+    finally:
+        for signum, handler in previous.items():
+            signal.signal(signum, handler)
+
+
+@dataclass(frozen=True)
+class _PendingFrame:
+    frame: CapturedWindow
+    capture_seconds: float
+    enqueued_at: float
+
+
+def _record_frames(
+    *,
+    config: LiveLayoutConfig,
+    config_sha256: str,
+    session_dir: Path,
+    metadata: dict[str, object],
+    existing_rows: list[dict[str, object]],
+    interval: float,
+    frame_limit: int | None,
+    mark_complete: bool,
+    stop: Event,
+    received_signals: list[int],
+) -> int:
+    manifest_path = session_dir / "manifest.jsonl"
+    metadata_path = session_dir / "session.json"
+    video_dir = session_dir / "video"
+    frames_dir = session_dir / "frames"
+    session_name = str(metadata["session"])
+    storage = metadata.get("frame_storage")
+    video_storage = isinstance(storage, dict) and storage.get("mode") == _VIDEO_STORAGE_MODE
     first_frame_id = len(existing_rows) + 1
     recorded = len(existing_rows)
     recording_state = "failed"
     interrupted = False
+    error: BaseException | None = None
+    capture: MacWindowCapture | None = None
+    persistence: RecordingWriter[_PendingFrame] | None = None
+    max_capture_seconds = 0.0
+    capture_closed = False
+
+    def close_source() -> None:
+        nonlocal capture_closed, error
+        if capture_closed or capture is None:
+            return
+        capture_closed = True
+        try:
+            close_capture = getattr(capture, "close", None)
+            if callable(close_capture):
+                close_capture()
+        except BaseException as exc:
+            error = error or exc
+
     captured_timestamps = [
         float(str(row["timestamp"]))
         for row in existing_rows
@@ -274,7 +402,16 @@ def main(argv: list[str] | None = None) -> int:
     video_segment_path: Path | None = None
     video_segment_first_frame_id = first_frame_id
     video_segment_number = 0
-    if storage_mode == _VIDEO_STORAGE_MODE:
+
+    def wait_for_capture(delay: float) -> None:
+        deadline = time.monotonic() + delay
+        while not received_signals and not stop.is_set():
+            remaining = deadline - time.monotonic()
+            if remaining <= 0:
+                break
+            stop.wait(min(remaining, 0.05))
+
+    if video_storage:
         raw_storage = metadata.get("frame_storage")
         if not isinstance(raw_storage, dict):
             raise SystemExit("lossless video storage metadata is missing")
@@ -282,27 +419,31 @@ def main(argv: list[str] | None = None) -> int:
         if not isinstance(raw_segments, list):
             raise SystemExit("lossless video segment metadata is invalid")
         video_segment_number = len(raw_segments) + 1
-    next_capture_at = time.monotonic()
     try:
+        capture = MacWindowCapture(config.app_name)
         with manifest_path.open("a", encoding="utf-8") as manifest:
-            offsets = count() if frame_limit is None else range(frame_limit)
-            for offset in offsets:
-                delay = next_capture_at - time.monotonic()
-                if delay > 0:
-                    time.sleep(delay)
-                frame_id = first_frame_id + offset
-                frame = capture.capture(frame_id)
-                if (
-                    args.evidence_split == "acceptance"
-                    and frame.capture_backend != "screen_capture_kit_stream"
-                ):
-                    raise SystemExit(
-                        "acceptance recording requires the persistent "
-                        "ScreenCaptureKit stream; fallback capture is not eligible"
-                    )
-                next_capture_at += interval
+            def persist(pending: _PendingFrame) -> None:
+                nonlocal video_writer, video_segment_path, recorded
+                frame = pending.frame
+                frame_id = frame.frame_id
+                started = time.monotonic()
+                queue_wait = started - pending.enqueued_at
+                # Hash before encoding so a hashing error cannot add an
+                # unreferenced frame to an otherwise healthy video segment.
+                pixel_hash = sha256_image_pixels(frame.image) if video_storage else None
+                roi_descriptors: dict[str, dict[str, object]] = {}
+                roi_sha256: dict[str, str] = {}
+                for name in sorted(config.rois):
+                    box = config.roi(name)
+                    roi_descriptors[name] = {
+                        "source": "full_image",
+                        "normalized_box": list(box.to_tuple()),
+                    }
+                    roi_sha256[name] = sha256_image_pixels(config.crop(frame.image, name))
+                hash_seconds = time.monotonic() - started
+                encoding_started = time.monotonic()
                 frame_record: dict[str, object]
-                if storage_mode == _VIDEO_STORAGE_MODE:
+                if video_storage:
                     if video_writer is None:
                         video_segment_path = (
                             video_dir / f"segment-{video_segment_number:03d}.mkv"
@@ -311,6 +452,7 @@ def main(argv: list[str] | None = None) -> int:
                             video_segment_path,
                             image_size=frame.image.size,
                             frames_per_second=1.0 / interval,
+                            io_timeout_seconds=config.recording_io_timeout_seconds,
                         )
                     video_frame_index = video_writer.frame_count
                     video_writer.write(frame.image)
@@ -321,7 +463,7 @@ def main(argv: list[str] | None = None) -> int:
                             session_dir
                         ).as_posix(),
                         "video_frame_index": video_frame_index,
-                        "full_image_pixel_sha256": sha256_image_pixels(frame.image),
+                        "full_image_pixel_sha256": pixel_hash,
                     }
                 else:
                     frame_name = f"{frame_id:06d}.png"
@@ -332,17 +474,6 @@ def main(argv: list[str] | None = None) -> int:
                         "full_image": full_path.relative_to(session_dir).as_posix(),
                         "full_image_sha256": sha256_file(full_path),
                     }
-                roi_descriptors: dict[str, dict[str, object]] = {}
-                roi_sha256: dict[str, str] = {}
-                for name in sorted(config.rois):
-                    box = config.roi(name)
-                    roi_descriptors[name] = {
-                        "source": "full_image",
-                        "normalized_box": list(box.to_tuple()),
-                    }
-                    roi_sha256[name] = sha256_image_pixels(
-                        config.crop(frame.image, name)
-                    )
                 manifest.write(json.dumps({
                     **frame_record,
                     "event": "recorded_frame",
@@ -359,49 +490,101 @@ def main(argv: list[str] | None = None) -> int:
                     "rois": roi_descriptors,
                     "roi_sha256": roi_sha256,
                     "labels": {},
+                    "recording_timing": {
+                        "capture_seconds": pending.capture_seconds,
+                        "queue_wait_seconds": queue_wait,
+                        "hash_seconds": hash_seconds,
+                        "encode_seconds": time.monotonic() - encoding_started,
+                    },
                 }, ensure_ascii=False) + "\n")
                 manifest.flush()
                 recorded = frame_id
                 captured_timestamps.append(frame.timestamp)
                 capture_backends.add(frame.capture_backend)
-                print(
-                    (
-                        f"\rrecorded {offset + 1} (frame {frame_id})"
-                        if frame_limit is None
-                        else f"\rrecorded {offset + 1}/{frame_limit} (frame {frame_id})"
-                    ),
-                    end="",
-                    flush=True,
-                )
+                _progress_print(f"\rrecorded frame {frame_id}", end="", flush=True)
+            persistence = RecordingWriter(persist, max_pending=config.recording_queue_frames)
+            try:
+                offsets = count() if frame_limit is None else range(frame_limit)
+                schedule: FrameSchedule | None = None
+                for offset in offsets:
+                    if received_signals or stop.is_set():
+                        break
+                    persistence.check()
+                    if schedule is not None:
+                        schedule.wait_next(wait_for_capture)
+                    if received_signals or stop.is_set():
+                        break
+                    started = time.monotonic()
+                    try:
+                        frame = capture.capture(first_frame_id + offset)
+                    except Exception:
+                        # The native capture child may also receive a terminal
+                        # group signal. This unfinished frame was not accepted.
+                        if received_signals or stop.is_set():
+                            break
+                        raise
+                    if received_signals or stop.is_set():
+                        break
+                    capture_seconds = time.monotonic() - started
+                    max_capture_seconds = max(max_capture_seconds, capture_seconds)
+                    if (
+                        metadata["evidence_split"] == "acceptance"
+                        and frame.capture_backend != "screen_capture_kit_stream"
+                    ):
+                        raise SystemExit(
+                            "acceptance recording requires the persistent "
+                            "ScreenCaptureKit stream; fallback capture is not eligible"
+                        )
+                    # Anchor after the initial stream warm-up, never issue a
+                    # burst of catch-up requests for time spent initializing.
+                    if schedule is None:
+                        schedule = FrameSchedule(interval)
+                    persistence.submit(_PendingFrame(frame, capture_seconds, time.monotonic()))
+            except KeyboardInterrupt:
+                interrupted = True
+            except BaseException as exc:
+                error = exc
+            finally:
+                # Release the screen source before waiting for the disk queue.
+                # A close failure must not bypass drain or the video seal.
+                close_source()
+                try:
+                    persistence.close()
+                except BaseException as exc:
+                    error = error or exc
     except KeyboardInterrupt:
         interrupted = True
-        recording_state = "interrupted"
-    else:
-        recording_state = "complete" if args.mark_complete else "captured"
+    except BaseException as exc:
+        error = error or exc
     finally:
-        encoder_error: LosslessVideoError | None = None
+        close_source()
         if video_writer is not None:
             try:
                 video_writer.close()
-            except LosslessVideoError as exc:
-                encoder_error = exc
-                recording_state = "failed"
-            if video_segment_path is not None and video_segment_path.is_file():
-                raw_storage = metadata.get("frame_storage")
-                assert isinstance(raw_storage, dict)
-                raw_segments = raw_storage.get("segments")
-                assert isinstance(raw_segments, list)
-                raw_segments.append({
-                    "path": video_segment_path.relative_to(session_dir).as_posix(),
-                    "sha256": sha256_file(video_segment_path),
-                    "first_frame_id": video_segment_first_frame_id,
-                    "frame_count": video_writer.frame_count,
-                    "image_size": list(video_writer.image_size),
-                    "frames_per_second": video_writer.frames_per_second,
-                })
-        close_capture = getattr(capture, "close", None)
-        if callable(close_capture):
-            close_capture()
+            except BaseException as exc:
+                error = error or exc
+            try:
+                if video_segment_path is not None and video_segment_path.is_file():
+                    raw_storage = metadata.get("frame_storage")
+                    assert isinstance(raw_storage, dict)
+                    raw_segments = raw_storage.get("segments")
+                    assert isinstance(raw_segments, list)
+                    raw_segments.append({
+                        "path": video_segment_path.relative_to(session_dir).as_posix(),
+                        "sha256": sha256_file(video_segment_path),
+                        "first_frame_id": video_segment_first_frame_id,
+                        "frame_count": video_writer.frame_count,
+                        "image_size": list(video_writer.image_size),
+                        "frames_per_second": video_writer.frames_per_second,
+                    })
+            except BaseException as exc:
+                error = error or exc
+        interrupted = interrupted or bool(received_signals) or stop.is_set()
+        recording_state = (
+            "failed" if error is not None
+            else "interrupted" if interrupted
+            else "complete" if mark_complete else "captured"
+        )
         cadence = _capture_cadence(captured_timestamps, interval=interval)
         metadata.update({
             "updated_at": time.time(),
@@ -409,19 +592,46 @@ def main(argv: list[str] | None = None) -> int:
             "recording_state": recording_state,
             "complete_game": recording_state == "complete",
             "capture_cadence": cadence,
-                    "capture_backends": sorted(capture_backends),
-                })
+            "capture_backends": sorted(capture_backends),
+            "recording_diagnostics": {
+                "first_frame_id": first_frame_id,
+                "max_capture_seconds": max_capture_seconds,
+                **(persistence.diagnostics() if persistence is not None else {}),
+            },
+        })
+        if error is not None:
+            metadata["recording_error"] = f"{type(error).__name__}: {error}"
         if metadata["complete_game"]:
             metadata["completed_at"] = time.time()
         write_json_atomic(metadata_path, metadata)
-        if encoder_error is not None:
-            raise encoder_error
-    print(f"\nmanifest: {manifest_path}")
-    print(f"session_metadata: {metadata_path}")
+    if error is not None:
+        raise error
+    _progress_print(f"\nmanifest: {manifest_path}")
+    _progress_print(f"session_metadata: {metadata_path}")
     if interrupted:
-        print("recording interrupted safely; finalize it after confirming the game is complete")
-        return 130
+        _progress_print("recording interrupted safely; finalize after confirming the complete game")
+        return 128 + received_signals[0] if received_signals else 130
     return 0
+
+
+def _progress_print(message: str, *, end: str = "\n", flush: bool = False) -> None:
+    # Progress is disposable, unlike evidence. A full stdout pipe or a paused
+    # terminal must not block the writer or keep the session lock held on exit.
+    descriptor: int | None = None
+    was_blocking: bool | None = None
+    try:
+        descriptor = sys.stdout.fileno()
+        was_blocking = os.get_blocking(descriptor)
+        os.set_blocking(descriptor, False)
+        os.write(descriptor, (message[:1000] + end).encode("utf-8", errors="replace"))
+    except (OSError, ValueError):
+        pass
+    finally:
+        if descriptor is not None and was_blocking is not None:
+            try:
+                os.set_blocking(descriptor, was_blocking)
+            except (OSError, ValueError):
+                pass
 
 
 def _capture_cadence(

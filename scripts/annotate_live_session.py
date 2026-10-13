@@ -19,6 +19,7 @@ from src.capture.recording_integrity import (
 from src.logic.rules import Play, PlayType, can_beat
 from src.state.cards import FULL_DECK, CardSet
 from src.state.events import DEFAULT_TURN_ORDER, PlayerSeat
+from src.state.round_result import infer_opening_landlord, parse_round_result
 
 ACTION_EVENTS = {"play_observed", "pass_observed"}
 WORKBOOK_SCHEMA_VERSION = "phase6-blind-annotation-workbook-v1"
@@ -258,11 +259,11 @@ def validate_annotation_bundle(
         winner = PlayerSeat(str(result["winner"]))
     except (KeyError, ValueError) as exc:
         raise ValueError("round result winner is invalid") from exc
-    if result.get("outcome") not in {"victory", "defeat"}:
-        raise ValueError("round result outcome is invalid")
-    expected_outcome = "victory" if winner is PlayerSeat.SELF else "defeat"
-    if result.get("outcome") != expected_outcome:
-        raise ValueError("round result outcome does not match the winner")
+    facts = parse_round_result(
+        result, own_landlord_context=infer_opening_landlord(actions, scene_rows),
+    )
+    if not facts.team_verified:
+        raise ValueError("complete round requires independently annotated landlord/outcome")
     final_action = actions[-1]
     if final_action.get("event") != "play_observed":
         raise ValueError("the final annotated action must be a play")
@@ -271,6 +272,8 @@ def validate_annotation_bundle(
     assert previous_remaining is not None
     if previous_remaining[winner.value] != 0:
         raise ValueError("round winner must have zero remaining cards")
+    if sum(count == 0 for count in previous_remaining.values()) != 1:
+        raise ValueError("round result must have exactly one zero-card winner")
 
     return {
         "frame_count": len(inspection.manifest_rows),
