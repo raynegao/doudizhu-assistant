@@ -85,3 +85,7 @@ python -m scripts.audit_phase6_acceptance --recordings-root <只含本批会话�
 ```
 
 录制、标注规格（`work/independent-acceptance-20261014/spec-*.json`）、带规则引擎校验的标注生成脚本 `build_annotation.py`、冻结归档和审计 JSON 只保存在本地，不入库（`data/`、`runs/`、`work/` 均被 `.gitignore` 忽略）。
+
+## 后续（2026-10-16）
+
+三个根因已修复并在同批 5 局上回归到 5/5（动作 174/174、牌组 104/104、余牌 517/522），见 [INDEPENDENT_ACCEPTANCE_FIXES_20261016.md](INDEPENDENT_ACCEPTANCE_FIXES_20261016.md)。本文的验收结论不因此改变：这批数据已参与修复，聚合审计也因实现指纹变化拒绝汇总；新的独立验收要在新冻结下另录。
