@@ -77,7 +77,10 @@ def _paused_tracker() -> VisualEventTracker:
     paused = tracker.update(replace(_scene(2), warnings=(GEOMETRY_WARNING,)))
     assert paused.event is None and paused.state is not None
     assert paused.state.phase is RoundPhase.UNCERTAIN
-    assert not any(tracker._armed.values())
+    # A self-hand crop pause clears cross-frame evidence but keeps the
+    # opponents' blank edges that were observed on valid frames.
+    assert tracker._armed[PlayerSeat.SELF] is False
+    assert tracker._armed[PlayerSeat.LEFT] and tracker._armed[PlayerSeat.RIGHT]
     assert not tracker._recent_scenes
     return tracker
 

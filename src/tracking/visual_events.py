@@ -1193,7 +1193,12 @@ class VisualEventTracker:
         self._role_stable = _StableValue()
         self._result_stable = _StableValue()
         self._seat_stable = {seat: _StableValue() for seat in PlayerSeat}
-        self._armed = {seat: False for seat in PlayerSeat}
+        # Only the self-hand crop is unavailable. An opponent seat that was
+        # blank on a valid frame before this gap keeps that edge: a pass shown
+        # after recovery still needs fresh stable frames, but it is not a stale
+        # prompt. Dropping every edge here left a recovered pass unprovable and
+        # blocked the self terminal gate behind the wrong current actor.
+        self._armed[PlayerSeat.SELF] = False
         self._actor_entry_frame_id = scene.frame_id + 1
         self._self_actor_entry_hand_count = None
         state = self.state

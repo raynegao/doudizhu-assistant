@@ -33,6 +33,7 @@ from src.vision.card_regions import CardRegion, CardRegionKind
 from src.vision.clipped_hand_edges import clipped_trailing_edges_supported
 from src.vision.hand_empty import observe_empty_hand_domain
 from src.vision.hand_photometry import prepare_hand_rank_crop
+from src.vision.joker_pair import resolve_joker_pair
 from src.vision.rank_glyph import (
     JokerColorEvidence,
     RankGlyphComponent,
@@ -738,6 +739,7 @@ class SceneRecognizer:
                  for region in regions]
         predictions = self.predictor(crops)
         observed_cards: list[VisualCard] = []
+        colors: list[JokerColorEvidence | None] = []
         for index, prediction in enumerate(predictions):
             card_image = play_crop.crop(boxes[index])
             glyph = extract_rank_glyph(card_image)
@@ -771,6 +773,7 @@ class SceneRecognizer:
                 read_joker_color(card_image, glyph, self.config.joker_color)
                 if prediction.rank in {"SJ", "BJ"} else None
             )
+            colors.append(color)
             rank, confidence, evidence = _fuse_card_prediction(
                 prediction,
                 reference_match,
@@ -788,7 +791,9 @@ class SceneRecognizer:
                     evidence=evidence,
                 )
             )
-        return tuple(observed_cards)
+        # Overlapping table Jokers can leave the upper corner reading as the
+        # lower card's Joker; the deck then forces the complement.
+        return resolve_joker_pair(observed_cards, colors)
 
     def _observe_hand(
         self,
@@ -1198,7 +1203,7 @@ def _remaining_digit_masks(image: Image.Image) -> tuple[np.ndarray, ...]:
                 runs.append((start, stop))
             start = None
 
-    glyphs: list[np.ndarray] = []
+    candidates: list[tuple[np.ndarray, bool]] = []
     minimum_height = max(8, round(image.height * 0.18))
     for left, right in runs:
         region = mask[:, left:right]
@@ -1218,8 +1223,38 @@ def _remaining_digit_masks(image: Image.Image) -> tuple[np.ndarray, ...]:
         minimum_width = max(3, round(glyph.shape[0] * 0.25))
         if glyph.shape[1] < minimum_width:
             continue
-        glyphs.append(glyph)
-    return tuple(glyphs)
+        clipped = (
+            left == 0 or right == mask.shape[1] or top == 0 or bottom == mask.shape[0]
+        )
+        candidates.append((glyph, clipped))
+    return _trusted_counter_glyphs(candidates)
+
+
+# Counter digits share one line height; a run this much shorter than the real
+# digit is not part of the counter font.
+_COUNTER_GLYPH_HEIGHT_TOLERANCE = 0.85
+
+
+def _trusted_counter_glyphs(
+    candidates: Sequence[tuple[np.ndarray, bool]],
+) -> tuple[np.ndarray, ...]:
+    """Drop ROI-clipped decorations; refuse a read that may hold a clipped digit.
+
+    The calibrated counter badge sits inside its ROI, so a run touching the ROI
+    border is never a complete counter glyph. The avatar or an animation
+    bleeding over the border is shorter than the counter font, so such a run
+    is discarded and the remaining glyphs are read. A clipped run as tall as a
+    real digit may be a cut digit; the whole read then becomes unknown rather
+    than a value that silently misses that digit.
+    """
+    unclipped = [glyph for glyph, clipped in candidates if not clipped]
+    if not unclipped:
+        return ()
+    reference_height = max(glyph.shape[0] for glyph in unclipped)
+    for glyph, clipped in candidates:
+        if clipped and glyph.shape[0] >= reference_height * _COUNTER_GLYPH_HEIGHT_TOLERANCE:
+            return ()
+    return tuple(unclipped)
 
 
 def _remaining_glyph_signature(mask: np.ndarray) -> frozenset[int]:
