@@ -18,7 +18,7 @@ AI-based Dou Dizhu assistant with Mac screen capture, CNN card recognition, a ru
 | 蒙特卡洛 Top-K + 置信区间 | 完成；对手模型为**均匀未知牌抽样**，是可解释基线而非行为模型 | [ARCHITECTURE.md](docs/ARCHITECTURE.md) |
 | 无损录制 / 逐帧 SHA256 / 盲标封印 / replay 评测 | 完成 | [PHASE6_ACCEPTANCE.md](docs/PHASE6_ACCEPTANCE.md) |
 | AI 参考标注回归（六局 11,025 帧） | 动作 188/188、余牌 557/564、严格完整局 6/6 | [AI_REFERENCE_FIXES_20260908_V11.md](docs/AI_REFERENCE_FIXES_20260908_V11.md) |
-| **冻结后独立验收**（5 局新录制，AI 参考标注先于预测封印） | **未通过**：事件 F1 98.25%、牌组 97.12%、余牌 98.28%，完整局 3/5；牌面 holdout 未做。三根因已于 10-16 修复，同批回归 5/5，但该批已看过，需重新冻结另录 | [验收](docs/INDEPENDENT_ACCEPTANCE_20261014.md) · [修复](docs/INDEPENDENT_ACCEPTANCE_FIXES_20261016.md) |
+| **冻结后独立验收** | 第一批（10-14）完整局 3/5，三根因已修；第二批（10-17，修复后冻结 `b6029d5c`）可封印 3 局事件 F1 99.0%、完整局 2/3，另 2 局含冻结引擎不支持的牌型无法封印；首个 541 张牌面 holdout 93.9%（红桃 7→2 占错例一半）。**均未通过** | [10-14](docs/INDEPENDENT_ACCEPTANCE_20261014.md) · [修复](docs/INDEPENDENT_ACCEPTANCE_FIXES_20261016.md) · [10-17](docs/INDEPENDENT_ACCEPTANCE_20261017.md) |
 
 关于最后两行要说清楚：2026-09-07 冻结的五局 AI 参考基线最初整局成功 **0/5**，之后据失败原帧做了 v8–v11 四轮修复，回归到 6/6；这批数据已参与调参，只算**回归证据**。2026-10-14 起在冻结实现 `04f83e90` 下另录了 8 局 acceptance，3 局因采集卡顿被 finalize 拒收（原样计入批次审计），5 局有效：系统没有记错过任何一手（精确率 100%），但完整局只有 3/5，失误集中在三个终局/余牌问题上，正式门禁**未通过**。这批数据也已看过，之后同样只能做回归。详见 [INDEPENDENT_ACCEPTANCE_20261014.md](docs/INDEPENDENT_ACCEPTANCE_20261014.md)。2026-10-16 按三根因修复后，同一 5 局回归全部通过（动作 174/174、牌组 104/104、余牌 517/522），见 [INDEPENDENT_ACCEPTANCE_FIXES_20261016.md](docs/INDEPENDENT_ACCEPTANCE_FIXES_20261016.md)；这是回归，不是新的独立验收。
 
@@ -155,6 +155,7 @@ data/ models/ logs/ runs/   数据、模型、日志、产物，均不入库
 - [RELIABILITY_REVIEW_20260905.md](docs/RELIABILITY_REVIEW_20260905.md) — 可靠性修复验收表
 - [INDEPENDENT_ACCEPTANCE_20261014.md](docs/INDEPENDENT_ACCEPTANCE_20261014.md) — 冻结 `04f83e90` 后的 5 局独立验收与失败根因
 - [INDEPENDENT_ACCEPTANCE_FIXES_20261016.md](docs/INDEPENDENT_ACCEPTANCE_FIXES_20261016.md) — 三根因的取证、修复、测试与同批回归
+- [INDEPENDENT_ACCEPTANCE_20261017.md](docs/INDEPENDENT_ACCEPTANCE_20261017.md) — 修复后冻结 `b6029d5c` 的第二批 5 局独立验收、诊断回放与首个牌面 holdout
 - AI 参考回归：[ACCEPTANCE_20260907](docs/AI_REFERENCE_ACCEPTANCE_20260907.md) · [ACCEPTANCE_20260907_003](docs/AI_REFERENCE_ACCEPTANCE_20260907_003.md) · 修复 [v8](docs/AI_REFERENCE_FIXES_20260907_V8.md) · [v9](docs/AI_REFERENCE_FIXES_20260907_V9.md) · [v10](docs/AI_REFERENCE_FIXES_20260908_V10.md) · [v11](docs/AI_REFERENCE_FIXES_20260908_V11.md)
 - [PHASE_HISTORY.md](docs/PHASE_HISTORY.md) — Phase 1–6 的逐阶段命令、参数与实测记录（原 README 主体）
 
@@ -163,7 +164,7 @@ data/ models/ logs/ runs/   数据、模型、日志、产物，均不入库
 - **单皮肤绑定**：几何、颜色阈值、Joker 墨色、回合控件实体均针对当前 macOS 斗地主客户端的经典布局标定；换皮肤或平台需要重新标定并重新验证，不宣称跨皮肤泛化。
 - **对手模型是均匀基线**：未知牌均匀抽样，不建模对手行为；UI 会标出 `uniform_opponent_model` 风险，Top 候选置信区间重叠时标记排序不稳定。
 - **中途启动是近似模型**：看不见的历史牌只记 `hidden_played_count` 并进入未知采样池，不伪造牌点。
-- **独立验收未通过**：冻结 `04f83e90` 的 5 局完整局成功 3/5（门槛 80%）；三根因修复后同批回归 5/5，但只有在新冻结下另录的对局才算验收，300 张独立牌面 holdout 尚未完成；`make phase6-acceptance` 当前返回非零。
+- **独立验收未通过**：10-14 批完整局 3/5；10-17 批（修复后）可封印 3 局完整局 2/3，另 2 局因冻结规则引擎不支持 `AAAA+JJ`/`666555+33` 无法封印；541 张牌面 holdout 93.9%（门槛 95%），红桃 7 与桌面红方 A 是系统性错例；`make phase6-acceptance` 当前返回非零。
 - 不做自动点击、强化学习、云部署或多平台适配。
 
 ## 配置与日志
