@@ -793,7 +793,31 @@ class SceneRecognizer:
             )
         # Overlapping table Jokers can leave the upper corner reading as the
         # lower card's Joker; the deck then forces the complement.
-        return resolve_joker_pair(observed_cards, colors)
+        resolved = resolve_joker_pair(observed_cards, colors)
+        # A corner whose right neighbour starts inside its glyph zone (cards
+        # still sliding into place, or a far tighter overlap than this client
+        # ever settles on) cannot be read: a partial Q can score as a 6. The
+        # reading is kept for diagnostics with zero confidence; nothing is
+        # re-classified or invented.
+        visible_widths = _visible_corner_widths(boxes)
+        gated: list[VisualCard] = []
+        for card, visible in zip(resolved, visible_widths, strict=True):
+            crop_width = card.box[2] - card.box[0]
+            if (
+                visible is not None
+                and visible < self.config.table_rank_crop.minimum_visible_width_ratio * crop_width
+            ):
+                reason = f"partial_corner:{visible}/{crop_width}"
+                card = replace(
+                    card,
+                    confidence=0.0,
+                    evidence=(
+                        replace(card.evidence, geometry_reason=reason)
+                        if card.evidence is not None else None
+                    ),
+                )
+            gated.append(card)
+        return tuple(gated)
 
     def _observe_hand(
         self,
@@ -1353,6 +1377,33 @@ def _remaining_zero_hole_incompatible(
 
 def _minimum_card_confidence(cards: Sequence[VisualCard]) -> float:
     return min((card.confidence for card in cards), default=0.0)
+
+
+def _visible_corner_widths(
+    boxes: Sequence[tuple[int, int, int, int]],
+) -> tuple[int | None, ...]:
+    """Horizontal extent of each box before its nearest right neighbour in the same row.
+
+    Pure geometry on the segmentation boxes: a neighbour shares the row when
+    the two boxes overlap vertically by at least half of the shorter height,
+    so a card wrapped below the last slot is not a neighbour. ``None`` means
+    no right neighbour, i.e. the full crop is visible.
+    """
+    widths: list[int | None] = []
+    for left, top, _right, bottom in boxes:
+        nearest: int | None = None
+        for other_left, other_top, _other_right, other_bottom in boxes:
+            if other_left <= left:
+                continue
+            overlap = min(bottom, other_bottom) - max(top, other_top)
+            shorter = max(1, min(bottom - top, other_bottom - other_top))
+            if overlap * 2 < shorter:
+                continue
+            visible = other_left - left
+            if nearest is None or visible < nearest:
+                nearest = visible
+        widths.append(nearest)
+    return tuple(widths)
 
 
 def _rank_glyph_signature(image: Image.Image) -> frozenset[int]:

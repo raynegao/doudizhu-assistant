@@ -24,8 +24,18 @@ REAL_SPLITS: tuple[str, ...] = ("train", "val", "test")
 @dataclass(frozen=True)
 class CropSource:
     crop_dir: Path
-    labels: tuple[str, ...]
+    labels: tuple[str, ...] = ()
     note: str = ""
+    labels_file: str | None = None
+    per_crop: int | None = None
+
+    def resolve_labels(self) -> tuple[str, ...]:
+        """Inline labels, or the space-separated ``labels_file`` next to the crops."""
+        if self.labels_file is None:
+            return self.labels
+        if self.labels:
+            raise ValueError(f"{self.crop_dir}: give either labels or labels_file, not both")
+        return tuple((self.crop_dir / self.labels_file).read_text(encoding="utf-8").split())
 
 
 DEFAULT_CROP_SOURCES: tuple[CropSource, ...] = (
@@ -41,6 +51,22 @@ DEFAULT_CROP_SOURCES: tuple[CropSource, ...] = (
         crop_dir=Path("data/roi_samples/window_mode_jokers_sj_gray"),
         labels=("SJ",),
         note="temporary_gray_sj_from_bj_crop",
+    ),
+    # Real-window corner crops cut from the 2026-10-14 regression recordings
+    # (not holdout data) by work/fix-20261018/build_training_crops.py; labels
+    # come from that batch's blind action labels and every crop that matched a
+    # sealed 2026-10-17 holdout crop (exact or MAD<=1.0) was dropped.
+    CropSource(
+        crop_dir=Path("data/roi_samples/real_window_20261014_hand"),
+        labels_file="labels.txt",
+        note="real_window_20261014_hand",
+        per_crop=8,
+    ),
+    CropSource(
+        crop_dir=Path("data/roi_samples/real_window_20261014_table"),
+        labels_file="labels.txt",
+        note="real_window_20261014_table",
+        per_crop=8,
     ),
 )
 
@@ -139,10 +165,12 @@ def _write_real_crop_samples(
     written = 0
     for source in crop_sources:
         paths = sorted(source.crop_dir.glob("card_*.png"))
-        if len(paths) != len(source.labels):
-            raise ValueError(f"{source.crop_dir} has {len(paths)} card crops but {len(source.labels)} labels")
-        for index, (path, rank) in enumerate(zip(paths, source.labels, strict=True)):
-            split_counts = _split_counts(real_per_crop, {"train": 0.7, "val": 0.2, "test": 0.1})
+        labels = source.resolve_labels()
+        if len(paths) != len(labels):
+            raise ValueError(f"{source.crop_dir} has {len(paths)} card crops but {len(labels)} labels")
+        per_crop = real_per_crop if source.per_crop is None else source.per_crop
+        for index, (path, rank) in enumerate(zip(paths, labels, strict=True)):
+            split_counts = _split_counts(per_crop, {"train": 0.7, "val": 0.2, "test": 0.1})
             written += _augment_source_to_splits(
                 source_path=path,
                 rank=rank,

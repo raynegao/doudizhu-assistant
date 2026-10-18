@@ -51,7 +51,15 @@ class SelfTerminalEvidenceGate:
         epoch: int | None,
         stability_frames: int,
         confidence_threshold: float,
+        commit: bool = True,
     ) -> ObservedAction | None:
+        """Return the terminal play once the evidence is stable.
+
+        With ``commit=False`` the caller is judging a previewed state (an
+        inferred opponent pass still to be committed first); the gate then
+        does not record the revision as emitted, so the real terminal play
+        can still be produced for that revision afterwards.
+        """
         if (
             isinstance(stability_frames, bool)
             or not isinstance(stability_frames, int)
@@ -156,7 +164,8 @@ class SelfTerminalEvidenceGate:
         self._support += 1
         if self._support < stability_frames:
             return None
-        self._emitted_revision = (state.round_id, state.revision)
+        if commit:
+            self._emitted_revision = (state.round_id, state.revision)
         self.reset()
         return event
 
