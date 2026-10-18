@@ -115,6 +115,27 @@ class ShapedAgent:
 
 
 @dataclass(frozen=True)
+class DouZeroAgent:
+    """Greedy DouZero network over the rule engine's legal actions (loaded lazily)."""
+
+    checkpoint_dir: str = "models/douzero"
+    name: str = "douzero"
+    _policy: list[object] = field(default_factory=list, compare=False, repr=False)
+
+    def choose(self, state: ObservableGameState, rng: random.Random) -> Play:
+        if not self._policy:
+            # Imported here so arena workers without a DouZero agent never load PyTorch.
+            import torch
+
+            from src.logic.douzero_policy import DouZeroPolicy
+
+            torch.set_num_threads(1)  # one game per worker process; avoid thread oversubscription
+            self._policy.append(DouZeroPolicy(self.checkpoint_dir))
+        policy = self._policy[0]
+        return policy.choose(state)  # type: ignore[attr-defined]
+
+
+@dataclass(frozen=True)
 class MonteCarloAgent:
     """The Phase 4/6 recommender; the seed of every decision comes from the game rng.
 
@@ -160,6 +181,8 @@ class AgentSpec:
             return HeuristicAgent()
         if self.kind == "shaped":
             return ShapedAgent()
+        if self.kind == "douzero":
+            return DouZeroAgent(checkpoint_dir=str(self.settings.get("checkpoint_dir", "models/douzero")))
         if self.kind == "monte_carlo":
             defaults = MonteCarloAgent().settings
             overrides = cast(dict[str, Any], dict(self.settings))
@@ -528,6 +551,7 @@ __all__ = [
     "ArenaDeal",
     "ArenaError",
     "CONFIGURATIONS",
+    "DouZeroAgent",
     "GameRecord",
     "HeuristicAgent",
     "MatchSettings",

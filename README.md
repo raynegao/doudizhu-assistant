@@ -15,7 +15,7 @@ AI-based Dou Dizhu assistant with Mac screen capture, CNN card recognition, a ru
 | 规则引擎 / 合法动作 / 牌型比较 | 完成，CLI 可独立使用 | `tests/`，`python -m src.ui.cli` |
 | CNN 牌面分类（固定 ROI 切牌） | 完成；本地 train/val/test 100%，**不是**真实窗口泛化准确率 | `models/card_cnn.metrics.json`（不入库） |
 | Mac 实时流水线（ScreenCaptureKit 持久流 → 识别 → 状态 → 决策 → Tk 置顶窗） | 完成；热态采集约 9.8 ms，完整识别中位数约 128 ms | [PHASE6_LIVE_ASSISTANT.md](docs/PHASE6_LIVE_ASSISTANT.md) |
-| 蒙特卡洛 Top-K + 置信区间 | 完成；对手模型为**均匀未知牌抽样**，是可解释基线而非行为模型。10-18 起有自对弈评测：对自身走子启发式配对优势地主 +0.24、农民 +0.52；采样改为逐次淘汰后决赛候选样本 64 → 100 | [ARCHITECTURE.md](docs/ARCHITECTURE.md) · [DECISION_ARENA.md](docs/DECISION_ARENA.md) |
+| 决策：蒙特卡洛 Top-K + 置信区间 / DouZero 预训练网络 | 蒙特卡洛是可解释基线（均匀未知牌抽样，10-18 起采样改为逐次淘汰）；可选 `decision_backend=douzero` 用 DouZero-WP 网络给规则引擎的合法动作打分，自对弈直接对局对现有蒙特卡洛配对优势地主 +0.27、农民 +0.22，每次决策约 5 ms（权重需自行放入 `models/douzero/`） | [ARCHITECTURE.md](docs/ARCHITECTURE.md) · [DECISION_ARENA.md](docs/DECISION_ARENA.md) |
 | 无损录制 / 逐帧 SHA256 / 盲标封印 / replay 评测 | 完成 | [PHASE6_ACCEPTANCE.md](docs/PHASE6_ACCEPTANCE.md) |
 | AI 参考标注回归（六局 11,025 帧） | 动作 188/188、余牌 557/564、严格完整局 6/6 | [AI_REFERENCE_FIXES_20260908_V11.md](docs/AI_REFERENCE_FIXES_20260908_V11.md) |
 | **冻结后独立验收** | 第一批（10-14）完整局 3/5，三根因已修；第二批（10-17，修复后冻结 `b6029d5c`）可封印 3 局事件 F1 99.0%、完整局 2/3，另 2 局含冻结引擎不支持的牌型无法封印；首个 541 张牌面 holdout 93.9%（标签修正后 94.8%，红桃 7→2 占错例一半）。**均未通过**。10-18 已修四个根因并用真实裁图重训 CNN，同批回归 10 局全部完整（只是回归） | [10-14](docs/INDEPENDENT_ACCEPTANCE_20261014.md) · [修复](docs/INDEPENDENT_ACCEPTANCE_FIXES_20261016.md) · [10-17](docs/INDEPENDENT_ACCEPTANCE_20261017.md) · [修复 2](docs/INDEPENDENT_ACCEPTANCE_FIXES_20261018.md) |
@@ -149,7 +149,7 @@ data/ models/ logs/ runs/   数据、模型、日志、产物，均不入库
 - [PHASE6_LIVE_ASSISTANT.md](docs/PHASE6_LIVE_ASSISTANT.md) — 实时助手标定、模板、录制、运行、状态保护
 - [PHASE6_ACCEPTANCE.md](docs/PHASE6_ACCEPTANCE.md) — 正式录制、盲标、replay、聚合门禁
 - [EVALUATION.md](docs/EVALUATION.md) — 评测口径与基准
-- [DECISION_ARENA.md](docs/DECISION_ARENA.md) — 决策层自对弈评测、逐次淘汰采样与走子策略对比
+- [DECISION_ARENA.md](docs/DECISION_ARENA.md) — 决策层自对弈评测、逐次淘汰采样、走子策略对比与 DouZero 预训练网络接入
 - [REAL_WINDOW_HOLDOUT.md](docs/REAL_WINDOW_HOLDOUT.md) — 独立牌面 holdout 采集与评测
 - [SHOWCASE.md](docs/SHOWCASE.md) — Demo 与录屏说明
 - [PORTFOLIO.md](docs/PORTFOLIO.md) — 中英文作品集 / 简历描述
@@ -164,7 +164,7 @@ data/ models/ logs/ runs/   数据、模型、日志、产物，均不入库
 ## 已知限制
 
 - **单皮肤绑定**：几何、颜色阈值、Joker 墨色、回合控件实体均针对当前 macOS 斗地主客户端的经典布局标定；换皮肤或平台需要重新标定并重新验证，不宣称跨皮肤泛化。
-- **对手模型是均匀基线**：未知牌均匀抽样，不建模对手行为；UI 会标出 `uniform_opponent_model` 风险，Top 候选置信区间重叠时标记排序不稳定。
+- **对手模型是均匀基线**：未知牌均匀抽样，不建模对手行为；UI 会标出 `uniform_opponent_model` 风险，Top 候选置信区间重叠时标记排序不稳定。DouZero 后端的估值未经校准，UI 只显示折算值不给区间；其棋力数据只来自与本项目基线的自对弈，不是对人类玩家的声明。
 - **中途启动是近似模型**：看不见的历史牌只记 `hidden_played_count` 并进入未知采样池，不伪造牌点。
 - **独立验收未通过**：10-14 批完整局 3/5；10-17 批（修复后）可封印 3 局完整局 2/3，另 2 局因冻结规则引擎不支持 `AAAA+JJ`/`666555+33` 无法封印；541 张牌面 holdout 93.9%（标签修正后 94.8%，门槛 95%），红桃 7 与桌面红方 A 是系统性错例。10-18 的修复与重训只在已看过的两批上做了回归，`make phase6-acceptance` 当前仍返回非零，要等重新冻结后的新录制。
 - 不做自动点击、强化学习、云部署或多平台适配。

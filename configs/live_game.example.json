@@ -102,5 +102,7 @@
   "top_k": 3,
   "max_candidates": 20,
   "allocation": "successive_halving",
-  "rollout_policy": "heuristic"
+  "rollout_policy": "heuristic",
+  "decision_backend": "monte_carlo",
+  "douzero_checkpoint_dir": "models/douzero"
 }

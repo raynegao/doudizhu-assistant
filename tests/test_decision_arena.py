@@ -128,3 +128,17 @@ def test_wilson_interval_is_bounded_and_centred() -> None:
     assert wilson_interval(0, 0) == (0.0, 1.0)
     low, high = wilson_interval(10, 10)
     assert low < 0.75 and 0.99 < high <= 1.0
+
+
+def test_douzero_agent_spec_is_lazy_and_plays_legal_moves(tmp_path) -> None:
+    torch = pytest.importorskip("torch")
+    from src.logic.douzero_policy import CHECKPOINT_FILES, build_model
+
+    torch.manual_seed(3)
+    for position, name in CHECKPOINT_FILES.items():
+        torch.save(build_model(position).state_dict(), tmp_path / name)
+    agent = AgentSpec("douzero", {"checkpoint_dir": str(tmp_path)}).build()
+    assert agent.name == "douzero"
+    deal = deal_cards(random.Random(9), landlord=0)
+    record = play_game(deal, [agent, RuleAgent(), HeuristicAgent()], rng=random.Random(9))
+    assert record.agents[0] == "douzero" and record.winner in range(3)

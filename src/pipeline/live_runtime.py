@@ -96,6 +96,28 @@ class LiveDecisionRecord:
         }
 
 
+def select_decision_fn(config: LiveLayoutConfig, decision_fn: DecisionFn) -> DecisionFn:
+    """Honour ``decision_backend`` unless the caller injected its own function."""
+    if decision_fn is not recommend_phase4 or config.decision_backend == "monte_carlo":
+        return decision_fn
+    if config.decision_backend == "douzero":
+        # Imported here: the DouZero module needs PyTorch, which the Monte
+        # Carlo path never loads in the decision process.
+        from src.logic.douzero_policy import CHECKPOINT_FILES, douzero_decision_fn
+
+        missing = [
+            name for name in CHECKPOINT_FILES.values()
+            if not (Path(config.douzero_checkpoint_dir) / name).is_file()
+        ]
+        if missing:
+            raise FileNotFoundError(
+                "decision_backend=douzero needs the DouZero-WP checkpoints "
+                f"{missing} in {config.douzero_checkpoint_dir}; see docs/DECISION_ARENA.md"
+            )
+        return douzero_decision_fn(config.douzero_checkpoint_dir)
+    raise ValueError(f"unknown decision backend: {config.decision_backend}")
+
+
 def _evaluate_live_decision(
     decision_fn: DecisionFn,
     state: ObservableGameState,
@@ -173,6 +195,7 @@ class LiveGameRuntime:
         diagnostic_evidence: bool | None = None,
     ) -> None:
         production_components = frame_source is None and recognizer is None and tracker is None
+        decision_fn = select_decision_fn(config, decision_fn)
         use_process_decisions = decision_fn is recommend_phase4 and production_components
         self.config = config
         self.resume_session_id = resume_session_id
