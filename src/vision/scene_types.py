@@ -78,6 +78,9 @@ class CardFusionEvidence:
     input_geometry: str | None = None
     input_box: tuple[int, int, int, int] | None = None
     input_photometry: CardPhotometryEvidence | None = None
+    # Set when segmentation geometry alone voids the reading (for example a
+    # corner cut by the next card); the rank and scores above stay as read.
+    geometry_reason: str | None = None
 
     def to_log_payload(self) -> dict[str, object]:
         payload: dict[str, object] = {
@@ -101,6 +104,8 @@ class CardFusionEvidence:
             payload["input_box"] = list(self.input_box) if self.input_box is not None else None
         if self.input_photometry is not None:
             payload["input_photometry"] = self.input_photometry.to_log_payload()
+        if self.geometry_reason is not None:
+            payload["geometry_reason"] = self.geometry_reason
         return payload
 
 

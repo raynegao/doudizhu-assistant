@@ -4,7 +4,7 @@ from collections import Counter
 from collections.abc import Iterable
 from dataclasses import dataclass
 from enum import Enum
-from itertools import combinations
+from itertools import combinations, combinations_with_replacement
 
 from src.state.cards import CHAIN_RANKS, RANK_VALUE, CardSet, parse_cards, sort_cards
 
@@ -105,7 +105,8 @@ def classify_play(cards: Iterable[str]) -> Play:
     if size == 5 and count_values == [3, 2]:
         return Play(normalized, PlayType.TRIPLE_PAIR, ranks_by_count[3][0], size, 1)
 
-    if size == 6 and count_values == [4, 1, 1]:
+    # The two attached singles may share a rank (AAAA + JJ); the client plays it.
+    if size == 6 and count_values in ([4, 1, 1], [4, 2]):
         return Play(normalized, PlayType.FOUR_TWO_SINGLE, ranks_by_count[4][0], size, 1)
 
     if size == 8 and count_values == [4, 2, 2]:
@@ -159,7 +160,11 @@ def _classify_plane(cards: tuple[str, ...], counts: Counter[str]) -> Play | None
         return Play(cards, PlayType.PLANE, main_rank, size, triple_count)
 
     attachments = Counter(count for rank, count in counts.items() if rank not in triple_ranks)
-    if size == triple_count * 4 and attachments == Counter({1: triple_count}):
+    # Single wings are any ``triple_count`` leftover cards; two of them may
+    # share a rank (666555 + 33), as the real client allows. A leftover group
+    # of three would have joined the chain or broken its run above, so the
+    # size check alone bounds the wings.
+    if size == triple_count * 4 and max(attachments, default=0) <= 2:
         return Play(cards, PlayType.PLANE_SINGLE, main_rank, size, triple_count)
     if size == triple_count * 5 and attachments == Counter({2: triple_count}):
         return Play(cards, PlayType.PLANE_PAIR, main_rank, size, triple_count)
@@ -239,6 +244,9 @@ def _all_candidate_plays(hand: CardSet) -> list[Play]:
         single_ranks = [rank for rank in counts if rank != bomb]
         for kickers in combinations(single_ranks, 2):
             candidates.add(sort_cards((bomb, bomb, bomb, bomb, *kickers)))
+        for rank in single_ranks:
+            if counts[rank] >= 2:
+                candidates.add(sort_cards((bomb, bomb, bomb, bomb, rank, rank)))
         pair_ranks = [rank for rank, count in counts.items() if rank != bomb and count >= 2]
         for kickers in combinations(pair_ranks, 2):
             cards = [bomb, bomb, bomb, bomb]
@@ -279,8 +287,10 @@ def _add_planes(candidates: set[tuple[str, ...]], counts: Counter[str]) -> None:
 
         excluded = set(chain)
         single_ranks = [rank for rank in counts if rank not in excluded]
-        for kickers in combinations(single_ranks, len(chain)):
-            candidates.add(sort_cards((*base, *kickers)))
+        # Wings may repeat a rank as long as the hand holds that many copies.
+        for kickers in combinations_with_replacement(single_ranks, len(chain)):
+            if all(kickers.count(rank) <= min(counts[rank], 2) for rank in set(kickers)):
+                candidates.add(sort_cards((*base, *kickers)))
 
         pair_ranks = [rank for rank, count in counts.items() if rank not in excluded and count >= 2]
         for kickers in combinations(pair_ranks, len(chain)):

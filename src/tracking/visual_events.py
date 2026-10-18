@@ -427,6 +427,10 @@ class VisualEventTracker:
         initial = _initial_state_payload(
             scene,
             confidence_threshold=self.confidence_threshold,
+            allow_dealt_display=(
+                self._tracker is None
+                or self.mode is not VisualTrackerMode.TRACKING
+            ),
         )
         if initial is None:
             self._initial_stable.update(("not_initial",))
@@ -581,18 +585,37 @@ class VisualEventTracker:
             self._scene_evidence_start_frame_id, self._self_actor_entry_frame_id,
         ) if value is not None]
         table = scene.self_table
-        terminal_event = self._self_terminal_gate.observe(
-            state=state, scene=scene,
-            cards=table.cards if table is not None else (),
-            complete=table.complete if table is not None else False,
-            empty_hand_verified=scene.self_hand_empty_verified,
-            epoch=max(watermarks) if watermarks else None,
-            stability_frames=self.stability_frames,
-            confidence_threshold=self.confidence_threshold,
-        )
-        if terminal_event is None:
+
+        def observe(candidate: ObservableGameState, *, commit: bool) -> ObservedAction | None:
+            return self._self_terminal_gate.observe(
+                state=candidate, scene=scene,
+                cards=table.cards if table is not None else (),
+                complete=table.complete if table is not None else False,
+                empty_hand_verified=scene.self_hand_empty_verified,
+                epoch=max(watermarks) if watermarks else None,
+                stability_frames=self.stability_frames,
+                confidence_threshold=self.confidence_threshold,
+                commit=commit,
+            )
+
+        if state.current_actor is PlayerSeat.SELF:
+            terminal_event = observe(state, commit=True)
+            if terminal_event is None:
+                return None
+            return self._apply_event(scene, scene.seat(PlayerSeat.SELF), terminal_event)
+        # The opponents still owed a reply to our lead, but their pass label may
+        # have shown only during a self-hand crop pause and been cleared by the
+        # game before geometry recovered. A blank seat with a verified unchanged
+        # counter plus our complete terminal table is the pass -> finish chain;
+        # the gate judges that chain on the previewed state, and the pass is
+        # committed first, one event per update.
+        chain = _terminal_pass_chain(scene, state, confidence_threshold=self.confidence_threshold)
+        if chain is None:
             return None
-        return self._apply_event(scene, scene.seat(PlayerSeat.SELF), terminal_event)
+        first_pass, previewed = chain
+        if observe(previewed, commit=False) is None:
+            return None
+        return self._apply_event(scene, scene.seat(first_pass.actor), first_pass)
 
     def _collect_turn_evidence(
         self, scene: SceneObservation, state: ObservableGameState,
@@ -1918,6 +1941,7 @@ def _initial_state_payload(
     scene: SceneObservation,
     *,
     confidence_threshold: float,
+    allow_dealt_display: bool = True,
 ) -> _InitialStatePayload | None:
     landlords = [
         observation.seat
@@ -1952,10 +1976,28 @@ def _initial_state_payload(
     if hand_confidence < confidence_threshold:
         return None
 
+    # Between bidding and the landlord's first play the client shows the three
+    # dealt cards at the top of the table, inside the opponents' play ROIs. A
+    # seat whose verified counter still equals its deal cannot have played, so
+    # such cards are the dealt-cards display, not an action to rebuild from.
+    # The caller disables this while a round is actively tracked: there the
+    # same frame is an opponent play whose counter has not yet decremented,
+    # which the action path keeps waiting for instead of re-dealing.
+    dealt_display_only = allow_dealt_display and scene.seat(
+        PlayerSeat.SELF,
+    ).signal is VisualSignal.NEUTRAL and all(
+        observation.signal is VisualSignal.NEUTRAL
+        or (
+            observation.remaining_verified
+            and observation.remaining_count == expected[observation.seat]
+        )
+        for observation in scene.seats
+        if observation.seat is not PlayerSeat.SELF
+    )
     if any(
         observation.signal is not VisualSignal.NEUTRAL
         for observation in scene.seats
-    ):
+    ) and not dealt_display_only:
         return _opening_state_payload(
             scene,
             landlord=landlord,
@@ -3131,6 +3173,72 @@ def _can_infer_pass(
             scene.seat(following),
         )
     return False
+
+
+_TERMINAL_PASS_SOURCE = "live_terminal_inferred_pass"
+
+
+def _terminal_pass_chain(
+    scene: SceneObservation,
+    state: ObservableGameState,
+    *,
+    confidence_threshold: float,
+) -> tuple[ObservedAction, ObservableGameState] | None:
+    """Pass events for the blank, unchanged opponents owed after our lead.
+
+    Returns the first pass and the state previewed through every pass up to
+    the point where SELF is current again, or None when any owed seat shows
+    cards, an unverified or changed counter, or the reducer rejects a pass.
+    """
+    if (
+        state.phase is not RoundPhase.PLAYING
+        or state.trick_leader is not PlayerSeat.SELF
+        or not state.trick_target.cards
+        or state.current_actor is PlayerSeat.SELF
+    ):
+        return None
+    previewed = state
+    first: ObservedAction | None = None
+    for _ in range(len(PlayerSeat) - 1):
+        actor = previewed.current_actor
+        if actor is PlayerSeat.SELF:
+            break
+        observation = scene.seat(actor)
+        if (
+            observation.signal not in {VisualSignal.NEUTRAL, VisualSignal.PASS}
+            or observation.cards
+            or not observation.remaining_verified
+            or observation.remaining_count != previewed.remaining_for(actor)
+        ):
+            return None
+        confidence = max(
+            observation.pass_confidence,
+            min(observation.confidence, observation.remaining_confidence),
+        )
+        if not 0.0 <= confidence <= 1.0:
+            return None
+        event = ObservedAction(
+            event_id=f"{previewed.round_id}:{previewed.last_sequence_no + 1}:{actor.value}",
+            sequence_no=previewed.last_sequence_no + 1,
+            actor=actor,
+            cards=CardSet(()),
+            confidence=confidence,
+            source=_TERMINAL_PASS_SOURCE,
+        )
+        try:
+            preview = reduce_observed_action(
+                previewed, event, validator=validate_observed_action,
+                confidence_threshold=confidence_threshold,
+            )
+        except GameStateTransitionError:
+            return None
+        if preview.status is not StateUpdateStatus.APPLIED:
+            return None
+        first = first or event
+        previewed = preview.state
+    if first is None or previewed.current_actor is not PlayerSeat.SELF:
+        return None
+    return first, previewed
 
 
 def _inferred_pass_confidence(

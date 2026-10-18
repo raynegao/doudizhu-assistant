@@ -15,9 +15,17 @@ class TableRankCropConfig:
     visible_corner_height_ratio: float = 0.68
     minimum_height: int = 24
     minimum_width: int = 16
+    # A table card whose right neighbour starts closer than this fraction of
+    # its own crop width has its rank glyph cut by that neighbour (settled
+    # overlaps on this client leave ~0.81, a slide-in animation frame ~0.38);
+    # such a corner is reported with zero confidence, never classified.
+    minimum_visible_width_ratio: float = 0.60
 
     def __post_init__(self) -> None:
-        for name in ("body_height_ratio", "width_height_ratio", "visible_corner_height_ratio"):
+        for name in (
+            "body_height_ratio", "width_height_ratio", "visible_corner_height_ratio",
+            "minimum_visible_width_ratio",
+        ):
             value = getattr(self, name)
             if (
                 isinstance(value, bool)

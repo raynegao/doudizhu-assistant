@@ -39,6 +39,8 @@ python -m scripts.prepare_real_window_holdout \
 
 `session.json` 会封存原 ROI、contact sheet、标签和 crop 数量。相同 `source-id`、相同 ROI 或相同 crop 会被拒绝。`data/` 默认被 Git 忽略，不提交私有截图。
 
+标签必须按画面**从左到右的摆放顺序**写，不是按点数排序。手牌扇总是点数降序；但桌面出牌里带牌的牌型（三带一/二、四带二、飞机）这个客户端是**主牌组在前、带牌在后**（例如 `3 3 3 4`、`7 7 7 8 8`、`4 4 4 3 3 3 6 5`），按降序写标签会把主牌和带牌的标签互换——2026-10-17 的 v2 holdout 就因此错了 5 张桌面标签（见 [INDEPENDENT_ACCEPTANCE_20261017.md](INDEPENDENT_ACCEPTANCE_20261017.md) 补记）。
+
 ## 2. 预测前盲封存
 
 达到 300 张、15 类每类至少 10 张、至少 3 个独立来源后，在运行任何 holdout 预测前执行：
