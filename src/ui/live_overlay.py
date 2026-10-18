@@ -194,6 +194,8 @@ def _format_evaluation(
         return "胜率不可用（规则回退）"
     if "exact_finish" in evaluation.reason_factors:
         return "可直接出完（规则已确认）"
+    if evaluation.win_rate_estimate_kind == "douzero_value":
+        return f"DouZero 估值（未校准）：{evaluation.estimated_win_rate:.1%}"
     is_score = (
         evaluation.win_rate_estimate_kind == "bounded_rollout_score"
         or "depth_limit_reached" in evaluation.risk_flags

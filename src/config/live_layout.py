@@ -137,6 +137,10 @@ class LiveLayoutConfig:
     # landlord in simulation and stays optional.
     allocation: str = "successive_halving"
     rollout_policy: str = "heuristic"
+    # "monte_carlo" keeps the sampled recommender; "douzero" ranks the legal
+    # actions with the pretrained DouZero-WP networks in douzero_checkpoint_dir.
+    decision_backend: str = "monte_carlo"
+    douzero_checkpoint_dir: str = "models/douzero"
 
     def __post_init__(self) -> None:
         if not isinstance(self.joker_color, JokerColorConfig):
@@ -206,6 +210,10 @@ class LiveLayoutConfig:
             raise ValueError("allocation must be 'uniform' or 'successive_halving'")
         if self.rollout_policy not in ("heuristic", "shaped"):
             raise ValueError("rollout_policy must be 'heuristic' or 'shaped'")
+        if self.decision_backend not in ("monte_carlo", "douzero"):
+            raise ValueError("decision_backend must be 'monte_carlo' or 'douzero'")
+        if not self.douzero_checkpoint_dir:
+            raise ValueError("douzero_checkpoint_dir must not be empty")
 
     def roi(self, name: str) -> NormalizedBox:
         try:
@@ -262,6 +270,8 @@ class LiveLayoutConfig:
             "max_candidates": self.max_candidates,
             "allocation": self.allocation,
             "rollout_policy": self.rollout_policy,
+            "decision_backend": self.decision_backend,
+            "douzero_checkpoint_dir": self.douzero_checkpoint_dir,
         }
 
 
@@ -378,6 +388,8 @@ def live_layout_from_dict(data: Mapping[str, object]) -> LiveLayoutConfig:
         max_candidates=int(str(data.get("max_candidates", defaults.max_candidates))),
         allocation=str(data.get("allocation", defaults.allocation)),
         rollout_policy=str(data.get("rollout_policy", defaults.rollout_policy)),
+        decision_backend=str(data.get("decision_backend", defaults.decision_backend)),
+        douzero_checkpoint_dir=str(data.get("douzero_checkpoint_dir", defaults.douzero_checkpoint_dir)),
     )
 
 

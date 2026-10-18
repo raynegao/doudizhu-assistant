@@ -18,7 +18,7 @@ from pathlib import Path
 from src.logic.arena import CONFIGURATIONS, AgentSpec, MatchSettings, run_match
 from src.logic.monte_carlo import RULESET_VERSION
 
-AGENT_KINDS = ("random", "rule", "heuristic", "shaped", "monte_carlo")
+AGENT_KINDS = ("random", "rule", "heuristic", "shaped", "monte_carlo", "douzero")
 
 
 def build_parser() -> argparse.ArgumentParser:
@@ -32,6 +32,7 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--max-candidates", type=int, default=20)
     parser.add_argument("--allocation", choices=("uniform", "successive_halving"), default="uniform")
     parser.add_argument("--rollout-policy", choices=("heuristic", "shaped"), default="heuristic")
+    parser.add_argument("--douzero-checkpoints", default="models/douzero", help="Directory with the DouZero WP checkpoints.")
     parser.add_argument(
         "--opponent-settings",
         type=json.loads,
@@ -52,15 +53,18 @@ def main(argv: list[str] | None = None) -> int:
         "allocation": args.allocation,
         "rollout_policy": args.rollout_policy,
     }
+    def spec(kind: str, overrides: dict | None) -> AgentSpec:
+        if kind == "monte_carlo":
+            return AgentSpec(kind, overrides if overrides is not None else monte_carlo)
+        if kind == "douzero":
+            return AgentSpec(kind, {"checkpoint_dir": args.douzero_checkpoints})
+        return AgentSpec(kind)
+
     settings = MatchSettings(
         games=args.games,
         seed=args.seed,
-        subject=AgentSpec(args.subject, monte_carlo if args.subject == "monte_carlo" else {}),
-        opponent=AgentSpec(
-            args.opponent,
-            (args.opponent_settings if args.opponent_settings is not None else monte_carlo)
-            if args.opponent == "monte_carlo" else {},
-        ),
+        subject=spec(args.subject, None),
+        opponent=spec(args.opponent, args.opponent_settings),
         workers=args.workers,
     )
     started = time.perf_counter()

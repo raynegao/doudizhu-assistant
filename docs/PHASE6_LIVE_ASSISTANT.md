@@ -170,6 +170,10 @@ Makefile 会优先使用项目 `.venv/bin/python`，无需手动激活虚拟环�
 
 如果是在一局中途启动，等到自己的“出牌/不出”按钮显示后，助手会在连续 2 帧确认角色、手牌、左右余牌和场上待压牌后自动重建。也可以点击置顶窗中的“重新扫描当前牌局”立即请求重扫；按钮会在最多 8 个可用帧内自动重试，吸收短暂遮挡或动画帧，显示“扫描中”时无需重复点击。若识别进程已因连续异常停止，同一个按钮会先重新拉起进程并清除旧错误，再提交重扫。此前已出但画面中不可见的牌只按张数放入未知历史池，不会伪造牌点；对应胜率会显示 `estimated_win_rate_uses_uniform_unknown_history` 风险提示。若不是自己回合，或角色、余牌、待压牌在重试后仍不稳定，本次扫描会保持暂停并等待下一次可确认场面。
 
+### 决策后端
+
+`decision_backend` 默认 `monte_carlo`：Phase 4 蒙特卡洛，按 `simulations`/`time_budget_ms`/`allocation`（默认逐次淘汰）采样，输出估计胜率与 95% 区间。设为 `douzero` 时，推荐改由 DouZero-WP 预训练网络对规则引擎生成的合法动作打分取最高分（`douzero_checkpoint_dir` 默认 `models/douzero/`，需自行放入 `landlord.ckpt`、`landlord_down.ckpt`、`landlord_up.ckpt`），置顶窗显示"DouZero 估值（未校准）"而不是区间；直接出完仍由规则判定为 100%。两种后端都只在规则引擎给出的合法动作里选，不会推荐手里没有的牌。两者的自对弈数据见 [DECISION_ARENA.md](DECISION_ARENA.md)。
+
 ## 5. 状态保护和日志
 
 系统只在以下条件满足时输出推荐：
