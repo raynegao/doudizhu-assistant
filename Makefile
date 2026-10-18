@@ -1,6 +1,6 @@
 PYTHON ?= $(if $(wildcard .venv/bin/python),.venv/bin/python,python)
 
-.PHONY: test coverage lint typecheck quality macos-smoke demo benchmark docker-demo web-demo demo-gif holdout-seal holdout-evaluate live-calibrate live-assistant live-finalize live-annotate-prepare live-annotate-seal live-diagnostics phase6-acceptance
+.PHONY: test coverage lint typecheck quality macos-smoke demo benchmark arena-smoke docker-demo web-demo demo-gif holdout-seal holdout-evaluate live-calibrate live-assistant live-finalize live-annotate-prepare live-annotate-seal live-diagnostics phase6-acceptance
 
 test:
 	$(PYTHON) -m pytest -q
@@ -31,6 +31,10 @@ demo:
 
 benchmark:
 	$(PYTHON) -m scripts.run_phase5_showcase --output-dir runs/showcase-benchmark --repeats 3 --simulations 20 --max-depth 20
+
+arena-smoke:
+	$(PYTHON) -m scripts.run_decision_arena --games 6 --subject monte_carlo --opponent heuristic \
+		--simulations 16 --max-candidates 8 --workers 2 --output-dir runs/decision-arena/smoke
 
 docker-demo:
 	docker build -t doudizhu-assistant:phase5 .

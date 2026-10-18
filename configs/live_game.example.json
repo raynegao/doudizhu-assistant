@@ -100,5 +100,7 @@
   "time_budget_ms": 1500,
   "min_rollouts_per_action": 32,
   "top_k": 3,
-  "max_candidates": 20
+  "max_candidates": 20,
+  "allocation": "successive_halving",
+  "rollout_policy": "heuristic"
 }
