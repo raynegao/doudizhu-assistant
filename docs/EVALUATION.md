@@ -20,6 +20,17 @@ python -m scripts.run_phase5_showcase \
 
 These values describe one machine and configuration. CI verifies completeness and deterministic fingerprints but does not enforce these latency numbers across hardware.
 
+## Decision strength (self-play arena)
+
+Throughput above says nothing about playing strength. Since 2026-10-18 the
+decision layer is measured in seeded self-play (`python -m scripts.run_decision_arena`,
+`make arena-smoke`): every deal is played with the subject as landlord, as both
+farmers, and as a reference game of the baseline against itself, and the report
+gives Wilson intervals plus per-deal paired advantages. Method, baselines and the
+allocation/rollout-policy comparison are in [DECISION_ARENA.md](DECISION_ARENA.md).
+Results compare versions of this project against its own heuristics only; they are
+not a strength claim against human or external AI players.
+
 ## Historical Phase 2 evidence
 
 [`card_cnn_eval.json`](evidence/card_cnn_eval.json) records the original local split sizes, accuracies, error count and manifest hash:

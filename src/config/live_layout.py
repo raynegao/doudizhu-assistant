@@ -131,6 +131,12 @@ class LiveLayoutConfig:
     min_rollouts_per_action: int = 32
     top_k: int = 3
     max_candidates: int = 20
+    # Measured 2026-10-18 (docs/DECISION_ARENA.md): successive halving on the
+    # same 20 candidates raised the finalists' samples from 64 to ~100 at equal
+    # cost and did not lose strength; the shaped rollout policy weakened the
+    # landlord in simulation and stays optional.
+    allocation: str = "successive_halving"
+    rollout_policy: str = "heuristic"
 
     def __post_init__(self) -> None:
         if not isinstance(self.joker_color, JokerColorConfig):
@@ -196,6 +202,10 @@ class LiveLayoutConfig:
             raise ValueError("template_threshold must be between 0 and 1")
         if self.top_k <= 0 or self.max_candidates < self.top_k:
             raise ValueError("max_candidates must be at least top_k")
+        if self.allocation not in ("uniform", "successive_halving"):
+            raise ValueError("allocation must be 'uniform' or 'successive_halving'")
+        if self.rollout_policy not in ("heuristic", "shaped"):
+            raise ValueError("rollout_policy must be 'heuristic' or 'shaped'")
 
     def roi(self, name: str) -> NormalizedBox:
         try:
@@ -250,6 +260,8 @@ class LiveLayoutConfig:
             "min_rollouts_per_action": self.min_rollouts_per_action,
             "top_k": self.top_k,
             "max_candidates": self.max_candidates,
+            "allocation": self.allocation,
+            "rollout_policy": self.rollout_policy,
         }
 
 
@@ -364,6 +376,8 @@ def live_layout_from_dict(data: Mapping[str, object]) -> LiveLayoutConfig:
         )),
         top_k=int(str(data.get("top_k", defaults.top_k))),
         max_candidates=int(str(data.get("max_candidates", defaults.max_candidates))),
+        allocation=str(data.get("allocation", defaults.allocation)),
+        rollout_policy=str(data.get("rollout_policy", defaults.rollout_policy)),
     )
 
 

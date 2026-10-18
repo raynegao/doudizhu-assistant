@@ -15,7 +15,7 @@ AI-based Dou Dizhu assistant with Mac screen capture, CNN card recognition, a ru
 | 规则引擎 / 合法动作 / 牌型比较 | 完成，CLI 可独立使用 | `tests/`，`python -m src.ui.cli` |
 | CNN 牌面分类（固定 ROI 切牌） | 完成；本地 train/val/test 100%，**不是**真实窗口泛化准确率 | `models/card_cnn.metrics.json`（不入库） |
 | Mac 实时流水线（ScreenCaptureKit 持久流 → 识别 → 状态 → 决策 → Tk 置顶窗） | 完成；热态采集约 9.8 ms，完整识别中位数约 128 ms | [PHASE6_LIVE_ASSISTANT.md](docs/PHASE6_LIVE_ASSISTANT.md) |
-| 蒙特卡洛 Top-K + 置信区间 | 完成；对手模型为**均匀未知牌抽样**，是可解释基线而非行为模型 | [ARCHITECTURE.md](docs/ARCHITECTURE.md) |
+| 蒙特卡洛 Top-K + 置信区间 | 完成；对手模型为**均匀未知牌抽样**，是可解释基线而非行为模型。10-18 起有自对弈评测：对自身走子启发式配对优势地主 +0.24、农民 +0.52；采样改为逐次淘汰后决赛候选样本 64 → 100 | [ARCHITECTURE.md](docs/ARCHITECTURE.md) · [DECISION_ARENA.md](docs/DECISION_ARENA.md) |
 | 无损录制 / 逐帧 SHA256 / 盲标封印 / replay 评测 | 完成 | [PHASE6_ACCEPTANCE.md](docs/PHASE6_ACCEPTANCE.md) |
 | AI 参考标注回归（六局 11,025 帧） | 动作 188/188、余牌 557/564、严格完整局 6/6 | [AI_REFERENCE_FIXES_20260908_V11.md](docs/AI_REFERENCE_FIXES_20260908_V11.md) |
 | **冻结后独立验收** | 第一批（10-14）完整局 3/5，三根因已修；第二批（10-17，修复后冻结 `b6029d5c`）可封印 3 局事件 F1 99.0%、完整局 2/3，另 2 局含冻结引擎不支持的牌型无法封印；首个 541 张牌面 holdout 93.9%（标签修正后 94.8%，红桃 7→2 占错例一半）。**均未通过**。10-18 已修四个根因并用真实裁图重训 CNN，同批回归 10 局全部完整（只是回归） | [10-14](docs/INDEPENDENT_ACCEPTANCE_20261014.md) · [修复](docs/INDEPENDENT_ACCEPTANCE_FIXES_20261016.md) · [10-17](docs/INDEPENDENT_ACCEPTANCE_20261017.md) · [修复 2](docs/INDEPENDENT_ACCEPTANCE_FIXES_20261018.md) |
@@ -149,6 +149,7 @@ data/ models/ logs/ runs/   数据、模型、日志、产物，均不入库
 - [PHASE6_LIVE_ASSISTANT.md](docs/PHASE6_LIVE_ASSISTANT.md) — 实时助手标定、模板、录制、运行、状态保护
 - [PHASE6_ACCEPTANCE.md](docs/PHASE6_ACCEPTANCE.md) — 正式录制、盲标、replay、聚合门禁
 - [EVALUATION.md](docs/EVALUATION.md) — 评测口径与基准
+- [DECISION_ARENA.md](docs/DECISION_ARENA.md) — 决策层自对弈评测、逐次淘汰采样与走子策略对比
 - [REAL_WINDOW_HOLDOUT.md](docs/REAL_WINDOW_HOLDOUT.md) — 独立牌面 holdout 采集与评测
 - [SHOWCASE.md](docs/SHOWCASE.md) — Demo 与录屏说明
 - [PORTFOLIO.md](docs/PORTFOLIO.md) — 中英文作品集 / 简历描述

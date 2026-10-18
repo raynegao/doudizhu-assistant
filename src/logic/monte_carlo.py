@@ -16,12 +16,14 @@ from src.logic.opponent_model import (
     OpponentModelError,
     UniformOpponentModel,
 )
+from src.logic.rollout_policies import ROLLOUT_POLICIES, build_rollout_policy
 from src.logic.rules import Play, PlayType, can_beat, legal_actions
 from src.state.cards import RANK_VALUE, CardSet, sort_cards
 from src.state.events import PlayerSeat
 from src.state.observable_state import ObservableGameState
 
 RULESET_VERSION = "phase4-standard-subset-v1"
+ALLOCATIONS = ("uniform", "successive_halving")
 
 
 @dataclass(frozen=True)
@@ -34,10 +36,23 @@ class MonteCarloSettings:
     max_candidates: int = 12
     min_rollouts_per_action: int = 8
     enforce_min_rollouts: bool = False
+    # "uniform": every candidate gets `simulations` shared worlds.
+    # "successive_halving": the same total rollout budget (simulations x
+    # candidates) is spent in rounds; after each round the weaker half of the
+    # candidates is dropped (never below top_k), so the final survivors are
+    # ranked on several times more worlds than uniform allocation affords.
+    allocation: str = "uniform"
+    # Policy every simulated player follows inside rollouts; "shaped" keeps
+    # hands close to finishing (see src/logic/rollout_policies.py).
+    rollout_policy: str = "heuristic"
 
     def __post_init__(self) -> None:
         if self.simulations <= 0:
             raise ValueError("simulations must be positive")
+        if self.allocation not in ALLOCATIONS:
+            raise ValueError(f"allocation must be one of {ALLOCATIONS}")
+        if self.rollout_policy not in ROLLOUT_POLICIES:
+            raise ValueError(f"rollout_policy must be one of {ROLLOUT_POLICIES}")
         if self.max_depth <= 0:
             raise ValueError("max_depth must be positive")
         if self.time_budget_ms < 0:
@@ -219,7 +234,8 @@ class MonteCarloEvaluator:
         clock: Callable[[], float] = time.perf_counter,
     ) -> None:
         self.opponent_model = opponent_model or UniformOpponentModel()
-        self.policy = policy or HeuristicRolloutPolicy()
+        # An explicit policy wins; otherwise the settings choose per evaluation.
+        self.policy = policy
         self.clock = clock
 
     def evaluate(
@@ -239,6 +255,9 @@ class MonteCarloEvaluator:
             all_candidates,
             max_candidates=settings.max_candidates,
         )
+        schedule = allocation_schedule(len(candidates), settings)
+        planned_worlds = sum(worlds for _, worlds in schedule)
+        policy = self.policy or build_rollout_policy(settings.rollout_policy)
 
         deadline = (
             started + settings.time_budget_ms / 1000
@@ -251,69 +270,106 @@ class MonteCarloEvaluator:
         completed_worlds: list[OpponentDeal] = []
         rng = random.Random(settings.seed)
         deadline_reached = False
+        survivors: list[Play] = list(candidates)
+        eliminated: list[tuple[int, Play]] = []
 
-        for _ in range(settings.simulations):
-            world = self.opponent_model.sample(state, rng)
-            for candidate in candidates:
-                outcomes[candidate].append(
-                    _simulate_candidate(
-                        state,
-                        world,
-                        candidate,
-                        max_depth=settings.max_depth,
-                        policy=self.policy,
-                    )
+        def current_estimate(candidate: Play) -> float:
+            values = outcomes[candidate]
+            return sum(value.expected_result for value in values) / len(values)
+
+        for round_index, (keep, worlds) in enumerate(schedule):
+            if round_index > 0 and keep < len(survivors):
+                # Common random numbers: every survivor has seen exactly the
+                # same worlds so far, so their means are directly comparable.
+                ranked = sorted(
+                    survivors,
+                    key=lambda candidate: (
+                        -current_estimate(candidate), *_stable_action_key(candidate),
+                    ),
                 )
-            completed_worlds.append(world)
-            if (
-                self.clock() >= deadline
-                and (
-                    not settings.enforce_min_rollouts
-                    or len(completed_worlds)
-                    >= min(
-                        settings.min_rollouts_per_action,
-                        settings.simulations,
+                eliminated.extend((round_index, candidate) for candidate in ranked[keep:])
+                survivors = ranked[:keep]
+            for _ in range(worlds):
+                world = self.opponent_model.sample(state, rng)
+                for candidate in survivors:
+                    outcomes[candidate].append(
+                        _simulate_candidate(
+                            state,
+                            world,
+                            candidate,
+                            max_depth=settings.max_depth,
+                            policy=policy,
+                        )
                     )
-                )
-            ):
-                deadline_reached = True
+                completed_worlds.append(world)
+                survivor_samples = min(len(outcomes[candidate]) for candidate in survivors)
+                if (
+                    self.clock() >= deadline
+                    and (
+                        not settings.enforce_min_rollouts
+                        or survivor_samples
+                        >= min(
+                            settings.min_rollouts_per_action,
+                            planned_worlds,
+                        )
+                    )
+                ):
+                    deadline_reached = True
+                    break
+            if deadline_reached:
                 break
 
         completed = len(completed_worlds)
+        survivor_samples = min(len(outcomes[candidate]) for candidate in survivors)
         warnings = list(state.warnings)
         if len(candidates) < len(all_candidates):
             warnings.append(
                 f"candidate_pruned: evaluated {len(candidates)} of {len(all_candidates)} legal actions"
             )
-        if completed < settings.simulations:
+        if completed < planned_worlds:
             warnings.append(
-                f"time_budget_exhausted: completed {completed} of {settings.simulations} sampled worlds"
+                f"time_budget_exhausted: completed {completed} of {planned_worlds} sampled worlds"
             )
         elif deadline_reached and settings.time_budget_ms > 0:
             warnings.append("time_budget_overrun: final complete world crossed the deadline")
-        if completed < settings.min_rollouts_per_action:
+        if survivor_samples < settings.min_rollouts_per_action:
             warnings.append(
-                f"low_sample_count: only {completed} rollouts completed per action"
+                f"low_sample_count: only {survivor_samples} rollouts completed per action"
+            )
+        if settings.allocation == "successive_halving":
+            warnings.append(
+                f"successive_halving: rounds={len(schedule)}, final_survivors={len(survivors)}, "
+                f"worlds_per_survivor={survivor_samples}"
             )
         warnings.extend(("uniform_opponent_model", "rule_subset_only"))
 
-        evaluations = tuple(
-            _aggregate_action(
+        evaluations = {
+            candidate: _aggregate_action(
                 state,
                 candidate,
                 values,
                 global_risks=tuple(warnings),
             )
             for candidate, values in outcomes.items()
+        }
+        # Survivors rank first: an action dropped in an early round was judged
+        # on few worlds, and a lucky small sample must not outrank the finalists.
+        ordered = tuple(
+            sorted((evaluations[candidate] for candidate in survivors), key=_evaluation_sort_key)
+        ) + tuple(
+            evaluations[candidate]
+            for _, candidate in sorted(
+                eliminated,
+                key=lambda item: (-item[0], _evaluation_sort_key(evaluations[item[1]])),
+            )
         )
-        ordered = tuple(sorted(evaluations, key=_evaluation_sort_key))
         top = ordered[: min(settings.top_k, len(ordered))]
         if len(top) >= 2 and _confidence_intervals_overlap(top[0], top[1]):
             warnings.append("top_action_confidence_intervals_overlap")
         if any(value.terminal_rate < 1.0 for value in top):
             warnings.append("heuristic_score_not_win_probability")
         best = top[0]
-        reason = _recommendation_reason(best, completed)
+        reason = _recommendation_reason(best, best.simulations)
         estimate = self.opponent_model.summarize(state, tuple(completed_worlds))
         elapsed_ms = (self.clock() - started) * 1000
         return Phase4DecisionResult(
@@ -330,6 +386,30 @@ class MonteCarloEvaluator:
             opponent_estimate=estimate,
         )
 
+
+def allocation_schedule(
+    candidate_count: int,
+    settings: MonteCarloSettings,
+) -> tuple[tuple[int, int], ...]:
+    """Rounds of (candidates kept, new shared worlds for each of them).
+
+    Uniform allocation is one round over every candidate. Successive halving
+    spends the same total budget (``simulations`` x candidates) over
+    ``rounds + 1`` equal shares: the candidate set halves after every round
+    until ``top_k`` remain, so each share buys the survivors more worlds.
+    """
+    if candidate_count <= 0:
+        raise ValueError("candidate_count must be positive")
+    if settings.allocation == "uniform" or candidate_count <= settings.top_k:
+        return ((candidate_count, settings.simulations),)
+    rounds = math.ceil(math.log2(candidate_count / settings.top_k))
+    budget = settings.simulations * candidate_count
+    share = budget / (rounds + 1)
+    schedule: list[tuple[int, int]] = []
+    for round_index in range(rounds + 1):
+        keep = max(settings.top_k, math.ceil(candidate_count / 2**round_index))
+        schedule.append((keep, max(1, int(share // keep))))
+    return tuple(schedule)
 
 def recommend_phase4(
     state: ObservableGameState,
@@ -838,6 +918,7 @@ def _recommendation_reason(evaluation: ActionEvaluation, simulations: int) -> st
 
 
 __all__ = [
+    "ALLOCATIONS",
     "ActionEvaluation",
     "HeuristicRolloutPolicy",
     "MonteCarloEvaluator",
@@ -846,5 +927,6 @@ __all__ = [
     "RULESET_VERSION",
     "RolloutOutcome",
     "RolloutPolicy",
+    "allocation_schedule",
     "recommend_phase4",
 ]

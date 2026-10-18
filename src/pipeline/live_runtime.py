@@ -1016,6 +1016,8 @@ class LiveGameRuntime:
             max_candidates=self.config.max_candidates,
             min_rollouts_per_action=self.config.min_rollouts_per_action,
             enforce_min_rollouts=True,
+            allocation=self.config.allocation,
+            rollout_policy=self.config.rollout_policy,
         )
         self._decision_revision = key
         self._decision_future = self._executor.submit(
